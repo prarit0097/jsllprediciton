@@ -346,12 +346,22 @@ function renderPriceRow(primary, nowPriceUsd, nowPriceInr) {
   const predList = document.getElementById('pred-list');
   const lastLine = document.getElementById('pred-last-line');
   const actualLine = document.getElementById('pred-actual-line');
+  const priceRow = document.getElementById('price-row');
 
   if (!primary) {
     document.getElementById('price-now').textContent = `${MARKET_LABEL} Now: ${nowDisplay}`;
-    document.getElementById('price-row').innerHTML = '<span class="price-left">Predicted: -- | Match: --</span><span class="price-right"></span>';
-    if (lastLine) lastLine.textContent = 'Last matched prediction: --';
-    if (actualLine) actualLine.textContent = 'Actual price at match time: --';
+    if (priceRow) {
+      priceRow.style.display = '';
+      priceRow.innerHTML = '<span class="price-left">Predicted: -- | Match: --</span><span class="price-right"></span>';
+    }
+    if (lastLine) {
+      lastLine.style.display = '';
+      lastLine.textContent = 'Last matched prediction: --';
+    }
+    if (actualLine) {
+      actualLine.style.display = '';
+      actualLine.textContent = 'Actual price at match time: --';
+    }
     return;
   }
 
@@ -364,27 +374,22 @@ function renderPriceRow(primary, nowPriceUsd, nowPriceInr) {
     ? ` [${formatDualPrice(primary.predicted_price_low, lastFxRate)} - ${formatDualPrice(primary.predicted_price_high, lastFxRate)}]`
     : '';
   const conf = formatConfidence(primary);
-  const confTag = conf !== '--' ? ` | Confidence: ${conf}${primary.low_confidence ? ' (low)' : ''}` : '';
   const match = statusText(primary);
   const isSingle = Array.isArray(lastPrediction?.predictions) && lastPrediction.predictions.length <= 1;
 
   const lastReady = primary.last_ready;
-  let lastBlock = '';
-  if (lastReady) {
-    const lastLineText = `Last matched prediction: ${formatDualPrice(lastReady.predicted_price, lastFxRate)} (${formatMatchPercent(lastReady)})${formatDiffHtml(lastReady)}`;
-    const actualLineText = lastReady.actual_price !== null && lastReady.actual_price !== undefined
-      ? `Last match actual price: ${formatDualPrice(lastReady.actual_price, lastFxRate)}`
-      : 'Last match actual price: --';
-    const actualTime = lastReady.actual_at ? `at ${fmtDateTimeLower(lastReady.actual_at)}` : '';
-    lastBlock = `${lastLineText}\n${actualLineText}${actualTime ? ' ' + actualTime : ''}`;
-  }
 
   if (isSingle) {
     document.getElementById('price-now').textContent = `${MARKET_LABEL} Now: ${nowDisplay}`;
-    document.getElementById('price-row').innerHTML = `
-      <span class="price-left">Predicted (${label || `${horizonMin}m`}): ${predDisplay}${band} | Conf: ${conf}${primary.low_confidence ? ' low' : ''} | Match: ${match}</span>
-      <span class="price-right"></span>
-    `;
+    if (priceRow) {
+      priceRow.style.display = '';
+      priceRow.innerHTML = `
+        <span class="price-left">Predicted (${label || `${horizonMin}m`}): ${predDisplay}${band} | Conf: ${conf}${primary.low_confidence ? ' low' : ''} | Match: ${match}</span>
+        <span class="price-right"></span>
+      `;
+    }
+    if (lastLine) lastLine.style.display = '';
+    if (actualLine) actualLine.style.display = '';
     if (lastReady) {
       const actualTime = lastReady.actual_at ? `at ${fmtDateTimeLower(lastReady.actual_at)}` : '';
       if (lastLine) {
@@ -403,12 +408,18 @@ function renderPriceRow(primary, nowPriceUsd, nowPriceInr) {
     if (predList) predList.style.display = 'none';
   } else {
     document.getElementById('price-now').textContent = `${MARKET_LABEL} Now: ${nowDisplay}`;
-    document.getElementById('price-row').innerHTML = `
-      <span class="price-left">Predicted (${label || `${horizonMin}m`}): ${predDisplay} | Match: ${match}</span>
-      <span class="price-right">${confTag}${band}${lastBlock ? ` | ${lastBlock.replace('\\n', ' | ')}` : ''}</span>
-    `;
-    if (lastLine) lastLine.textContent = 'Last matched prediction: --';
-    if (actualLine) actualLine.textContent = 'Actual price at match time: --';
+    if (priceRow) {
+      priceRow.style.display = 'none';
+      priceRow.innerHTML = '';
+    }
+    if (lastLine) {
+      lastLine.style.display = 'none';
+      lastLine.textContent = '';
+    }
+    if (actualLine) {
+      actualLine.style.display = 'none';
+      actualLine.textContent = '';
+    }
     if (predList) predList.style.display = '';
   }
 }
