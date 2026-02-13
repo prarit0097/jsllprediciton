@@ -456,7 +456,7 @@ function renderPredList(predictions) {
     let lastBlock = 'Last matched on last predicted price: -- | Actual: --';
     if (pred.last_ready) {
       const lr = pred.last_ready;
-      const lastLine = `Last matched on last predicted price: ${formatDualPrice(lr.predicted_price, lastFxRate)} (${formatMatchPercent(lr)})${formatDiffHtml(lr, true)}`;
+      const lastLine = `Last matched on last predicted price: ${formatDualPrice(lr.predicted_price, lastFxRate)} (${formatMatchPercent(lr)})${formatDiffHtml(lr)}`;
       const actualLine = lr.actual_price !== null && lr.actual_price !== undefined
         ? `Actual: ${formatDualPrice(lr.actual_price, lastFxRate)}`
         : 'Actual: --';
