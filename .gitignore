@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyd
+*.so
+*.egg-info/
+.pytest_cache/
+
+# Virtual env
+.venv/
+.venv311/
+
+# Env files
+.env
+
+# Django
+*.sqlite3
+
+# Data/artifacts
+/data/
+catboost_info/
+
+# Logs
+*.log
+
+# OS
+.DS_Store
+Thumbs.db

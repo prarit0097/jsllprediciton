@@ -1,0 +1,496 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>{{ brand_name }} Dashboard</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=DM+Mono:wght@400;500&display=swap" rel="stylesheet">
+    <style>
+      :root {
+        --bg: #0b0f14;
+        --surface: #111822;
+        --surface-2: #161f2c;
+        --muted: #a0a8b3;
+        --accent: #f4c95d;
+        --accent-2: #62c2ff;
+        --good: #1ad1a3;
+        --warn: #f87171;
+        --text: #f3f6f9;
+        --border: rgba(255,255,255,0.08);
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        font-family: "Space Grotesk", "Segoe UI", sans-serif;
+        background:
+          radial-gradient(1200px 500px at 10% -10%, rgba(98,194,255,0.18), transparent 60%),
+          radial-gradient(1000px 600px at 90% -20%, rgba(244,201,93,0.14), transparent 60%),
+          #0b0f14;
+        color: var(--text);
+      }
+      .wrap {
+        max-width: 1200px;
+        margin: 28px auto 60px;
+        padding: 0 16px;
+      }
+      .hero {
+        display: grid;
+        grid-template-columns: 1.2fr 1fr;
+        gap: 18px;
+        align-items: center;
+        margin-bottom: 18px;
+      }
+      .hero-title {
+        font-size: 32px;
+        letter-spacing: 0.5px;
+      }
+      .hero-sub {
+        color: var(--muted);
+        margin-top: 6px;
+      }
+      .pill {
+        padding: 6px 12px;
+        background: rgba(255,255,255,0.06);
+        border-radius: 999px;
+        font-size: 12px;
+        border: 1px solid var(--border);
+      }
+      .hidden {
+        display: none !important;
+      }
+      .mono { font-family: "DM Mono", monospace; }
+
+      .grid {
+        display: grid;
+        gap: 16px;
+      }
+      .card {
+        background: linear-gradient(180deg, var(--surface), var(--surface-2));
+        border-radius: 14px;
+        padding: 18px;
+        border: 1px solid var(--border);
+        box-shadow: 0 12px 24px rgba(0,0,0,0.25);
+      }
+      .row {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 16px;
+        align-items: center;
+      }
+      .status-row {
+        justify-content: space-between;
+        align-items: flex-start;
+      }
+      .status-controls {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+        align-items: center;
+        justify-content: flex-end;
+      }
+      .kpi {
+        font-size: 22px;
+        font-weight: 700;
+      }
+      .muted { color: var(--muted); }
+
+      .badge {
+        background: rgba(251,191,36,0.15);
+        color: var(--accent);
+        border: 1px solid rgba(251,191,36,0.3);
+        padding: 2px 8px;
+        border-radius: 999px;
+        font-size: 12px;
+      }
+      table {
+        width: 100%;
+        border-collapse: collapse;
+        font-size: 13px;
+      }
+      th, td {
+        padding: 10px 8px;
+        border-bottom: 1px solid rgba(255,255,255,0.06);
+        text-align: left;
+      }
+      th {
+        color: var(--muted);
+        font-weight: 600;
+        position: sticky;
+        top: 0;
+        background: var(--surface-2);
+        z-index: 1;
+      }
+      .scroll {
+        max-height: 360px;
+        overflow: auto;
+      }
+      .winner {
+        background: rgba(26,209,163,0.12);
+      }
+      .winner .badge {
+        background: rgba(26,209,163,0.18);
+        color: var(--good);
+        border-color: rgba(26,209,163,0.35);
+      }
+      .status-item { margin: 4px 0; }
+      .mini-block {
+        margin-top: 10px;
+        padding: 8px 10px;
+        border-radius: 10px;
+        border: 1px solid var(--border);
+        background: rgba(255,255,255,0.03);
+        font-size: 13px;
+      }
+      .price-row {
+        font-size: 18px;
+        font-weight: 600;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+      }
+      .pred-list {
+        margin-top: 12px;
+        display: grid;
+        gap: 6px;
+      }
+      .horizon-metrics {
+        margin-top: 12px;
+        display: grid;
+        gap: 6px;
+      }
+      .horizon-metrics .metric-row {
+        padding: 8px 10px;
+        border-radius: 10px;
+        border: 1px solid var(--border);
+        background: rgba(255,255,255,0.03);
+        font-size: 13px;
+        font-family: "DM Mono", monospace;
+      }
+      .pred-item {
+        display: grid;
+        grid-template-columns: 28px 1fr;
+        gap: 10px;
+        align-items: center;
+        padding: 8px 10px;
+        border-radius: 10px;
+        border: 1px solid var(--border);
+        background: rgba(255,255,255,0.03);
+      }
+      .pred-idx {
+        width: 24px;
+        height: 24px;
+        border-radius: 999px;
+        display: grid;
+        place-items: center;
+        font-size: 12px;
+        font-family: "DM Mono", monospace;
+        color: var(--muted);
+        background: rgba(255,255,255,0.06);
+        border: 1px solid var(--border);
+      }
+      .pred-text {
+        font-size: 14px;
+        line-height: 1.35;
+      }
+      .price-hero {
+        text-align: center;
+        margin-bottom: 10px;
+      }
+      .price-bar {
+        display: grid;
+        grid-template-columns: 1fr auto 1fr;
+        align-items: center;
+        gap: 12px;
+      }
+      .price-center {
+        text-align: center;
+      }
+      .price-search {
+        display: flex;
+        gap: 8px;
+        align-items: center;
+        justify-self: end;
+      }
+      .price-search input {
+        background: rgba(255,255,255,0.06);
+        border: 1px solid rgba(255,255,255,0.12);
+        color: var(--text);
+        padding: 6px 10px;
+        border-radius: 8px;
+        min-width: 220px;
+        font-family: "DM Mono", monospace;
+      }
+      .price-search button {
+        background: rgba(255,255,255,0.08);
+        border: 1px solid rgba(255,255,255,0.18);
+        color: var(--text);
+        padding: 6px 10px;
+        border-radius: 8px;
+        cursor: pointer;
+        font-weight: 600;
+      }
+      .price-at-result {
+        margin-top: 6px;
+        text-align: right;
+        font-family: "DM Mono", monospace;
+      }
+      .price-now {
+        font-size: 26px;
+        font-weight: 700;
+        letter-spacing: 0.3px;
+      }
+      .price-updated {
+        margin-top: 4px;
+      }
+      .price-left {
+        font-weight: 600;
+      }
+      .price-right {
+        color: var(--muted);
+        font-family: "DM Mono", monospace;
+        white-space: nowrap;
+      }
+      .diff-label {
+        font-weight: 700;
+        color: var(--text);
+      }
+      .diff-value {
+        font-weight: 700;
+        color: var(--accent);
+      }
+      .diff-plus {
+        color: var(--good);
+      }
+      .diff-minus {
+        color: var(--warn);
+      }
+      .controls {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+        align-items: center;
+      }
+      .controls select, .controls input, .controls button {
+        background: rgba(255,255,255,0.06);
+        border: 1px solid rgba(255,255,255,0.1);
+        color: var(--text);
+        padding: 6px 8px;
+        border-radius: 8px;
+        color-scheme: dark;
+        font-family: "Space Grotesk", sans-serif;
+      }
+      .controls select option {
+        background: #0f172a;
+        color: var(--text);
+      }
+      .controls button { cursor: pointer; }
+      .button {
+        background: linear-gradient(135deg, rgba(244,201,93,0.2), rgba(98,194,255,0.15));
+        border: 1px solid rgba(244,201,93,0.4);
+        color: var(--text);
+        padding: 8px 14px;
+        border-radius: 10px;
+        cursor: pointer;
+        font-weight: 600;
+        transition: transform 0.15s ease, box-shadow 0.15s ease;
+      }
+      .button:hover {
+        transform: translateY(-1px);
+        box-shadow: 0 8px 18px rgba(244,201,93,0.15);
+      }
+      .chart {
+        display: flex;
+        gap: 8px;
+        align-items: flex-end;
+        height: 140px;
+        margin-top: 12px;
+        padding: 12px;
+        border-radius: 12px;
+        background: linear-gradient(180deg, rgba(255,255,255,0.04), rgba(255,255,255,0.02));
+        border: 1px solid var(--border);
+        position: relative;
+        overflow: hidden;
+      }
+      .chart::before {
+        content: "";
+        position: absolute;
+        inset: 12px;
+        background:
+          repeating-linear-gradient(
+            to top,
+            rgba(255,255,255,0.06),
+            rgba(255,255,255,0.06) 1px,
+            transparent 1px,
+            transparent 24px
+          );
+        pointer-events: none;
+      }
+      .bar {
+        flex: 1;
+        background: linear-gradient(180deg, rgba(98,194,255,0.6), rgba(244,201,93,0.6));
+        border-radius: 10px 10px 6px 6px;
+        box-shadow: 0 8px 18px rgba(0,0,0,0.25);
+        position: relative;
+        z-index: 1;
+      }
+      .bar span {
+        position: absolute;
+        top: -18px;
+        left: 50%;
+        transform: translateX(-50%);
+        font-size: 10px;
+        color: var(--muted);
+        font-family: "DM Mono", monospace;
+      }
+      @media (max-width: 800px) {
+        .hero { grid-template-columns: 1fr; }
+        .price-row { font-size: 16px; }
+        .price-row { flex-direction: column; align-items: flex-start; }
+        .status-controls { justify-content: flex-start; }
+        .price-bar {
+          grid-template-columns: 1fr;
+          justify-items: center;
+        }
+        .price-search {
+          width: 100%;
+          justify-content: center;
+        }
+        .price-at-result {
+          text-align: center;
+        }
+        th, td { font-size: 12px; }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="wrap" id="app-root" data-market-label="{{ market_label }}" data-api-prefix="{{ api_prefix }}">
+      <div class="hero">
+        <div>
+          <div class="hero-title">{{ brand_name }} Dashboard</div>
+          <div class="hero-sub">Live price + model tournament status + prediction tracking.</div>
+        </div>
+        <div class="row" style="justify-content:flex-end;">
+          <span class="pill mono" id="timeframe-pill">timeframe: --</span>
+          <span class="pill mono" id="run-mode">mode: --</span>
+        </div>
+      </div>
+
+      <div class="grid">
+        <div class="card" id="tournament-status">
+          <div class="row status-row">
+            <div>
+              <div class="muted">Tournament Status</div>
+              <div class="kpi" id="candidate-count">--</div>
+              <div class="muted" id="last-run">Last run: --</div>
+              <div class="muted" id="last-completed">Last tournament completed: --</div>
+            </div>
+            <div class="status-controls">
+              <button class="button hidden" id="run-now">Run Tournament Now</button>
+              <span class="pill" id="run-state">idle</span>
+              <span class="pill mono" id="run-timer">Last time: --</span>
+              <span class="pill mono" id="run-progress">Progress: --</span>
+              <span class="pill mono" id="run-next">Next: --</span>
+            </div>
+          </div>
+          <div class="status-item" id="champ-direction">Direction champion: --</div>
+          <div class="status-item" id="champ-return">Return champion: --</div>
+          <div class="status-item" id="champ-range">Range champion: --</div>
+          <div class="mini-block muted" id="drift-status">Drift: --</div>
+          <div class="mini-block muted" id="champions-horizon">Horizon champions: --</div>
+        </div>
+
+        <div class="card">
+          <div class="price-hero">
+            <div class="price-bar">
+              <div></div>
+              <div class="price-center">
+                <div class="price-now" id="price-now">{{ market_label }} Now: --</div>
+                <div class="price-updated muted" id="price-updated">Updated: --</div>
+              </div>
+              <div class="price-search">
+                <input id="price-at-input" placeholder="YYYY-MM-DD HH:MM" />
+                <button id="price-at-btn">Find</button>
+              </div>
+            </div>
+            <div class="price-at-result muted" id="price-at-result">Price at timestamp: --</div>
+          </div>
+          <div class="price-row" id="price-row">
+            <span class="price-left">Predicted (10m): -- | Match: --</span>
+            <span class="price-right"></span>
+          </div>
+          <div class="muted" id="pred-last-line" style="margin-top: 6px;">Last matched prediction: --</div>
+          <div class="muted" id="pred-actual-line">Last match actual price: --</div>
+          <div class="pred-list" id="pred-list"></div>
+          <div class="horizon-metrics" id="horizon-metrics"></div>
+        </div>
+
+        <div class="card">
+          <div class="row" style="justify-content: space-between;">
+            <div class="muted">Scoreboard</div>
+            <span class="pill">Auto-refresh: 60s</span>
+          </div>
+          <div class="controls" style="margin: 10px 0;">
+            <select id="filter-target">
+              <option value="all">All Targets</option>
+              <option value="direction">direction</option>
+              <option value="return">return</option>
+              <option value="range">range</option>
+            </select>
+            <select id="filter-feature">
+              <option value="all">All Features</option>
+              <option value="base">base</option>
+              <option value="vol">vol</option>
+              <option value="momentum">momentum</option>
+              <option value="volume">volume</option>
+              <option value="trend">trend</option>
+              <option value="volatility">volatility</option>
+              <option value="long">long</option>
+              <option value="signal">signal</option>
+              <option value="price_action">price_action</option>
+              <option value="mean_revert">mean_revert</option>
+              <option value="vwap_flow">vwap_flow</option>
+              <option value="trend_longer">trend_longer</option>
+              <option value="micro_momentum">micro_momentum</option>
+              <option value="session">session</option>
+              <option value="minimal">minimal</option>
+            </select>
+            <input id="filter-text" placeholder="Search model name" />
+            <select id="sort-by">
+              <option value="final_score">FinalScore</option>
+              <option value="trading_score">Trading</option>
+              <option value="primary">Primary</option>
+            </select>
+          </div>
+          <div class="scroll">
+            <table>
+              <thead>
+                <tr>
+                  <th>Rank</th>
+                  <th>Target</th>
+                  <th>Feature Set</th>
+                  <th>Model</th>
+                  <th>Family</th>
+                  <th>FinalScore</th>
+                  <th>Primary</th>
+                  <th>Trading</th>
+                  <th>Stability</th>
+                  <th>Run At</th>
+                </tr>
+              </thead>
+              <tbody id="scoreboard-body"></tbody>
+            </table>
+          </div>
+          <div class="muted" style="margin-top: 8px;">Top Scores Chart (by FinalScore)</div>
+          <div class="chart" id="score-chart"></div>
+        </div>
+      </div>
+    </div>
+
+    <script src="/static/jeena_sikho_dashboard.js"></script>
+  </body>
+</html>
+
+

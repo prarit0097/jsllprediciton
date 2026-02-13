@@ -1,0 +1,363 @@
+import datetime as dt
+import logging
+import os
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+import pandas as pd
+import requests
+
+from .market_calendar import IST, load_nse_holidays
+
+
+@dataclass
+class CoverageReport:
+    earliest: Optional[pd.Timestamp]
+    total_candles: int
+    missing_intervals: int
+    interval_minutes: int
+
+
+def _to_utc(ts: pd.Series) -> pd.Series:
+    ts = pd.to_datetime(ts, utc=True)
+    return ts
+
+
+def _as_ohlcv(df: pd.DataFrame, source: str) -> pd.DataFrame:
+    if df.empty:
+        return df
+    out = df.copy()
+    out = out.rename_axis("timestamp_utc").reset_index()
+    out["timestamp_utc"] = _to_utc(out["timestamp_utc"])
+    out["source"] = source
+    required = {"timestamp_utc", "open", "high", "low", "close", "volume"}
+    if not required.issubset(out.columns):
+        return pd.DataFrame()
+    out = out.dropna(subset=["timestamp_utc", "open", "high", "low", "close", "volume"])
+    return out[["timestamp_utc", "open", "high", "low", "close", "volume", "source"]]
+
+
+def fetch_binance(symbol: str, timeframe: str, start: dt.datetime) -> pd.DataFrame:
+    try:
+        import ccxt  # type: ignore
+    except Exception:
+        return pd.DataFrame()
+
+    supported = {
+        "1m",
+        "3m",
+        "5m",
+        "15m",
+        "30m",
+        "1h",
+        "2h",
+        "4h",
+        "6h",
+        "8h",
+        "12h",
+        "1d",
+    }
+    if timeframe not in supported:
+        return pd.DataFrame()
+
+    exchange = ccxt.binance({"enableRateLimit": True})
+    since_ms = int(start.timestamp() * 1000)
+    all_rows = []
+    while True:
+        try:
+            candles = exchange.fetch_ohlcv(symbol, timeframe=timeframe, since=since_ms, limit=1000)
+        except Exception:
+            return pd.DataFrame()
+        if not candles:
+            break
+        all_rows.extend(candles)
+        last_ts = candles[-1][0]
+        since_ms = last_ts + 1
+        if len(candles) < 1000:
+            break
+    if not all_rows:
+        return pd.DataFrame()
+    df = pd.DataFrame(all_rows, columns=["ts", "open", "high", "low", "close", "volume"])
+    df["timestamp_utc"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
+    df = df.drop(columns=["ts"]).set_index("timestamp_utc")
+    return _as_ohlcv(df, "binance")
+
+
+def fetch_yfinance(symbol: str, start: dt.datetime, end: dt.datetime) -> pd.DataFrame:
+    try:
+        import yfinance as yf  # type: ignore
+    except Exception:
+        return pd.DataFrame()
+
+    for name in ["yfinance", "yfinance.base", "yfinance.shared", "yfinance.ticker"]:
+        logging.getLogger(name).setLevel(logging.CRITICAL)
+
+    # Yahoo 1h data is limited (~730 days), so chunk requests.
+    all_parts = []
+    chunk_start = start
+    while chunk_start < end:
+        chunk_end = min(chunk_start + dt.timedelta(days=730), end)
+        try:
+            part = yf.download(
+                symbol,
+                start=chunk_start,
+                end=chunk_end,
+                interval="60m",
+                auto_adjust=False,
+                progress=False,
+            )
+        except Exception:
+            part = pd.DataFrame()
+        if not part.empty:
+            all_parts.append(part)
+        chunk_start = chunk_end
+    if not all_parts:
+        return pd.DataFrame()
+    data = pd.concat(all_parts)
+    if isinstance(data.columns, pd.MultiIndex):
+        data.columns = [str(c[0]) for c in data.columns]
+    data = data.rename(
+        columns={
+            "Open": "open",
+            "High": "high",
+            "Low": "low",
+            "Close": "close",
+            "Volume": "volume",
+        }
+    )
+    data.index = pd.to_datetime(data.index, utc=True)
+    data = data[["open", "high", "low", "close", "volume"]]
+    data = data[~data.index.duplicated(keep="last")]
+    data = _filter_nse_session(data, symbol)
+    return _as_ohlcv(data, "yfinance")
+
+
+def fetch_cryptocompare(symbol: str, start: dt.datetime, end: dt.datetime) -> pd.DataFrame:
+    url = "https://min-api.cryptocompare.com/data/v2/histohour"
+    fsym, tsym = _split_symbol_for_cryptocompare(symbol)
+    all_rows = []
+    to_ts = int(end.timestamp())
+    limit = 2000
+    while True:
+        params = {
+            "fsym": fsym,
+            "tsym": tsym,
+            "toTs": to_ts,
+            "limit": limit,
+        }
+        api_key = _cryptocompare_key()
+        if api_key:
+            params["api_key"] = api_key
+        try:
+            resp = requests.get(url, params=params, timeout=10)
+            resp.raise_for_status()
+            payload = resp.json()
+        except Exception:
+            break
+        data = payload.get("Data", {}).get("Data", [])
+        if not data:
+            break
+        all_rows.extend(data)
+        oldest = data[0]["time"]
+        to_ts = oldest - 1
+        if dt.datetime.fromtimestamp(oldest, tz=dt.timezone.utc) <= start:
+            break
+    if not all_rows:
+        return pd.DataFrame()
+    df = pd.DataFrame(all_rows)
+    df["timestamp_utc"] = pd.to_datetime(df["time"], unit="s", utc=True)
+    df = df.rename(columns={"open": "open", "high": "high", "low": "low", "close": "close", "volumefrom": "volume"})
+    df = df.set_index("timestamp_utc")
+    df = df[["open", "high", "low", "close", "volume"]]
+    start_ts = pd.Timestamp(start)
+    if start_ts.tzinfo is None:
+        start_ts = start_ts.tz_localize("UTC")
+    df = df.loc[df.index >= start_ts]
+    return _as_ohlcv(df, "cryptocompare")
+
+
+def fetch_cryptocompare_minute(symbol: str, start: dt.datetime, end: dt.datetime, aggregate: int) -> pd.DataFrame:
+    url = "https://min-api.cryptocompare.com/data/v2/histominute"
+    fsym, tsym = _split_symbol_for_cryptocompare(symbol)
+    all_rows = []
+    to_ts = int(end.timestamp())
+    limit = 2000
+    while True:
+        params = {
+            "fsym": fsym,
+            "tsym": tsym,
+            "toTs": to_ts,
+            "limit": limit,
+            "aggregate": aggregate,
+        }
+        api_key = _cryptocompare_key()
+        if api_key:
+            params["api_key"] = api_key
+        try:
+            resp = requests.get(url, params=params, timeout=10)
+            resp.raise_for_status()
+            payload = resp.json()
+        except Exception:
+            break
+        data = payload.get("Data", {}).get("Data", [])
+        if not data:
+            break
+        all_rows.extend(data)
+        oldest = data[0]["time"]
+        to_ts = oldest - 1
+        if dt.datetime.fromtimestamp(oldest, tz=dt.timezone.utc) <= start:
+            break
+    if not all_rows:
+        return pd.DataFrame()
+    df = pd.DataFrame(all_rows)
+    df["timestamp_utc"] = pd.to_datetime(df["time"], unit="s", utc=True)
+    df = df.rename(columns={"open": "open", "high": "high", "low": "low", "close": "close", "volumefrom": "volume"})
+    df = df.set_index("timestamp_utc")
+    df = df[["open", "high", "low", "close", "volume"]]
+    start_ts = pd.Timestamp(start)
+    if start_ts.tzinfo is None:
+        start_ts = start_ts.tz_localize("UTC")
+    df = df.loc[df.index >= start_ts]
+    return _as_ohlcv(df, "cryptocompare")
+
+
+def stitch_sources(sources: List[pd.DataFrame], interval_minutes: int) -> Tuple[pd.DataFrame, CoverageReport]:
+    if not sources:
+        return pd.DataFrame(), CoverageReport(None, 0, 0, interval_minutes)
+    non_empty = [s for s in sources if not s.empty]
+    if not non_empty:
+        return pd.DataFrame(), CoverageReport(None, 0, 0, interval_minutes)
+    merged = pd.concat(non_empty, ignore_index=True)
+    if merged.empty:
+        return pd.DataFrame(), CoverageReport(None, 0, 0, interval_minutes)
+
+    merged = merged.dropna(subset=["timestamp_utc", "open", "high", "low", "close", "volume"])
+    priority = {"binance": 0, "cryptocompare": 1, "yfinance": 2}
+    merged["priority"] = merged["source"].map(priority).fillna(9)
+    merged = merged.sort_values(["timestamp_utc", "priority"])
+    merged = merged.drop_duplicates(subset=["timestamp_utc"], keep="first")
+    merged = merged.drop(columns=["priority"]).sort_values("timestamp_utc")
+
+    merged = merged.set_index("timestamp_utc")
+    earliest = merged.index.min()
+    total = len(merged)
+
+    freq = f"{interval_minutes}min"
+    full_range = pd.date_range(start=earliest, end=merged.index.max(), freq=freq, tz="UTC")
+    missing = len(full_range.difference(merged.index))
+
+    return merged.reset_index(), CoverageReport(earliest, total, missing, interval_minutes)
+
+
+def fetch_and_stitch(
+    symbol: str,
+    yfinance_symbol: str,
+    start: dt.datetime,
+    timeframe: str,
+    interval_minutes: int,
+) -> Tuple[pd.DataFrame, CoverageReport]:
+    end = dt.datetime.now(dt.timezone.utc)
+    is_nse_symbol = (yfinance_symbol or "").strip().upper().endswith(".NS") or (yfinance_symbol or "").strip().upper().endswith(".BO")
+    if is_nse_symbol:
+        ydf = fetch_yfinance(yfinance_symbol, start, end)
+        if not ydf.empty and interval_minutes != 60:
+            ydf = _aggregate_ohlcv(ydf, interval_minutes)
+        merged, report = stitch_sources([ydf], interval_minutes)
+        return merged, report
+    sources = []
+    sources.append(fetch_binance(symbol, timeframe, start))
+    if interval_minutes == 60:
+        sources.append(fetch_cryptocompare(symbol, start, end))
+        sources.append(fetch_yfinance(yfinance_symbol, start, end))
+    else:
+        sources.append(fetch_cryptocompare_minute(symbol, start, end, interval_minutes))
+    merged, report = stitch_sources(sources, interval_minutes)
+    return merged, report
+
+
+def _cryptocompare_key() -> Optional[str]:
+    return (
+        os.getenv("CRYPTOCOMPARE_API_KEY")
+        or os.getenv("CRYPTOCOMPARE_KEY")
+        or os.getenv("CRYPTOCOMPARE_TOKEN")
+    )
+
+
+def _split_symbol_for_cryptocompare(symbol: str) -> Tuple[str, str]:
+    cleaned = (symbol or "").strip().upper().replace("-", "/")
+    if "/" in cleaned:
+        base, quote = cleaned.split("/", 1)
+        if base and quote:
+            return base, quote
+    return "BTC", "USD"
+
+
+def _timeframe_to_minutes(timeframe: str, fallback: int) -> int:
+    tf = timeframe.strip().lower()
+    if tf.endswith("m") and tf[:-1].isdigit():
+        return int(tf[:-1])
+    if tf.endswith("h") and tf[:-1].isdigit():
+        return int(tf[:-1]) * 60
+    return fallback
+
+
+def _filter_nse_session(data: pd.DataFrame, symbol: str) -> pd.DataFrame:
+    sym = (symbol or "").strip().upper()
+    if not (sym.endswith(".NS") or sym.endswith(".BO")):
+        return data
+    if data.empty:
+        return data
+    holidays = load_nse_holidays(Path(os.getenv("APP_DATA_DIR", "data")))
+    idx_local = data.index.tz_convert(IST)
+    minutes = (idx_local.hour * 60) + idx_local.minute
+    is_holiday = pd.Series(idx_local.date).isin(holidays).to_numpy()
+    mask = (idx_local.weekday < 5) & (~is_holiday) & (minutes >= (9 * 60 + 15)) & (minutes <= (15 * 60 + 30))
+    return data.loc[mask]
+
+
+def _aggregate_ohlcv(df: pd.DataFrame, interval_minutes: int) -> pd.DataFrame:
+    if df.empty or interval_minutes <= 60:
+        return df
+    out = df.copy()
+    out["timestamp_utc"] = pd.to_datetime(out["timestamp_utc"], utc=True)
+    out = out.set_index("timestamp_utc").sort_index()
+    idx_local = out.index.tz_convert(IST)
+    out.index = idx_local
+
+    if interval_minutes >= 1440:
+        g = out.groupby(out.index.date)
+        agg = g.agg(
+            open=("open", "first"),
+            high=("high", "max"),
+            low=("low", "min"),
+            close=("close", "last"),
+            volume=("volume", "sum"),
+            source=("source", "last"),
+        )
+        agg.index = pd.to_datetime(agg.index).tz_localize(IST) + pd.Timedelta(hours=15, minutes=30)
+    else:
+        rule = f"{int(interval_minutes)}min"
+        agg = out.resample(
+            rule,
+            origin="start_day",
+            offset="9h15min",
+            closed="right",
+            label="right",
+        ).agg(
+            {
+                "open": "first",
+                "high": "max",
+                "low": "min",
+                "close": "last",
+                "volume": "sum",
+                "source": "last",
+            }
+        )
+        agg = agg.dropna(subset=["open", "high", "low", "close"])
+        mins = agg.index.hour * 60 + agg.index.minute
+        agg = agg[(agg.index.weekday < 5) & (mins >= (9 * 60 + 15)) & (mins <= (15 * 60 + 30))]
+
+    agg.index = agg.index.tz_convert("UTC")
+    agg = agg.reset_index().rename(columns={"index": "timestamp_utc"})
+    return agg
