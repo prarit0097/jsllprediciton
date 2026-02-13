@@ -13,8 +13,8 @@ from .splits import walk_forward_split
 from .storage import Storage
 
 
-def _subset_candidates(task: str, max_count: int, enable_dl: bool):
-    specs = get_candidates(task, max_count, enable_dl, candle_minutes=config.candle_minutes, strict_horizon_pool=True)
+def _subset_candidates(task: str, max_count: int, enable_dl: bool, candle_minutes: int):
+    specs = get_candidates(task, max_count, enable_dl, candle_minutes=candle_minutes, strict_horizon_pool=True)
     return specs[:max_count]
 
 
@@ -39,7 +39,7 @@ def run_dry_tournament(config) -> bool:
 
     start = time.time()
     for task in ["direction", "return", "range"]:
-        specs = _subset_candidates(task, 5, False)
+        specs = _subset_candidates(task, 5, False, config.candle_minutes)
         X_train = split.train[cols]
         X_val = split.val[cols]
         if task == "direction":

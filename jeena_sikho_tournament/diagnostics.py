@@ -292,7 +292,8 @@ def check_registry_predictor(config: TournamentConfig) -> CheckResult:
         registry = load_registry(config.registry_path)
         champs = registry.get("champions", {})
         if not champs:
-            res.warn("No champions in registry")
+            # Fresh setup may legitimately have no champions yet.
+            res.message = "No champions yet (fresh setup)"
             return res
         outputs = predict_latest(config)
         if not outputs:
