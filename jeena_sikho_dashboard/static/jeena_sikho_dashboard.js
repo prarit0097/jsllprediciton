@@ -453,18 +453,23 @@ function renderPredList(predictions) {
     const conf = formatConfidence(pred);
     const match = statusText(pred);
 
-    let lastBlock = 'Last matched on last predicted price: -- | Actual: --';
+    let lastMatchedLine = 'Last matched on last predicted price: --';
+    let diffActualLine = 'Difference: -- | Actual: --';
     if (pred.last_ready) {
       const lr = pred.last_ready;
-      const lastLine = `Last matched on last predicted price: ${formatDualPrice(lr.predicted_price, lastFxRate)} (${formatMatchPercent(lr)})${formatDiffHtml(lr)}`;
+      lastMatchedLine = `Last matched on last predicted price: ${formatDualPrice(lr.predicted_price, lastFxRate)} (${formatMatchPercent(lr)})`;
       const actualLine = lr.actual_price !== null && lr.actual_price !== undefined
         ? `Actual: ${formatDualPrice(lr.actual_price, lastFxRate)}`
         : 'Actual: --';
       const actualTime = lr.actual_at ? `@ ${fmtDateTimeLower(lr.actual_at)}` : '';
-      lastBlock = `${lastLine} | ${actualLine}${actualTime ? ' ' + actualTime : ''}`;
+      const diffHtml = formatDiffHtml(lr);
+      const diffOnly = diffHtml
+        ? (diffHtml.startsWith(' | ') ? diffHtml.slice(3) : diffHtml)
+        : 'Difference: --';
+      diffActualLine = `${diffOnly} | ${actualLine}${actualTime ? ' ' + actualTime : ''}`;
     }
 
-    const line = `Predicted (${label}): ${predPrice}${band} | Conf: ${conf}${pred.low_confidence ? ' low' : ''} | Match: ${match} | ${lastBlock}`;
+    const line = `Predicted (${label}): ${predPrice}${band} | Conf: ${conf}${pred.low_confidence ? ' low' : ''} | Match: ${match}<br>${lastMatchedLine}<br>${diffActualLine}`;
 
     const item = document.createElement('div');
     item.className = 'pred-item';
