@@ -14,7 +14,7 @@ from .storage import Storage
 
 
 def _subset_candidates(task: str, max_count: int, enable_dl: bool):
-    specs = get_candidates(task, max_count, enable_dl)
+    specs = get_candidates(task, max_count, enable_dl, candle_minutes=config.candle_minutes, strict_horizon_pool=True)
     return specs[:max_count]
 
 

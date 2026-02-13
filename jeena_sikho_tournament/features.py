@@ -49,6 +49,15 @@ def resolve_feature_windows_for_horizon(
     return merged
 
 
+def allowed_feature_sets_for_horizon(candle_minutes: int) -> set[str]:
+    minutes = max(1, int(candle_minutes))
+    if minutes <= 120:
+        return {"minimal", "base", "momentum", "micro_momentum", "session", "vwap_flow", "signal", "trend", "volatility"}
+    if minutes >= 1440:
+        return {"minimal", "base", "long", "trend_longer", "volatility", "session", "signal", "trend"}
+    return {"minimal", "base", "momentum", "signal", "trend", "volatility", "session", "vwap_flow", "trend_longer"}
+
+
 def compute_features(
     df: pd.DataFrame,
     candle_minutes: int = 60,
@@ -369,7 +378,22 @@ def make_supervised(
         if event_mask.any():
             df.loc[event_mask, target_label] = df.loc[event_mask, target_label].clip(-event_clip, event_clip)
 
-    df["y_ret"] = df[target_label]
-    df["y_dir"] = (df["y_ret"] > 0).astype(int)
+    # Keep raw log-return target for evaluation/trading math.
+    df["y_ret_raw"] = df[target_label]
+    df["y_ret"] = df["y_ret_raw"]
+    df["y_dir"] = (df["y_ret_raw"] > 0).astype(int)
+
+    # Optional modeling target normalization by recent volatility.
+    target_mode = os.getenv("RETURN_TARGET_MODE", "volnorm_logret").strip().lower()
+    vol_floor = float(os.getenv("TARGET_VOL_FLOOR", "0.001"))
+    vol_cap = float(os.getenv("TARGET_VOL_CAP", "0.08"))
+    target_scale = df.get("vol_24", pd.Series(1.0, index=df.index))
+    target_scale = target_scale.clip(lower=max(1e-6, vol_floor), upper=max(vol_floor, vol_cap))
+    df["target_scale"] = target_scale
+    if target_mode in {"volnorm", "volnorm_logret", "normalized"}:
+        df["y_ret_model"] = df["y_ret_raw"] / (target_scale + 1e-12)
+    else:
+        df["y_ret_model"] = df["y_ret_raw"]
+
     df = df.dropna()
     return df

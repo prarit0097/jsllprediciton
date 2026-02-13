@@ -13,7 +13,7 @@ import pandas as pd
 from .backtest import trading_score
 from .config import TournamentConfig
 from .data_sources import fetch_and_stitch
-from .features import feature_sets, make_supervised, resolve_feature_windows_for_horizon
+from .features import allowed_feature_sets_for_horizon, feature_sets, make_supervised, resolve_feature_windows_for_horizon
 from .metrics import accuracy, f1_score, mae, pinball_loss, coverage
 from .models_zoo import ModelSpec, build_quantile_bundle, get_candidates
 from .registry import (
@@ -25,6 +25,8 @@ from .registry import (
 )
 from .splits import walk_forward_cv_splits
 from .storage import Storage
+from .validator import validate_ohlcv_quality
+from .market_calendar import load_nse_holidays
 from jeena_sikho_dashboard.db import insert_run, insert_scores
 
 def _update_predictions_safe(config) -> None:
@@ -115,7 +117,26 @@ def _build_dataset(df: pd.DataFrame, config: TournamentConfig) -> Tuple[pd.DataF
     horizon_windows = resolve_feature_windows_for_horizon(config.candle_minutes, config.feature_windows)
     sup = make_supervised(df, candle_minutes=config.candle_minutes, feature_windows_hours=horizon_windows)
     feature_sets_map = feature_sets(sup)
+    if os.getenv("STRICT_HORIZON_FEATURE_POOL", "1").strip().lower() not in {"0", "false", "no", "off"}:
+        allowed = allowed_feature_sets_for_horizon(config.candle_minutes)
+        feature_sets_map = {k: v for k, v in feature_sets_map.items() if k in allowed}
     return sup, feature_sets_map
+
+
+def _is_indian_equity(config: TournamentConfig) -> bool:
+    sym = (config.yfinance_symbol or "").strip().upper()
+    return sym.endswith(".NS") or sym.endswith(".BO")
+
+
+def _target_mode(config: TournamentConfig) -> str:
+    return os.getenv("RETURN_TARGET_MODE", "volnorm_logret").strip().lower()
+
+
+def _vol_scale(series: pd.Series) -> np.ndarray:
+    floor = float(os.getenv("TARGET_VOL_FLOOR", "0.001"))
+    cap = float(os.getenv("TARGET_VOL_CAP", "0.08"))
+    arr = pd.Series(series).astype(float).clip(lower=max(1e-6, floor), upper=max(floor, cap)).to_numpy()
+    return np.where(np.isfinite(arr), arr, max(1e-6, floor))
 
 
 def _primary_score_direction(acc: float) -> float:
@@ -269,6 +290,8 @@ def _evaluate_candidate(args: Tuple[ModelSpec, str, str, List[Tuple[pd.DataFrame
     preds_collect: List[np.ndarray] = []
     truth_collect: List[np.ndarray] = []
     last_model: Any = None
+    ret_mode = _target_mode(config)
+    use_volnorm = ret_mode in {"volnorm", "volnorm_logret", "normalized"}
 
     for train_df, val_df in split_pairs:
         if train_df.empty or val_df.empty:
@@ -296,9 +319,15 @@ def _evaluate_candidate(args: Tuple[ModelSpec, str, str, List[Tuple[pd.DataFrame
             continue
 
         if task == "return":
-            y_train = train_df["y_ret"].values
-            y_val = val_df["y_ret"].values
-            model, y_pred = _fit_predict_reg(spec_local, X_train, y_train, X_val)
+            y_train_raw = train_df["y_ret"].values
+            y_val_raw = val_df["y_ret"].values
+            y_train_model = train_df["y_ret_model"].values if use_volnorm and "y_ret_model" in train_df.columns else y_train_raw
+            model, y_pred_model = _fit_predict_reg(spec_local, X_train, y_train_model, X_val)
+            if use_volnorm and "target_scale" in val_df.columns:
+                y_pred = y_pred_model * _vol_scale(val_df["target_scale"])
+            else:
+                y_pred = y_pred_model
+            y_val = y_val_raw
             mae_val = mae(y_val, y_pred)
             dir_acc = accuracy((y_val > 0).astype(int), (y_pred > 0).astype(int))
             close_hit = _close_hit_rate(y_val, y_pred, config.close_hit_bps)
@@ -316,7 +345,13 @@ def _evaluate_candidate(args: Tuple[ModelSpec, str, str, List[Tuple[pd.DataFrame
 
         y_train = train_df["y_ret"].values
         y_val = val_df["y_ret"].values
-        model, y_pred = _fit_predict_range(spec_local, X_train, y_train, X_val)
+        y_train_model = train_df["y_ret_model"].values if use_volnorm and "y_ret_model" in train_df.columns else y_train
+        model, y_pred_model = _fit_predict_range(spec_local, X_train, y_train_model, X_val)
+        if use_volnorm and "target_scale" in val_df.columns:
+            scale = _vol_scale(val_df["target_scale"]).reshape(-1, 1)
+            y_pred = y_pred_model * scale
+        else:
+            y_pred = y_pred_model
         p10, p50, p90 = y_pred[:, 0], y_pred[:, 1], y_pred[:, 2]
         cov = coverage(y_val, p10, p90)
         pin = (
@@ -353,6 +388,7 @@ def _evaluate_candidate(args: Tuple[ModelSpec, str, str, List[Tuple[pd.DataFrame
         "y_pred": y_pred_full,
         "y_true": y_true_full,
         "model": last_model,
+        "target_mode": ret_mode if task in {"return", "range"} else "raw_logret",
     }
 
 
@@ -467,6 +503,22 @@ def run_tournament(config: TournamentConfig) -> Dict[str, Any]:
         df, coverage = _prep_data(config)
         if df.empty:
             raise RuntimeError("No data available")
+        holidays = load_nse_holidays(config.data_dir)
+        dq = validate_ohlcv_quality(
+            df,
+            config.candle_minutes,
+            nse_mode=_is_indian_equity(config),
+            holidays=holidays,
+            max_missing_ratio=float(os.getenv("MAX_MISSING_RATIO", "0.15")),
+        )
+        coverage["dq_errors"] = dq.errors
+        coverage["dq_warnings"] = dq.warnings
+        coverage["dq_stats"] = dq.stats
+        strict_dq = os.getenv("STRICT_DATA_QUALITY", "1").strip().lower() not in {"0", "false", "no", "off"}
+        if strict_dq and not dq.ok:
+            raise RuntimeError(f"Data quality check failed: {'; '.join(dq.errors)}")
+        if dq.warnings:
+            LOGGER.warning("Data quality warnings: %s", "; ".join(dq.warnings))
 
         sup, feature_sets_map = _build_dataset(df, config)
         registry = load_registry(config.registry_path)
@@ -491,8 +543,15 @@ def run_tournament(config: TournamentConfig) -> Dict[str, Any]:
 
         per_task_candidates: Dict[str, List[Tuple[ModelSpec, str, List[str]]]] = {}
         per_task_feature_cols: Dict[str, Dict[str, List[str]]] = {}
+        strict_horizon_pool = os.getenv("STRICT_HORIZON_MODEL_POOL", "1").strip().lower() not in {"0", "false", "no", "off"}
         for task in ["direction", "return", "range"]:
-            specs = get_candidates(task, config.max_candidates_per_target, config.enable_dl)
+            specs = get_candidates(
+                task,
+                config.max_candidates_per_target,
+                config.enable_dl,
+                candle_minutes=config.candle_minutes,
+                strict_horizon_pool=strict_horizon_pool,
+            )
             dropped_features = _feature_drop_set(registry, task)
             fs_cols_map: Dict[str, List[str]] = {}
             candidates = []
@@ -658,6 +717,7 @@ def run_tournament(config: TournamentConfig) -> Dict[str, Any]:
                     "feature_cols": task_feature_cols.get(fs_id, []),
                     "final_score": r["final_score"],
                     "family": r["family"],
+                    "target_mode": r.get("target_mode"),
                 }
                 if model_path:
                     ensemble_members.append(member)
@@ -708,6 +768,7 @@ def run_tournament(config: TournamentConfig) -> Dict[str, Any]:
                 "feature_cols": task_feature_cols.get(best_fs_id, []),
                 "feature_set_id": best_fs_id,
                 "family": best["family"],
+                "target_mode": best.get("target_mode"),
             }
             top_features = _extract_feature_importance(best.get("model"), task_feature_cols.get(best_fs_id, []), top_k=10)
             registry.setdefault("feature_importance", {}).setdefault(task, []).append(

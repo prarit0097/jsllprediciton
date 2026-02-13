@@ -43,6 +43,9 @@ def _summarize_rows(rows: List[Tuple[float, float]]) -> Dict[str, float]:
     if not rows:
         return {}
     pcts: List[float] = []
+    maes: List[float] = []
+    hits: List[float] = []
+    hit_tol_pct = float(os.getenv("DRIFT_HIT_TOL_PCT", "1.0"))
     for pred, actual in rows:
         try:
             p = float(pred)
@@ -51,12 +54,19 @@ def _summarize_rows(rows: List[Tuple[float, float]]) -> Dict[str, float]:
             continue
         if a == 0:
             continue
-        pct = abs(p - a) / abs(a) * 100.0
+        abs_err = abs(p - a)
+        maes.append(float(abs_err))
+        pct = abs_err / abs(a) * 100.0
         if np.isfinite(pct):
             pcts.append(float(pct))
+            hits.append(1.0 if pct <= hit_tol_pct else 0.0)
     if not pcts:
         return {}
-    return {"mape": float(np.mean(pcts))}
+    return {
+        "mape": float(np.mean(pcts)),
+        "mae": float(np.mean(maes)) if maes else float("inf"),
+        "hit_rate": float(np.mean(hits)) if hits else 0.0,
+    }
 
 
 def should_retrain_on_drift(config: TournamentConfig) -> Tuple[bool, str]:
@@ -67,6 +77,10 @@ def should_retrain_on_drift(config: TournamentConfig) -> Tuple[bool, str]:
         return True, "no_db"
     window = max(20, int(os.getenv("DRIFT_WINDOW", "60")))
     ratio = float(os.getenv("DRIFT_MAPE_RATIO", "1.2"))
+    mae_ratio = float(os.getenv("DRIFT_MAE_RATIO", "1.2"))
+    hit_drop = float(os.getenv("DRIFT_HIT_DROP", "0.08"))
+    if hit_drop > 1.0:
+        hit_drop = hit_drop / 100.0
     frames = resolve_timeframes(config)
     try:
         con = sqlite3.connect(db)
@@ -94,6 +108,10 @@ def should_retrain_on_drift(config: TournamentConfig) -> Tuple[bool, str]:
                 return True, f"insufficient_metrics_{tf}"
             if float(recent["mape"]) >= float(prev["mape"]) * ratio:
                 return True, f"drift_alert_{tf}"
+            if float(recent["mae"]) >= float(prev["mae"]) * mae_ratio:
+                return True, f"drift_alert_mae_{tf}"
+            if float(recent["hit_rate"]) <= float(prev["hit_rate"]) - hit_drop:
+                return True, f"drift_alert_hit_{tf}"
     finally:
         con.close()
     return False, "stable_no_drift"

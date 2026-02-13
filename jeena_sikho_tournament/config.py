@@ -55,7 +55,7 @@ class TournamentConfig:
     bias_max_abs: float = 0.01
 
     feature_windows: List[int] = field(default_factory=lambda: [2, 4, 8, 12, 24, 48, 72, 96, 168])
-    cv_folds: int = 3
+    cv_folds: int = 5
     close_hit_bps: float = 15.0
 
     def __post_init__(self) -> None:

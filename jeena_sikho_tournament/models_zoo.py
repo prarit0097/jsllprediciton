@@ -335,7 +335,37 @@ def _optional_dl(task: str) -> List[ModelSpec]:
     return specs
 
 
-def get_candidates(task: str, max_candidates: int, enable_dl: bool) -> List[ModelSpec]:
+def _filter_specs_by_horizon(specs: List[ModelSpec], task: str, candle_minutes: int, strict: bool) -> List[ModelSpec]:
+    if not strict:
+        return specs
+    minutes = max(1, int(candle_minutes))
+    if minutes <= 120:
+        allowed_families = {"naive", "ema", "bias", "zero", "logreg", "sgd", "ridge", "lasso", "enet", "ada", "gb", "hgb", "xgb", "lgb", "gbr_q", "hgb_q", "lgb_q"}
+        allowed_groups = {"fast", "medium"}
+    elif minutes >= 1440:
+        allowed_families = {"naive", "ema", "bias", "zero", "ridge", "lasso", "enet", "rf", "et", "gb", "hgb", "xgb", "lgb", "cat", "gbr_q", "hgb_q", "lgb_q"}
+        allowed_groups = {"fast", "medium", "heavy"}
+    else:
+        allowed_families = {"naive", "ema", "bias", "zero", "sgd", "ridge", "lasso", "enet", "rf", "et", "ada", "gb", "hgb", "xgb", "lgb", "cat", "gbr_q", "hgb_q", "lgb_q"}
+        allowed_groups = {"fast", "medium", "heavy"}
+    out: List[ModelSpec] = []
+    for spec in specs:
+        family = str(spec.meta.get("family", spec.name))
+        group = str(spec.meta.get("group", "fast"))
+        if family in allowed_families and group in allowed_groups:
+            out.append(spec)
+    if out:
+        return out
+    return specs
+
+
+def get_candidates(
+    task: str,
+    max_candidates: int,
+    enable_dl: bool,
+    candle_minutes: int = 60,
+    strict_horizon_pool: bool = True,
+) -> List[ModelSpec]:
     specs: List[ModelSpec] = []
 
     if task == "direction":
@@ -359,6 +389,7 @@ def get_candidates(task: str, max_candidates: int, enable_dl: bool) -> List[Mode
     if enable_dl:
         specs.extend(_optional_dl(task))
 
+    specs = _filter_specs_by_horizon(specs, task, candle_minutes, strict_horizon_pool)
     return specs[:max_candidates]
 
 

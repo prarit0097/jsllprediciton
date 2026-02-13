@@ -714,6 +714,31 @@ def update_pending_predictions(config: TournamentConfig) -> None:
         update_prediction(p["id"], actual, metrics["match_percent"], "ready")
 
 
+def _target_mode() -> str:
+    return os.getenv("RETURN_TARGET_MODE", "volnorm_logret").strip().lower()
+
+
+def _target_scale_from_latest(latest_row: pd.DataFrame) -> float:
+    if latest_row is None or latest_row.empty:
+        return 1.0
+    floor = float(os.getenv("TARGET_VOL_FLOOR", "0.001"))
+    cap = float(os.getenv("TARGET_VOL_CAP", "0.08"))
+    try:
+        raw = float(latest_row.iloc[-1].get("vol_24", 1.0))
+    except Exception:
+        raw = 1.0
+    if not np.isfinite(raw):
+        raw = 1.0
+    return float(max(max(1e-6, floor), min(max(floor, cap), raw)))
+
+
+def _denorm_return(pred_model: float, latest_row: pd.DataFrame, mode: Optional[str]) -> float:
+    m = (mode or _target_mode()).strip().lower()
+    if m in {"volnorm", "volnorm_logret", "normalized"}:
+        return float(pred_model) * _target_scale_from_latest(latest_row)
+    return float(pred_model)
+
+
 def _predict_return_from_champion(config: TournamentConfig, latest_row: pd.DataFrame) -> Optional[Dict[str, Any]]:
     reg = _load_registry(config.registry_path)
     champ = reg.get("champions", {}).get("return")
@@ -729,7 +754,8 @@ def _predict_return_from_champion(config: TournamentConfig, latest_row: pd.DataF
     model = joblib.load(model_path)
     feature_cols = _resolve_feature_cols(model, champ.get("feature_cols", []))
     X = latest_row.reindex(columns=feature_cols, fill_value=0.0)
-    pred = float(model.predict(X)[0])
+    pred_model = float(model.predict(X)[0])
+    pred = _denorm_return(pred_model, latest_row, champ.get("target_mode"))
     score = float(champ.get("final_score") or 0.0)
     confidence_pct = _champion_confidence(score)
     return {
@@ -772,7 +798,8 @@ def _predict_return_from_ensemble(config: TournamentConfig, latest_row: pd.DataF
         model = joblib.load(model_path)
         feature_cols = _resolve_feature_cols(model, member.get("feature_cols", []))
         X = latest_row.reindex(columns=feature_cols, fill_value=0.0)
-        pred_val = float(model.predict(X)[0])
+        pred_model = float(model.predict(X)[0])
+        pred_val = _denorm_return(pred_model, latest_row, member.get("target_mode"))
         if not np.isfinite(pred_val):
             continue
         weight = member.get("final_score")
@@ -1409,7 +1436,9 @@ def refresh_prediction(config: TournamentConfig) -> Dict[str, Any]:
         confidence_pct = float(pred.get("confidence_pct") or 55.0)
         low_conf_threshold = float(os.getenv("LOW_CONFIDENCE_PCT", "45"))
         downweight = float(os.getenv("LOW_CONF_DOWNWEIGHT", "0.5"))
+        skip_threshold = float(os.getenv("LOW_CONFIDENCE_SKIP_PCT", "0"))
         low_confidence = confidence_pct < low_conf_threshold
+        skipped_low_conf = skip_threshold > 0 and confidence_pct < skip_threshold
         if low_confidence:
             factor = max(0.1, min(1.0, downweight * (confidence_pct / max(1.0, low_conf_threshold))))
             predicted_return = float(predicted_return * factor)
@@ -1433,7 +1462,7 @@ def refresh_prediction(config: TournamentConfig) -> Dict[str, Any]:
             "predicted_price": predicted_price,
             "actual_price_1h": None,
             "match_percent": None,
-            "status": "pending",
+            "status": "skipped_low_confidence" if skipped_low_conf else "pending",
             "model_name": pred["model_name"],
             "feature_set": pred["feature_set"],
             "run_id": run_id,
@@ -1450,6 +1479,8 @@ def refresh_prediction(config: TournamentConfig) -> Dict[str, Any]:
         pred_id = insert_prediction(record)
         record["id"] = pred_id
         record["bias_correction"] = bias
+        if skipped_low_conf:
+            record["note"] = f"skipped due to low confidence < {skip_threshold:.1f}%"
         if calibrator.get("active"):
             record["calibration"] = calibrator
         _decorate_pending_target(record, horizon_min)

@@ -259,7 +259,13 @@ def check_model_zoo(config: TournamentConfig) -> Tuple[CheckResult, Dict[str, st
 
     total = 0
     for task in ["direction", "return", "range"]:
-        specs = get_candidates(task, config.max_candidates_per_target, config.enable_dl)
+        specs = get_candidates(
+            task,
+            config.max_candidates_per_target,
+            config.enable_dl,
+            candle_minutes=config.candle_minutes,
+            strict_horizon_pool=True,
+        )
         count = len(specs) * max(1, len(fs_map))
         summary[f"{task}_candidates"] = str(count)
         total += count
