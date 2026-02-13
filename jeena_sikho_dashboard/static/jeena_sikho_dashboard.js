@@ -452,10 +452,10 @@ function renderPredList(predictions) {
     const conf = formatConfidence(pred);
     const match = statusText(pred);
 
-    let lastBlock = 'Last matched: -- | Actual: --';
+    let lastBlock = 'Last matched on last predicted price: -- | Actual: --';
     if (pred.last_ready) {
       const lr = pred.last_ready;
-      const lastLine = `Last matched: ${formatDualPrice(lr.predicted_price, lastFxRate)} (${formatMatchPercent(lr)})${formatDiffHtml(lr)}`;
+      const lastLine = `Last matched on last predicted price: ${formatDualPrice(lr.predicted_price, lastFxRate)} (${formatMatchPercent(lr)})${formatDiffHtml(lr)}`;
       const actualLine = lr.actual_price !== null && lr.actual_price !== undefined
         ? `Actual: ${formatDualPrice(lr.actual_price, lastFxRate)}`
         : 'Actual: --';
