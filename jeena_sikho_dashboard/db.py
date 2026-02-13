@@ -104,6 +104,8 @@ def ensure_tables() -> None:
                 current_price REAL,
                 predicted_return REAL,
                 predicted_price REAL,
+                predicted_price_low REAL,
+                predicted_price_high REAL,
                 actual_price_1h REAL,
                 match_percent REAL,
                 status TEXT,
@@ -113,7 +115,10 @@ def ensure_tables() -> None:
                 prediction_target TEXT,
                 prediction_horizon_min INTEGER,
                 timeframe TEXT,
-                timeframe_minutes INTEGER
+                timeframe_minutes INTEGER,
+                confidence_pct REAL,
+                low_confidence INTEGER,
+                regime TEXT
             )
             """
         )
@@ -126,6 +131,16 @@ def ensure_tables() -> None:
             con.execute("ALTER TABLE btc_predictions ADD COLUMN timeframe TEXT")
         if "timeframe_minutes" not in cols:
             con.execute("ALTER TABLE btc_predictions ADD COLUMN timeframe_minutes INTEGER")
+        if "predicted_price_low" not in cols:
+            con.execute("ALTER TABLE btc_predictions ADD COLUMN predicted_price_low REAL")
+        if "predicted_price_high" not in cols:
+            con.execute("ALTER TABLE btc_predictions ADD COLUMN predicted_price_high REAL")
+        if "confidence_pct" not in cols:
+            con.execute("ALTER TABLE btc_predictions ADD COLUMN confidence_pct REAL")
+        if "low_confidence" not in cols:
+            con.execute("ALTER TABLE btc_predictions ADD COLUMN low_confidence INTEGER")
+        if "regime" not in cols:
+            con.execute("ALTER TABLE btc_predictions ADD COLUMN regime TEXT")
 
 
 def insert_run(
@@ -397,8 +412,9 @@ def get_latest_prediction() -> Optional[Dict[str, Any]]:
         cur = con.execute(
             """
             SELECT id, predicted_at, current_price, predicted_return, predicted_price,
-                   actual_price_1h, match_percent, status, model_name, feature_set, run_id,
-                   prediction_target, prediction_horizon_min, timeframe, timeframe_minutes
+                   predicted_price_low, predicted_price_high, actual_price_1h, match_percent, status, model_name,
+                   feature_set, run_id, prediction_target, prediction_horizon_min, timeframe, timeframe_minutes,
+                   confidence_pct, low_confidence, regime
             FROM btc_predictions
             ORDER BY id DESC LIMIT 1
             """
@@ -412,16 +428,21 @@ def get_latest_prediction() -> Optional[Dict[str, Any]]:
         "current_price": row[2],
         "predicted_return": row[3],
         "predicted_price": row[4],
-        "actual_price_1h": row[5],
-        "match_percent": row[6],
-        "status": row[7],
-        "model_name": row[8],
-        "feature_set": row[9],
-        "run_id": row[10],
-        "prediction_target": row[11],
-        "prediction_horizon_min": row[12],
-        "timeframe": row[13],
-        "timeframe_minutes": row[14],
+        "predicted_price_low": row[5],
+        "predicted_price_high": row[6],
+        "actual_price_1h": row[7],
+        "match_percent": row[8],
+        "status": row[9],
+        "model_name": row[10],
+        "feature_set": row[11],
+        "run_id": row[12],
+        "prediction_target": row[13],
+        "prediction_horizon_min": row[14],
+        "timeframe": row[15],
+        "timeframe_minutes": row[16],
+        "confidence_pct": row[17],
+        "low_confidence": bool(row[18]) if row[18] is not None else None,
+        "regime": row[19],
     }
 
 
@@ -431,7 +452,9 @@ def get_latest_ready_prediction() -> Optional[Dict[str, Any]]:
         cur = con.execute(
             """
             SELECT id, predicted_at, current_price, predicted_return, predicted_price,
-                   actual_price_1h, match_percent, status, model_name, feature_set, run_id, prediction_target, prediction_horizon_min
+                   predicted_price_low, predicted_price_high, actual_price_1h, match_percent, status, model_name,
+                   feature_set, run_id, prediction_target, prediction_horizon_min, timeframe, timeframe_minutes,
+                   confidence_pct, low_confidence, regime
             FROM btc_predictions
             WHERE status = 'ready'
             ORDER BY id DESC LIMIT 1
@@ -446,14 +469,21 @@ def get_latest_ready_prediction() -> Optional[Dict[str, Any]]:
         "current_price": row[2],
         "predicted_return": row[3],
         "predicted_price": row[4],
-        "actual_price_1h": row[5],
-        "match_percent": row[6],
-        "status": row[7],
-        "model_name": row[8],
-        "feature_set": row[9],
-        "run_id": row[10],
-        "prediction_target": row[11],
-        "prediction_horizon_min": row[12],
+        "predicted_price_low": row[5],
+        "predicted_price_high": row[6],
+        "actual_price_1h": row[7],
+        "match_percent": row[8],
+        "status": row[9],
+        "model_name": row[10],
+        "feature_set": row[11],
+        "run_id": row[12],
+        "prediction_target": row[13],
+        "prediction_horizon_min": row[14],
+        "timeframe": row[15],
+        "timeframe_minutes": row[16],
+        "confidence_pct": row[17],
+        "low_confidence": bool(row[18]) if row[18] is not None else None,
+        "regime": row[19],
     }
 
 
@@ -464,15 +494,18 @@ def insert_prediction(row: Dict[str, Any]) -> int:
             """
             INSERT INTO btc_predictions (
                 predicted_at, current_price, predicted_return, predicted_price,
-                actual_price_1h, match_percent, status, model_name, feature_set, run_id,
-                prediction_target, prediction_horizon_min, timeframe, timeframe_minutes
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                predicted_price_low, predicted_price_high, actual_price_1h, match_percent, status, model_name,
+                feature_set, run_id, prediction_target, prediction_horizon_min, timeframe, timeframe_minutes,
+                confidence_pct, low_confidence, regime
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 row.get("predicted_at"),
                 row.get("current_price"),
                 row.get("predicted_return"),
                 row.get("predicted_price"),
+                row.get("predicted_price_low"),
+                row.get("predicted_price_high"),
                 row.get("actual_price_1h"),
                 row.get("match_percent"),
                 row.get("status"),
@@ -483,6 +516,9 @@ def insert_prediction(row: Dict[str, Any]) -> int:
                 row.get("prediction_horizon_min"),
                 row.get("timeframe"),
                 row.get("timeframe_minutes"),
+                row.get("confidence_pct"),
+                1 if row.get("low_confidence") else 0 if row.get("low_confidence") is not None else None,
+                row.get("regime"),
             ),
         )
         return int(cur.lastrowid)
@@ -507,7 +543,7 @@ def list_pending_predictions(cutoff_iso: str) -> List[Dict[str, Any]]:
         cur = con.execute(
             """
             SELECT id, predicted_at, current_price, predicted_return, predicted_price,
-                   prediction_horizon_min, timeframe, timeframe_minutes
+                   prediction_horizon_min, timeframe, timeframe_minutes, confidence_pct, low_confidence, regime
             FROM btc_predictions
             WHERE status = 'pending' AND predicted_at <= ?
             ORDER BY predicted_at ASC
@@ -525,6 +561,9 @@ def list_pending_predictions(cutoff_iso: str) -> List[Dict[str, Any]]:
             "prediction_horizon_min": r[5],
             "timeframe": r[6],
             "timeframe_minutes": r[7],
+            "confidence_pct": r[8],
+            "low_confidence": bool(r[9]) if r[9] is not None else None,
+            "regime": r[10],
         }
         for r in rows
     ]
@@ -536,8 +575,9 @@ def get_latest_prediction_for_timeframe(timeframe: str) -> Optional[Dict[str, An
         cur = con.execute(
             """
             SELECT id, predicted_at, current_price, predicted_return, predicted_price,
-                   actual_price_1h, match_percent, status, model_name, feature_set, run_id,
-                   prediction_target, prediction_horizon_min, timeframe, timeframe_minutes
+                   predicted_price_low, predicted_price_high, actual_price_1h, match_percent, status, model_name,
+                   feature_set, run_id, prediction_target, prediction_horizon_min, timeframe, timeframe_minutes,
+                   confidence_pct, low_confidence, regime
             FROM btc_predictions
             WHERE timeframe = ?
             ORDER BY id DESC LIMIT 1
@@ -553,16 +593,21 @@ def get_latest_prediction_for_timeframe(timeframe: str) -> Optional[Dict[str, An
         "current_price": row[2],
         "predicted_return": row[3],
         "predicted_price": row[4],
-        "actual_price_1h": row[5],
-        "match_percent": row[6],
-        "status": row[7],
-        "model_name": row[8],
-        "feature_set": row[9],
-        "run_id": row[10],
-        "prediction_target": row[11],
-        "prediction_horizon_min": row[12],
-        "timeframe": row[13],
-        "timeframe_minutes": row[14],
+        "predicted_price_low": row[5],
+        "predicted_price_high": row[6],
+        "actual_price_1h": row[7],
+        "match_percent": row[8],
+        "status": row[9],
+        "model_name": row[10],
+        "feature_set": row[11],
+        "run_id": row[12],
+        "prediction_target": row[13],
+        "prediction_horizon_min": row[14],
+        "timeframe": row[15],
+        "timeframe_minutes": row[16],
+        "confidence_pct": row[17],
+        "low_confidence": bool(row[18]) if row[18] is not None else None,
+        "regime": row[19],
     }
 
 
@@ -572,8 +617,9 @@ def get_latest_ready_prediction_for_timeframe(timeframe: str) -> Optional[Dict[s
         cur = con.execute(
             """
             SELECT id, predicted_at, current_price, predicted_return, predicted_price,
-                   actual_price_1h, match_percent, status, model_name, feature_set, run_id,
-                   prediction_target, prediction_horizon_min, timeframe, timeframe_minutes
+                   predicted_price_low, predicted_price_high, actual_price_1h, match_percent, status, model_name,
+                   feature_set, run_id, prediction_target, prediction_horizon_min, timeframe, timeframe_minutes,
+                   confidence_pct, low_confidence, regime
             FROM btc_predictions
             WHERE status = 'ready' AND timeframe = ?
             ORDER BY id DESC LIMIT 1
@@ -589,16 +635,21 @@ def get_latest_ready_prediction_for_timeframe(timeframe: str) -> Optional[Dict[s
         "current_price": row[2],
         "predicted_return": row[3],
         "predicted_price": row[4],
-        "actual_price_1h": row[5],
-        "match_percent": row[6],
-        "status": row[7],
-        "model_name": row[8],
-        "feature_set": row[9],
-        "run_id": row[10],
-        "prediction_target": row[11],
-        "prediction_horizon_min": row[12],
-        "timeframe": row[13],
-        "timeframe_minutes": row[14],
+        "predicted_price_low": row[5],
+        "predicted_price_high": row[6],
+        "actual_price_1h": row[7],
+        "match_percent": row[8],
+        "status": row[9],
+        "model_name": row[10],
+        "feature_set": row[11],
+        "run_id": row[12],
+        "prediction_target": row[13],
+        "prediction_horizon_min": row[14],
+        "timeframe": row[15],
+        "timeframe_minutes": row[16],
+        "confidence_pct": row[17],
+        "low_confidence": bool(row[18]) if row[18] is not None else None,
+        "regime": row[19],
     }
 
 
