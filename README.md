@@ -66,6 +66,11 @@ Nightly gap-repair + validation job:
 .\.venv\Scripts\python.exe -m jeena_sikho.run_repair
 ```
 
+`run_hourly` now also supports:
+- pre-open refill window (default 08:45-09:14 IST)
+- nightly once-per-day repair after market close
+- scheduled cooldown-based auto-repair during closed hours
+
 ## Key Environment Variables
 
 - `MARKET_YFINANCE_SYMBOL=JSLL.NS`
@@ -80,6 +85,8 @@ Nightly gap-repair + validation job:
 - `COMPLETENESS_MIN_PCT`, `COMPLETENESS_LOOKBACK_DAYS`
 - `AUTO_REPAIR_ON_DQ_FAIL`, `BACKFILL_GAP_REPAIR`, `BACKFILL_LOOKBACK_DAYS`
 - `NSE_ADHOC_HOLIDAYS`, `REPAIR_LOOKBACK_DAYS`
+- `PREOPEN_REFILL_ENABLE`, `PREOPEN_REFILL_START_MIN`, `PREOPEN_REFILL_END_MIN`
+- `SCHEDULED_AUTO_REPAIR_ENABLE`, `SCHEDULED_AUTO_REPAIR_COOLDOWN_MIN`
 - `LOW_CONFIDENCE_PCT`, `LOW_CONFIDENCE_SKIP_PCT`
 - `NSE_HOLIDAYS`, `NSE_HOLIDAY_FILE`
 
