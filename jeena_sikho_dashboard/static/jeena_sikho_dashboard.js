@@ -633,6 +633,16 @@ async function loadSummary() {
       });
       horizonEl.textContent = `Horizon champions: ${lines.join(' || ') || '--'}`;
     }
+    const compRows = Array.isArray(data.completeness_by_horizon) ? data.completeness_by_horizon : [];
+    const compEl = document.getElementById('completeness-horizon');
+    if (compEl) {
+      if (!compRows.length) {
+        compEl.textContent = 'Completeness: --';
+      } else {
+        const parts = compRows.map((r) => `${r.timeframe}:${fmt(r.completeness_pct, 2)}% (${r.actual}/${r.expected})`);
+        compEl.textContent = `Completeness (${compRows[0].lookback_days}d): ${parts.join(' || ')}`;
+      }
+    }
   } catch (err) {
     // ignore
   }

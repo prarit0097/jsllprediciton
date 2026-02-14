@@ -3,12 +3,12 @@ import logging
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 import pandas as pd
 import requests
 
-from .market_calendar import IST, load_nse_holidays
+from .market_calendar import IST, is_nse_trading_day, load_nse_holidays
 
 
 @dataclass
@@ -84,7 +84,57 @@ def fetch_binance(symbol: str, timeframe: str, start: dt.datetime) -> pd.DataFra
     return _as_ohlcv(df, "binance")
 
 
-def fetch_yfinance(symbol: str, start: dt.datetime, end: dt.datetime) -> pd.DataFrame:
+def _expected_nse_slots(start_utc: pd.Timestamp, end_utc: pd.Timestamp, interval_minutes: int, holidays: Set[dt.date]) -> pd.DatetimeIndex:
+    step = max(1, int(interval_minutes))
+    start_ist = start_utc.tz_convert(IST)
+    end_ist = end_utc.tz_convert(IST)
+    day = start_ist.date()
+    slots: List[pd.Timestamp] = []
+    while day <= end_ist.date():
+        cur = dt.datetime.combine(day, dt.time(9, 15), tzinfo=IST)
+        if is_nse_trading_day(cur, holidays):
+            if step >= 1440:
+                ts = dt.datetime.combine(day, dt.time(15, 30), tzinfo=IST)
+                slots.append(pd.Timestamp(ts).tz_convert("UTC"))
+            else:
+                minute = 9 * 60 + 15
+                while minute <= (15 * 60 + 30):
+                    hh, mm = divmod(minute, 60)
+                    ts = dt.datetime.combine(day, dt.time(hh, mm), tzinfo=IST)
+                    slots.append(pd.Timestamp(ts).tz_convert("UTC"))
+                    minute += step
+        day = day + dt.timedelta(days=1)
+    if not slots:
+        return pd.DatetimeIndex([], tz="UTC")
+    idx = pd.DatetimeIndex(slots, tz="UTC")
+    return idx[(idx >= start_utc) & (idx <= end_utc)]
+
+
+def _enforce_nse_slots(df: pd.DataFrame, interval_minutes: int, symbol: str) -> pd.DataFrame:
+    sym = (symbol or "").strip().upper()
+    if not (sym.endswith(".NS") or sym.endswith(".BO")):
+        return df
+    if df.empty:
+        return df
+    out = df.copy()
+    out.index = pd.to_datetime(out.index, utc=True)
+    holidays = load_nse_holidays(Path(os.getenv("APP_DATA_DIR", "data")))
+    idx_local = out.index.tz_convert(IST)
+    minute_of_day = idx_local.hour * 60 + idx_local.minute
+    valid_weekday = idx_local.weekday < 5
+    valid_holiday = ~pd.Series(idx_local.date, index=out.index).isin(holidays).to_numpy()
+    valid_session = (minute_of_day >= (9 * 60 + 15)) & (minute_of_day <= (15 * 60 + 30))
+    step = max(1, int(interval_minutes))
+    if step >= 1440:
+        valid_align = minute_of_day == (15 * 60 + 30)
+    else:
+        valid_align = ((minute_of_day - (9 * 60 + 15)) % step) == 0
+    mask = valid_weekday & valid_holiday & valid_session & valid_align
+    out = out.loc[mask]
+    return out[~out.index.duplicated(keep="last")].sort_index()
+
+
+def fetch_yfinance(symbol: str, start: dt.datetime, end: dt.datetime, *, auto_adjust: bool = False, source_name: Optional[str] = None) -> pd.DataFrame:
     try:
         import yfinance as yf  # type: ignore
     except Exception:
@@ -104,7 +154,7 @@ def fetch_yfinance(symbol: str, start: dt.datetime, end: dt.datetime) -> pd.Data
                 start=chunk_start,
                 end=chunk_end,
                 interval="60m",
-                auto_adjust=False,
+                auto_adjust=auto_adjust,
                 progress=False,
             )
         except Exception:
@@ -130,7 +180,9 @@ def fetch_yfinance(symbol: str, start: dt.datetime, end: dt.datetime) -> pd.Data
     data = data[["open", "high", "low", "close", "volume"]]
     data = data[~data.index.duplicated(keep="last")]
     data = _filter_nse_session(data, symbol)
-    return _as_ohlcv(data, "yfinance")
+    data = _enforce_nse_slots(data, 60, symbol)
+    src = source_name or ("yfinance_adj" if auto_adjust else "yfinance")
+    return _as_ohlcv(data, src)
 
 
 def fetch_cryptocompare(symbol: str, start: dt.datetime, end: dt.datetime) -> pd.DataFrame:
@@ -222,7 +274,7 @@ def fetch_cryptocompare_minute(symbol: str, start: dt.datetime, end: dt.datetime
     return _as_ohlcv(df, "cryptocompare")
 
 
-def stitch_sources(sources: List[pd.DataFrame], interval_minutes: int) -> Tuple[pd.DataFrame, CoverageReport]:
+def stitch_sources(sources: List[pd.DataFrame], interval_minutes: int, symbol: str = "") -> Tuple[pd.DataFrame, CoverageReport]:
     if not sources:
         return pd.DataFrame(), CoverageReport(None, 0, 0, interval_minutes)
     non_empty = [s for s in sources if not s.empty]
@@ -233,7 +285,11 @@ def stitch_sources(sources: List[pd.DataFrame], interval_minutes: int) -> Tuple[
         return pd.DataFrame(), CoverageReport(None, 0, 0, interval_minutes)
 
     merged = merged.dropna(subset=["timestamp_utc", "open", "high", "low", "close", "volume"])
-    priority = {"binance": 0, "cryptocompare": 1, "yfinance": 2}
+    priority = {"binance": 2, "cryptocompare": 1, "yfinance": 0, "yfinance_adj": 3, "yfinance_fallback": 4}
+    latest_by_source = merged.groupby("source")["timestamp_utc"].max().to_dict()
+    freshest_src = max(latest_by_source, key=latest_by_source.get) if latest_by_source else None
+    if freshest_src is not None:
+        priority[freshest_src] = -1
     merged["priority"] = merged["source"].map(priority).fillna(9)
     merged = merged.sort_values(["timestamp_utc", "priority"])
     merged = merged.drop_duplicates(subset=["timestamp_utc"], keep="first")
@@ -244,7 +300,12 @@ def stitch_sources(sources: List[pd.DataFrame], interval_minutes: int) -> Tuple[
     total = len(merged)
 
     freq = f"{interval_minutes}min"
-    full_range = pd.date_range(start=earliest, end=merged.index.max(), freq=freq, tz="UTC")
+    is_nse_symbol = (symbol or "").strip().upper().endswith(".NS") or (symbol or "").strip().upper().endswith(".BO")
+    if is_nse_symbol:
+        holidays = load_nse_holidays(Path(os.getenv("APP_DATA_DIR", "data")))
+        full_range = _expected_nse_slots(earliest, merged.index.max(), interval_minutes, holidays)
+    else:
+        full_range = pd.date_range(start=earliest, end=merged.index.max(), freq=freq, tz="UTC")
     missing = len(full_range.difference(merged.index))
 
     return merged.reset_index(), CoverageReport(earliest, total, missing, interval_minutes)
@@ -260,10 +321,13 @@ def fetch_and_stitch(
     end = dt.datetime.now(dt.timezone.utc)
     is_nse_symbol = (yfinance_symbol or "").strip().upper().endswith(".NS") or (yfinance_symbol or "").strip().upper().endswith(".BO")
     if is_nse_symbol:
-        ydf = fetch_yfinance(yfinance_symbol, start, end)
-        if not ydf.empty and interval_minutes != 60:
-            ydf = _aggregate_ohlcv(ydf, interval_minutes)
-        merged, report = stitch_sources([ydf], interval_minutes)
+        ydf_primary = fetch_yfinance(yfinance_symbol, start, end, auto_adjust=False, source_name="yfinance")
+        ydf_fallback = fetch_yfinance(yfinance_symbol, start, end, auto_adjust=True, source_name="yfinance_adj")
+        if not ydf_primary.empty and interval_minutes != 60:
+            ydf_primary = _aggregate_ohlcv(ydf_primary, interval_minutes, yfinance_symbol)
+        if not ydf_fallback.empty and interval_minutes != 60:
+            ydf_fallback = _aggregate_ohlcv(ydf_fallback, interval_minutes, yfinance_symbol)
+        merged, report = stitch_sources([ydf_primary, ydf_fallback], interval_minutes, yfinance_symbol)
         return merged, report
     sources = []
     sources.append(fetch_binance(symbol, timeframe, start))
@@ -272,7 +336,7 @@ def fetch_and_stitch(
         sources.append(fetch_yfinance(yfinance_symbol, start, end))
     else:
         sources.append(fetch_cryptocompare_minute(symbol, start, end, interval_minutes))
-    merged, report = stitch_sources(sources, interval_minutes)
+    merged, report = stitch_sources(sources, interval_minutes, yfinance_symbol)
     return merged, report
 
 
@@ -316,7 +380,7 @@ def _filter_nse_session(data: pd.DataFrame, symbol: str) -> pd.DataFrame:
     return data.loc[mask]
 
 
-def _aggregate_ohlcv(df: pd.DataFrame, interval_minutes: int) -> pd.DataFrame:
+def _aggregate_ohlcv(df: pd.DataFrame, interval_minutes: int, symbol: str = "") -> pd.DataFrame:
     if df.empty or interval_minutes <= 60:
         return df
     out = df.copy()
@@ -359,5 +423,6 @@ def _aggregate_ohlcv(df: pd.DataFrame, interval_minutes: int) -> pd.DataFrame:
         agg = agg[(agg.index.weekday < 5) & (mins >= (9 * 60 + 15)) & (mins <= (15 * 60 + 30))]
 
     agg.index = agg.index.tz_convert("UTC")
+    agg = _enforce_nse_slots(agg, interval_minutes, symbol)
     agg = agg.reset_index().rename(columns={"index": "timestamp_utc"})
     return agg

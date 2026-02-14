@@ -373,10 +373,12 @@ def make_supervised(
         default_event_gap, default_event_clip = 0.08, 0.05
     event_gap = float(os.getenv("EVENT_GAP_THRESHOLD", str(default_event_gap)))
     event_clip = float(os.getenv("EVENT_TARGET_CLIP", str(default_event_clip)))
+    event_mask = pd.Series(False, index=df.index)
     if "gap_from_prev_close" in df.columns:
         event_mask = df["gap_from_prev_close"].abs() >= event_gap
         if event_mask.any():
             df.loc[event_mask, target_label] = df.loc[event_mask, target_label].clip(-event_clip, event_clip)
+    df["is_event_day"] = event_mask.astype(int)
 
     # Keep raw log-return target for evaluation/trading math.
     df["y_ret_raw"] = df[target_label]
@@ -394,6 +396,10 @@ def make_supervised(
         df["y_ret_model"] = df["y_ret_raw"] / (target_scale + 1e-12)
     else:
         df["y_ret_model"] = df["y_ret_raw"]
+
+    drop_event_rows = os.getenv("EVENT_DAY_DROP_FROM_TRAIN", "1").strip().lower() in {"1", "true", "yes", "on"}
+    if drop_event_rows and "is_event_day" in df.columns:
+        df = df.loc[df["is_event_day"] == 0]
 
     df = df.dropna()
     return df

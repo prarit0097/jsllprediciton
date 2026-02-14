@@ -27,6 +27,7 @@ from .splits import walk_forward_cv_splits
 from .storage import Storage
 from .validator import validate_ohlcv_quality
 from .market_calendar import load_nse_holidays
+from .repair import repair_timeframe_data
 from jeena_sikho_dashboard.db import insert_run, insert_scores
 
 def _update_predictions_safe(config) -> None:
@@ -90,16 +91,28 @@ def _prep_data(config: TournamentConfig) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     storage.init_db()
 
     start = _parse_start(config)
+    existing = storage.load()
+    backfill_days = max(1, int(os.getenv("BACKFILL_LOOKBACK_DAYS", "120")))
+    fetch_start = start
+    if not existing.empty:
+        latest = existing.index.max()
+        if latest is not None:
+            fetch_start = max(start, latest - timedelta(days=backfill_days))
     stitched, report = fetch_and_stitch(
         config.symbol,
         config.yfinance_symbol,
-        start,
+        fetch_start,
         config.timeframe,
         config.candle_minutes,
     )
     if not stitched.empty:
         stitched = stitched.set_index("timestamp_utc")
         storage.upsert(stitched)
+    if os.getenv("BACKFILL_GAP_REPAIR", "1").strip().lower() in {"1", "true", "yes", "on"}:
+        try:
+            repair_timeframe_data(config, lookback_days=backfill_days)
+        except Exception as exc:
+            LOGGER.warning("Gap-repair step failed: %s", exc)
     storage.trim(pd.Timestamp(start))
     df = storage.load()
     df = df.loc[df.index >= pd.Timestamp(start)]
@@ -504,16 +517,41 @@ def run_tournament(config: TournamentConfig) -> Dict[str, Any]:
         if df.empty:
             raise RuntimeError("No data available")
         holidays = load_nse_holidays(config.data_dir)
+        dq_lookback_days = max(5, int(os.getenv("DQ_LOOKBACK_DAYS", "120")))
+        dq_cutoff = datetime.now(timezone.utc) - timedelta(days=dq_lookback_days)
+        dq_df = df.loc[df.index >= dq_cutoff] if not df.empty else df
         dq = validate_ohlcv_quality(
-            df,
+            dq_df,
             config.candle_minutes,
             nse_mode=_is_indian_equity(config),
             holidays=holidays,
             max_missing_ratio=float(os.getenv("MAX_MISSING_RATIO", "0.15")),
         )
+        min_comp_pct = float(os.getenv("COMPLETENESS_MIN_PCT", "95"))
+        missing_ratio = float((dq.stats or {}).get("missing_ratio", 1.0))
+        completeness_pct = max(0.0, min(100.0, (1.0 - missing_ratio) * 100.0))
+        if completeness_pct < min_comp_pct:
+            dq.errors.append(f"completeness_below_threshold:{completeness_pct:.2f}%<{min_comp_pct:.2f}%")
+        if not dq.ok and os.getenv("AUTO_REPAIR_ON_DQ_FAIL", "1").strip().lower() in {"1", "true", "yes", "on"}:
+            repair = repair_timeframe_data(config, lookback_days=int(os.getenv("REPAIR_LOOKBACK_DAYS", "120")))
+            LOGGER.warning("DQ failed; auto-repair attempted: %s", repair)
+            df, coverage = _prep_data(config)
+            dq_df = df.loc[df.index >= dq_cutoff] if not df.empty else df
+            dq = validate_ohlcv_quality(
+                dq_df,
+                config.candle_minutes,
+                nse_mode=_is_indian_equity(config),
+                holidays=holidays,
+                max_missing_ratio=float(os.getenv("MAX_MISSING_RATIO", "0.15")),
+            )
+            missing_ratio = float((dq.stats or {}).get("missing_ratio", 1.0))
+            completeness_pct = max(0.0, min(100.0, (1.0 - missing_ratio) * 100.0))
+            if completeness_pct < min_comp_pct:
+                dq.errors.append(f"completeness_below_threshold:{completeness_pct:.2f}%<{min_comp_pct:.2f}%")
         coverage["dq_errors"] = dq.errors
         coverage["dq_warnings"] = dq.warnings
         coverage["dq_stats"] = dq.stats
+        coverage["completeness_pct"] = completeness_pct
         strict_dq = os.getenv("STRICT_DATA_QUALITY", "1").strip().lower() not in {"0", "false", "no", "off"}
         if strict_dq and not dq.ok:
             raise RuntimeError(f"Data quality check failed: {'; '.join(dq.errors)}")

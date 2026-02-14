@@ -60,6 +60,12 @@ $env:FORCE_RUN='1'
 .\.venv\Scripts\python.exe -m jeena_sikho.run_hourly
 ```
 
+Nightly gap-repair + validation job:
+
+```powershell
+.\.venv\Scripts\python.exe -m jeena_sikho.run_repair
+```
+
 ## Key Environment Variables
 
 - `MARKET_YFINANCE_SYMBOL=JSLL.NS`
@@ -71,6 +77,9 @@ $env:FORCE_RUN='1'
 - `RETURN_TARGET_MODE=volnorm_logret`
 - `STRICT_HORIZON_FEATURE_POOL=1`, `STRICT_HORIZON_MODEL_POOL=1`
 - `STRICT_DATA_QUALITY=1`, `MAX_MISSING_RATIO`
+- `COMPLETENESS_MIN_PCT`, `COMPLETENESS_LOOKBACK_DAYS`
+- `AUTO_REPAIR_ON_DQ_FAIL`, `BACKFILL_GAP_REPAIR`, `BACKFILL_LOOKBACK_DAYS`
+- `NSE_ADHOC_HOLIDAYS`, `REPAIR_LOOKBACK_DAYS`
 - `LOW_CONFIDENCE_PCT`, `LOW_CONFIDENCE_SKIP_PCT`
 - `NSE_HOLIDAYS`, `NSE_HOLIDAY_FILE`
 

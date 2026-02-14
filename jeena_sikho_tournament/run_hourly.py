@@ -5,8 +5,9 @@ from datetime import datetime, timezone
 
 from .config import TournamentConfig
 from .drift import should_retrain_on_drift
-from .market_calendar import is_nse_run_window, load_nse_holidays
+from .market_calendar import IST, NSE_RUN_CLOSE_MIN, is_nse_run_window, load_nse_holidays
 from .multi_timeframe import config_for_timeframe, run_multi_timeframe_tournament
+from .repair import run_nightly_repair
 from .tournament import run_tournament
 from .env import load_env
 
@@ -38,6 +39,11 @@ def main():
     holidays = load_nse_holidays(config.data_dir)
     if _is_indian_equity(config) and not force_run:
         if not is_nse_run_window(datetime.now(timezone.utc), holidays):
+            nightly_repair = os.getenv("NIGHTLY_REPAIR_AFTER_CLOSE", "1").strip().lower() in {"1", "true", "yes", "on"}
+            now_ist = datetime.now(timezone.utc).astimezone(IST)
+            if nightly_repair and now_ist.weekday() < 5 and (now_ist.hour * 60 + now_ist.minute) > NSE_RUN_CLOSE_MIN:
+                report = run_nightly_repair(config)
+                print(f"Nightly repair completed: {len(report.get('reports', []))} horizons.")
             print("Outside NSE run window; skipping. Set FORCE_RUN=1 to override.")
             return
     auto_retrain = os.getenv("AUTO_RETRAIN_ON_DRIFT", "1").strip().lower() in {"1", "true", "yes", "on"}

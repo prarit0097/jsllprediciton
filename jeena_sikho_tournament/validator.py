@@ -34,10 +34,14 @@ def _expected_index_nse(df: pd.DataFrame, candle_minutes: int, holidays: Set) ->
     while cur.date() <= end_ts.date():
         if is_nse_trading_day(cur.to_pydatetime(), holidays):
             day_open = cur.replace(hour=9, minute=15, second=0, microsecond=0)
-            for mins in range(open_min, close_min + 1, step):
-                hh, mm = divmod(mins, 60)
-                slot = day_open.replace(hour=hh, minute=mm)
+            if step >= 1440:
+                slot = day_open.replace(hour=15, minute=30)
                 all_slots.append(slot.tz_convert("UTC"))
+            else:
+                for mins in range(open_min, close_min + 1, step):
+                    hh, mm = divmod(mins, 60)
+                    slot = day_open.replace(hour=hh, minute=mm)
+                    all_slots.append(slot.tz_convert("UTC"))
         cur = cur + timedelta(days=1)
     if not all_slots:
         return pd.DatetimeIndex([], tz="UTC")
@@ -95,7 +99,11 @@ def validate_ohlcv_quality(
             errors.append("nse_session_boundary_violation")
 
         step = max(1, int(candle_minutes))
-        if ((minute_of_day - (9 * 60 + 15)) % step != 0).any():
+        if step >= 1440:
+            align_ok = minute_of_day == (15 * 60 + 30)
+        else:
+            align_ok = ((minute_of_day - (9 * 60 + 15)) % step) == 0
+        if (~align_ok).any():
             errors.append("nse_interval_alignment_violation")
 
     expected = _expected_index_nse(df, candle_minutes, holidays) if nse_mode else _expected_index_24x7(df, candle_minutes)

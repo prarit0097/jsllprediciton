@@ -1,4 +1,5 @@
-﻿import sqlite3
+﻿import os
+import sqlite3
 from pathlib import Path
 from typing import Optional
 
@@ -84,6 +85,7 @@ class Storage:
         df = df.sort_index()
         df.index = pd.to_datetime(df.index, utc=True)
         df = df[~df.index.isna()]
+        df = self._filter_off_slot_rows(df)
         rows = [
             (
                 idx.isoformat(),
@@ -104,6 +106,37 @@ class Storage:
                 """,
                 rows,
             )
+
+    def _interval_minutes(self) -> int:
+        if self.table == "ohlcv":
+            return 60
+        if self.table.startswith("ohlcv_") and self.table.endswith("m"):
+            token = self.table[len("ohlcv_"):-1]
+            if token.isdigit():
+                return max(1, int(token))
+        return 60
+
+    def _is_nse_symbol(self) -> bool:
+        sym = (os.getenv("MARKET_YFINANCE_SYMBOL") or "").strip().upper()
+        return sym.endswith(".NS") or sym.endswith(".BO")
+
+    def _filter_off_slot_rows(self, df: pd.DataFrame) -> pd.DataFrame:
+        if df.empty or not self._is_nse_symbol():
+            return df
+        step = self._interval_minutes()
+        idx_local = df.index.tz_convert("Asia/Kolkata")
+        mins = idx_local.hour * 60 + idx_local.minute
+        if step >= 1440:
+            align_ok = mins == (15 * 60 + 30)
+        else:
+            align_ok = ((mins - (9 * 60 + 15)) % max(1, step)) == 0
+        valid = (
+            (idx_local.weekday < 5)
+            & (mins >= (9 * 60 + 15))
+            & (mins <= (15 * 60 + 30))
+            & align_ok
+        )
+        return df.loc[valid]
 
     def trim(self, min_timestamp: pd.Timestamp) -> None:
         if not self.db_path.exists():

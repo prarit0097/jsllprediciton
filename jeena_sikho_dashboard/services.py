@@ -14,6 +14,7 @@ from jeena_sikho_tournament.config import TournamentConfig, _timeframe_to_minute
 from jeena_sikho_tournament.data_sources import fetch_and_stitch
 from jeena_sikho_tournament.features import make_supervised, resolve_feature_windows_for_horizon
 from jeena_sikho_tournament.market_calendar import (
+    IST,
     align_to_nse_interval_floor,
     load_nse_holidays,
     next_nse_slot_at_or_after,
@@ -524,6 +525,62 @@ def _config_for_timeframe(base: TournamentConfig, timeframe: str) -> TournamentC
     return cfg
 
 
+def _expected_points_in_window(start_utc: datetime, end_utc: datetime, tf_minutes: int, nse_mode: bool) -> int:
+    if end_utc <= start_utc:
+        return 0
+    step = max(1, int(tf_minutes))
+    if not nse_mode:
+        rng = pd.date_range(start=start_utc, end=end_utc, freq=f"{step}min", tz="UTC")
+        return int(len(rng))
+    cur = start_utc.astimezone(IST)
+    end_local = end_utc.astimezone(IST)
+    count = 0
+    while cur.date() <= end_local.date():
+        day = cur.date()
+        day_start = datetime(day.year, day.month, day.day, 9, 15, tzinfo=cur.tzinfo)
+        day_end = datetime(day.year, day.month, day.day, 15, 30, tzinfo=cur.tzinfo)
+        if day_start.weekday() < 5 and day not in _NSE_HOLIDAYS:
+            minute = 9 * 60 + 15
+            while minute <= (15 * 60 + 30):
+                hh, mm = divmod(minute, 60)
+                slot = datetime(day.year, day.month, day.day, hh, mm, tzinfo=cur.tzinfo)
+                slot_utc = slot.astimezone(timezone.utc)
+                if start_utc <= slot_utc <= end_utc:
+                    count += 1
+                minute += step
+        cur = cur + timedelta(days=1)
+    return int(count)
+
+
+def _completeness_by_horizon(config: TournamentConfig) -> List[Dict[str, Any]]:
+    lookback_days = max(5, int(os.getenv("COMPLETENESS_LOOKBACK_DAYS", "30")))
+    now = datetime.now(timezone.utc)
+    start = now - timedelta(days=lookback_days)
+    nse_mode = _is_indian_equity()
+    rows: List[Dict[str, Any]] = []
+    for tf in get_timeframes(config):
+        cfg = _config_for_timeframe(config, tf)
+        storage = Storage(cfg.db_path, cfg.ohlcv_table)
+        df = storage.load()
+        if df.empty:
+            rows.append({"timeframe": tf, "lookback_days": lookback_days, "expected": 0, "actual": 0, "completeness_pct": 0.0})
+            continue
+        recent = df.loc[df.index >= start]
+        expected = _expected_points_in_window(start, now, cfg.candle_minutes, nse_mode)
+        actual = int(len(recent))
+        pct = (actual / expected * 100.0) if expected > 0 else 0.0
+        rows.append(
+            {
+                "timeframe": tf,
+                "lookback_days": lookback_days,
+                "expected": expected,
+                "actual": actual,
+                "completeness_pct": round(float(pct), 2),
+            }
+        )
+    return rows
+
+
 def _champion_confidence(final_score: float, stability: float = 0.0, trend_delta: float = 0.0) -> float:
     score = float(final_score)
     stability_penalty = max(0.0, float(stability))
@@ -663,6 +720,7 @@ def get_tournament_summary(config: TournamentConfig) -> Dict[str, Any]:
     drift_status = _compute_drift_status(config)
     backtest_report = _build_backtest_report(config)
     auto_retrain = bool(drift_status.get("alert"))
+    completeness_rows = _completeness_by_horizon(config)
     return {
         "last_run_at": run_at,
         "last_run_started_at": run_started_at,
@@ -675,6 +733,7 @@ def get_tournament_summary(config: TournamentConfig) -> Dict[str, Any]:
         "next_run_at": next_run_local.isoformat(),
         "drift_status": drift_status,
         "backtest_report": backtest_report,
+        "completeness_by_horizon": completeness_rows,
         "auto_retrain_recommended": auto_retrain,
     }
 

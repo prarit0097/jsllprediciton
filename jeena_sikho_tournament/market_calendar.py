@@ -29,6 +29,12 @@ def load_nse_holidays(data_dir: Optional[Path] = None) -> Set[date]:
             day = _parse_day(token)
             if day:
                 holidays.add(day)
+    adhoc_raw = os.getenv("NSE_ADHOC_HOLIDAYS", "")
+    if adhoc_raw:
+        for token in adhoc_raw.replace(";", ",").split(","):
+            day = _parse_day(token)
+            if day:
+                holidays.add(day)
 
     base_dir = data_dir or Path(os.getenv("APP_DATA_DIR", "data"))
     holiday_file = os.getenv("NSE_HOLIDAY_FILE", "").strip()
@@ -41,6 +47,18 @@ def load_nse_holidays(data_dir: Optional[Path] = None) -> Set[date]:
             day = _parse_day(clean)
             if day:
                 holidays.add(day)
+    # Optional yearly official files, e.g. nse_holidays_2026.txt
+    for p in sorted(base_dir.glob("nse_holidays_*.txt")):
+        try:
+            for line in p.read_text(encoding="utf-8").splitlines():
+                clean = line.split("#", 1)[0].strip()
+                if not clean:
+                    continue
+                day = _parse_day(clean)
+                if day:
+                    holidays.add(day)
+        except Exception:
+            continue
     return holidays
 
 
