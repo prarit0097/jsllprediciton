@@ -78,7 +78,11 @@ def check_dependencies() -> Tuple[CheckResult, List[str]]:
 
     required = ["pandas", "numpy", "sklearn", "joblib"]
     recommended = ["ccxt", "yfinance"]
-    optional = ["lightgbm", "xgboost", "catboost"]
+    optional = ["lightgbm", "xgboost"]
+    # catboost wheels are often unavailable on newest Python releases (e.g. 3.14),
+    # so avoid noisy install suggestions when unsupported.
+    if sys.version_info < (3, 14):
+        optional.append("catboost")
 
     for r in required:
         if not _has_module(r):
