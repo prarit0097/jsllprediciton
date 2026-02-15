@@ -3,7 +3,7 @@ import logging
 import os
 from copy import deepcopy
 from concurrent.futures import ProcessPoolExecutor, TimeoutError
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -169,11 +169,212 @@ def _close_hit_rate(y_true: np.ndarray, y_pred: np.ndarray, bps: float) -> float
     return float((err <= tol).mean())
 
 
-def _primary_score_reg_weighted(mae_val: float, y_true: np.ndarray, dir_acc: float, close_hit: float) -> float:
+def _cv_folds_for_horizon(config: TournamentConfig) -> int:
+    minutes = max(1, int(config.candle_minutes))
+    if minutes <= 120:
+        key = "TOURNAMENT_CV_FOLDS_SHORT"
+    elif minutes >= 1440:
+        key = "TOURNAMENT_CV_FOLDS_LONG"
+    else:
+        key = "TOURNAMENT_CV_FOLDS_MID"
+    raw = os.getenv(key)
+    if raw and raw.isdigit():
+        return max(1, int(raw))
+    return max(1, int(config.cv_folds))
+
+
+def _ensemble_top_k_for_horizon(config: TournamentConfig) -> int:
+    minutes = max(1, int(config.candle_minutes))
+    if minutes <= 120:
+        key = "ENSEMBLE_TOP_K_SHORT"
+    elif minutes >= 1440:
+        key = "ENSEMBLE_TOP_K_LONG"
+    else:
+        key = "ENSEMBLE_TOP_K_MID"
+    raw = os.getenv(key)
+    if raw and raw.isdigit():
+        return max(1, int(raw))
+    return max(1, int(config.ensemble_top_k))
+
+
+def _train_days_for_horizon(config: TournamentConfig) -> int:
+    minutes = max(1, int(config.candle_minutes))
+    if minutes <= 60:
+        key = "TRAIN_DAYS_SHORT"
+    elif minutes >= 1440:
+        key = "TRAIN_DAYS_LONG"
+    else:
+        key = "TRAIN_DAYS_MID"
+    raw = os.getenv(key)
+    if raw and raw.isdigit():
+        return max(30, int(raw))
+    return max(30, int(config.train_days))
+
+
+def _min_sup_rows_for_horizon(candle_minutes: int) -> int:
+    minutes = max(1, int(candle_minutes))
+    if minutes <= 60:
+        key = "MIN_SUP_ROWS_SHORT"
+        default = "240"
+    elif minutes >= 1440:
+        key = "MIN_SUP_ROWS_LONG"
+        default = "120"
+    else:
+        key = "MIN_SUP_ROWS_MID"
+        default = "180"
+    raw = os.getenv(key)
+    if raw and raw.isdigit():
+        return max(30, int(raw))
+    return max(30, int(default))
+
+
+def _completeness_min_for_horizon(candle_minutes: int) -> float:
+    minutes = max(1, int(candle_minutes))
+    if minutes <= 60:
+        key = "COMPLETENESS_MIN_PCT_SHORT"
+    elif minutes >= 1440:
+        key = "COMPLETENESS_MIN_PCT_LONG"
+    else:
+        key = "COMPLETENESS_MIN_PCT_MID"
+    raw = os.getenv(key)
+    if raw:
+        try:
+            return float(raw)
+        except ValueError:
+            pass
+    return float(os.getenv("COMPLETENESS_MIN_PCT", "95"))
+
+
+def _min_val_points_for_horizon(config: TournamentConfig) -> int:
+    minutes = max(1, int(config.candle_minutes))
+    if minutes <= 60:
+        key = "MIN_VAL_POINTS_SHORT"
+    elif minutes >= 1440:
+        key = "MIN_VAL_POINTS_LONG"
+    else:
+        key = "MIN_VAL_POINTS_MID"
+    raw = os.getenv(key)
+    if raw and raw.isdigit():
+        return max(1, int(raw))
+    return max(1, int(config.min_val_points))
+
+
+def _regime_code_from_val(val_df: pd.DataFrame) -> np.ndarray:
+    if val_df.empty:
+        return np.array([], dtype=int)
+    open_f = val_df.get("is_opening_hour", pd.Series(0, index=val_df.index)).astype(int).to_numpy()
+    close_f = val_df.get("is_closing_hour", pd.Series(0, index=val_df.index)).astype(int).to_numpy()
+    mins = val_df.get("minutes_from_open", pd.Series(0, index=val_df.index)).astype(float).to_numpy()
+    out = np.full(len(val_df), 1, dtype=int)  # mid-session default
+    out[open_f == 1] = 0
+    out[(close_f == 1) & (open_f == 0)] = 2
+    out[mins < 0] = 3
+    return out
+
+
+def _inv_err_weight(v: float, floor: float = 1e-8) -> float:
+    x = max(floor, float(v))
+    return float(1.0 / x)
+
+
+def _build_member_error_weights(task_results: List[Dict[str, Any]]) -> Dict[str, float]:
+    out: Dict[str, float] = {}
+    vals: List[float] = []
+    keys: List[str] = []
+    for r in task_results:
+        model_id = _model_id(r["spec"], r["feature_set_id"])
+        y_true = np.asarray(r.get("y_true", []), dtype=float)
+        y_pred = np.asarray(r.get("y_pred", []), dtype=float)
+        if y_true.size == 0 or y_true.size != y_pred.size:
+            continue
+        mae_val = float(np.mean(np.abs(y_true - y_pred)))
+        w = _inv_err_weight(mae_val)
+        keys.append(model_id)
+        vals.append(w)
+    if not vals:
+        return out
+    total = float(sum(vals)) + 1e-12
+    for k, v in zip(keys, vals):
+        out[k] = float(v / total)
+    return out
+
+
+def _build_regime_weights(task_results: List[Dict[str, Any]]) -> Dict[str, Dict[str, float]]:
+    names = {0: "opening", 1: "mid_session", 2: "closing", 3: "off_session"}
+    out: Dict[str, Dict[str, float]] = {}
+    for code, name in names.items():
+        vals: List[Tuple[str, float]] = []
+        for r in task_results:
+            model_id = _model_id(r["spec"], r["feature_set_id"])
+            y_true = np.asarray(r.get("y_true", []), dtype=float)
+            y_pred = np.asarray(r.get("y_pred", []), dtype=float)
+            regimes = np.asarray(r.get("regime_codes", []), dtype=int)
+            if y_true.size == 0 or y_true.size != y_pred.size or y_true.size != regimes.size:
+                continue
+            mask = regimes == code
+            if not mask.any():
+                continue
+            mae_val = float(np.mean(np.abs(y_true[mask] - y_pred[mask])))
+            vals.append((model_id, _inv_err_weight(mae_val)))
+        if not vals:
+            continue
+        s = float(sum(v for _, v in vals)) + 1e-12
+        out[name] = {k: float(v / s) for k, v in vals}
+    return out
+
+
+def _regime_top_members(regime_weights: Dict[str, Dict[str, float]], top_k: int = 3) -> Dict[str, List[str]]:
+    out: Dict[str, List[str]] = {}
+    k = max(1, int(top_k))
+    for regime, weights in regime_weights.items():
+        ordered = sorted((weights or {}).items(), key=lambda x: float(x[1]), reverse=True)
+        out[regime] = [mid for mid, _ in ordered[:k]]
+    return out
+
+
+def _unstable_features(df: pd.DataFrame) -> set:
+    if df.empty:
+        return set()
+    if os.getenv("FEATURE_INSTABILITY_DROP_ENABLE", "1").strip().lower() in {"0", "false", "no", "off"}:
+        return set()
+    min_rows = max(30, int(os.getenv("FEATURE_INSTABILITY_MIN_ROWS", "120")))
+    if len(df) < min_rows:
+        return set()
+    ratio_thr = float(os.getenv("FEATURE_INSTABILITY_NAN_RATIO", "0.02"))
+    std_thr = float(os.getenv("FEATURE_INSTABILITY_STD_MIN", "1e-9"))
+    unstable = set()
+    for col in df.columns:
+        if col.startswith("y_") or col in {"target_scale"}:
+            continue
+        s = pd.to_numeric(df[col], errors="coerce")
+        if float(s.isna().mean()) > ratio_thr:
+            unstable.add(col)
+            continue
+        if s.dropna().empty:
+            unstable.add(col)
+            continue
+        std = float(s.std(skipna=True))
+        if (not np.isfinite(std)) or (std <= std_thr):
+            unstable.add(col)
+    return unstable
+
+
+def _primary_score_reg_weighted(
+    mae_val: float,
+    y_true: np.ndarray,
+    dir_acc: float,
+    close_hit: float,
+    candle_minutes: int,
+) -> float:
     mae_component = _primary_score_reg(mae_val, y_true)
-    # Weighted objective requested for JSLL:
-    # 0.5*MAE(accuracy-style) + 0.3*direction_accuracy + 0.2*close_hit_rate
-    return float(0.5 * mae_component + 0.3 * float(dir_acc) + 0.2 * float(close_hit))
+    minutes = max(1, int(candle_minutes))
+    if minutes <= 60:
+        w_mae, w_dir, w_hit = 0.55, 0.25, 0.20
+    elif minutes >= 1440:
+        w_mae, w_dir, w_hit = 0.35, 0.40, 0.25
+    else:
+        w_mae, w_dir, w_hit = 0.50, 0.30, 0.20
+    return float((w_mae * mae_component) + (w_dir * float(dir_acc)) + (w_hit * float(close_hit)))
 
 
 def _primary_score_range(pinball: float, y_true: np.ndarray, cov: float) -> float:
@@ -207,6 +408,24 @@ def _fit_predict_range(spec: ModelSpec, X_train, y_train, X_val):
     model.fit(X_train, y_train)
     y_pred = model.predict(X_val)
     return model, y_pred
+
+
+def _impute_feature_frames(X_train: pd.DataFrame, X_val: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    # Strict model-fit guard: sanitize non-finite values before estimator training.
+    Xt = X_train.copy().replace([np.inf, -np.inf], np.nan)
+    Xv = X_val.copy().replace([np.inf, -np.inf], np.nan)
+
+    medians = Xt.median(numeric_only=True)
+    for col in Xt.columns:
+        med = medians.get(col, np.nan)
+        if not np.isfinite(med):
+            med = 0.0
+        Xt[col] = Xt[col].fillna(float(med))
+        Xv[col] = Xv[col].fillna(float(med))
+
+    Xt = Xt.fillna(0.0)
+    Xv = Xv.fillna(0.0)
+    return Xt, Xv
 
 
 def _clone_model(spec: ModelSpec):
@@ -302,6 +521,7 @@ def _evaluate_candidate(args: Tuple[ModelSpec, str, str, List[Tuple[pd.DataFrame
     fold_trading: List[float] = []
     preds_collect: List[np.ndarray] = []
     truth_collect: List[np.ndarray] = []
+    regime_collect: List[np.ndarray] = []
     last_model: Any = None
     ret_mode = _target_mode(config)
     use_volnorm = ret_mode in {"volnorm", "volnorm_logret", "normalized"}
@@ -311,7 +531,9 @@ def _evaluate_candidate(args: Tuple[ModelSpec, str, str, List[Tuple[pd.DataFrame
             continue
         X_train = train_df[feature_cols]
         X_val = val_df[feature_cols]
+        X_train, X_val = _impute_feature_frames(X_train, X_val)
         spec_local = ModelSpec(spec.name, _clone_model(spec), spec.task, spec.meta)
+        regime_codes = _regime_code_from_val(val_df)
 
         if task == "direction":
             y_train = train_df["y_dir"].values
@@ -328,6 +550,7 @@ def _evaluate_candidate(args: Tuple[ModelSpec, str, str, List[Tuple[pd.DataFrame
             fold_trading.append(trading)
             preds_collect.append(np.asarray(y_pred))
             truth_collect.append(np.asarray(y_val))
+            regime_collect.append(regime_codes)
             last_model = model
             continue
 
@@ -342,17 +565,21 @@ def _evaluate_candidate(args: Tuple[ModelSpec, str, str, List[Tuple[pd.DataFrame
                 y_pred = y_pred_model
             y_val = y_val_raw
             mae_val = mae(y_val, y_pred)
+            rmse_val = float(np.sqrt(np.mean((y_val - y_pred) ** 2))) if len(y_val) else float("inf")
             dir_acc = accuracy((y_val > 0).astype(int), (y_pred > 0).astype(int))
             close_hit = _close_hit_rate(y_val, y_pred, config.close_hit_bps)
             log_ret = y_val
             positions = (y_pred > 0).astype(int)
             net, mdd, trading = trading_score(positions, log_ret, config.fee_slippage)
-            primary = _primary_score_reg_weighted(mae_val, y_val, dir_acc, close_hit)
-            fold_metrics.append({"mae": mae_val, "dir_acc": dir_acc, "close_hit": close_hit, "net": net, "mdd": mdd})
+            primary = _primary_score_reg_weighted(mae_val, y_val, dir_acc, close_hit, config.candle_minutes)
+            fold_metrics.append(
+                {"mae": mae_val, "rmse": rmse_val, "dir_acc": dir_acc, "close_hit": close_hit, "net": net, "mdd": mdd}
+            )
             fold_primary.append(primary)
             fold_trading.append(trading)
             preds_collect.append(np.asarray(y_pred))
             truth_collect.append(np.asarray(y_val))
+            regime_collect.append(regime_codes)
             last_model = model
             continue
 
@@ -380,6 +607,7 @@ def _evaluate_candidate(args: Tuple[ModelSpec, str, str, List[Tuple[pd.DataFrame
         fold_trading.append(trading)
         preds_collect.append(np.asarray(p50))
         truth_collect.append(np.asarray(y_val))
+        regime_collect.append(regime_codes)
         last_model = model
 
     if not fold_metrics or last_model is None:
@@ -392,6 +620,7 @@ def _evaluate_candidate(args: Tuple[ModelSpec, str, str, List[Tuple[pd.DataFrame
 
     y_pred_full = np.concatenate(preds_collect) if preds_collect else np.array([])
     y_true_full = np.concatenate(truth_collect) if truth_collect else np.array([])
+    regime_full = np.concatenate(regime_collect) if regime_collect else np.array([], dtype=int)
     return {
         "spec": spec,
         "feature_set_id": feature_set_id,
@@ -400,6 +629,7 @@ def _evaluate_candidate(args: Tuple[ModelSpec, str, str, List[Tuple[pd.DataFrame
         "trading": float(np.mean(fold_trading)) if fold_trading else 0.0,
         "y_pred": y_pred_full,
         "y_true": y_true_full,
+        "regime_codes": regime_full,
         "model": last_model,
         "target_mode": ret_mode if task in {"return", "range"} else "raw_logret",
     }
@@ -508,6 +738,8 @@ def run_tournament(config: TournamentConfig) -> Dict[str, Any]:
     progress_total: Optional[int] = None
     progress_done = 0
     progress_failed = 0
+    progress_failed_nan = 0
+    progress_failed_other = 0
     progress_task: Optional[str] = None
     progress_last_model: Optional[str] = None
     last_progress_write: Optional[datetime] = None
@@ -527,7 +759,7 @@ def run_tournament(config: TournamentConfig) -> Dict[str, Any]:
             holidays=holidays,
             max_missing_ratio=float(os.getenv("MAX_MISSING_RATIO", "0.15")),
         )
-        min_comp_pct = float(os.getenv("COMPLETENESS_MIN_PCT", "95"))
+        min_comp_pct = _completeness_min_for_horizon(config.candle_minutes)
         missing_ratio = float((dq.stats or {}).get("missing_ratio", 1.0))
         completeness_pct = max(0.0, min(100.0, (1.0 - missing_ratio) * 100.0))
         if completeness_pct < min_comp_pct:
@@ -548,6 +780,23 @@ def run_tournament(config: TournamentConfig) -> Dict[str, Any]:
             completeness_pct = max(0.0, min(100.0, (1.0 - missing_ratio) * 100.0))
             if completeness_pct < min_comp_pct:
                 dq.errors.append(f"completeness_below_threshold:{completeness_pct:.2f}%<{min_comp_pct:.2f}%")
+        if completeness_pct < min_comp_pct and os.getenv("AUTO_REPAIR_ON_COMPLETENESS_FAIL", "1").strip().lower() in {"1", "true", "yes", "on"}:
+            try:
+                repair = repair_timeframe_data(config, lookback_days=int(os.getenv("REPAIR_LOOKBACK_DAYS", "120")))
+                LOGGER.warning("Completeness gate failed; auto-repair attempted: %s", repair)
+                df, coverage = _prep_data(config)
+                dq_df = df.loc[df.index >= dq_cutoff] if not df.empty else df
+                dq = validate_ohlcv_quality(
+                    dq_df,
+                    config.candle_minutes,
+                    nse_mode=_is_indian_equity(config),
+                    holidays=holidays,
+                    max_missing_ratio=float(os.getenv("MAX_MISSING_RATIO", "0.15")),
+                )
+                missing_ratio = float((dq.stats or {}).get("missing_ratio", 1.0))
+                completeness_pct = max(0.0, min(100.0, (1.0 - missing_ratio) * 100.0))
+            except Exception as exc:
+                LOGGER.warning("Completeness auto-repair failed: %s", exc)
         coverage["dq_errors"] = dq.errors
         coverage["dq_warnings"] = dq.warnings
         coverage["dq_stats"] = dq.stats
@@ -555,18 +804,48 @@ def run_tournament(config: TournamentConfig) -> Dict[str, Any]:
         strict_dq = os.getenv("STRICT_DATA_QUALITY", "1").strip().lower() not in {"0", "false", "no", "off"}
         if strict_dq and not dq.ok:
             raise RuntimeError(f"Data quality check failed: {'; '.join(dq.errors)}")
+        if completeness_pct < min_comp_pct:
+            LOGGER.warning(
+                "Skipping run due to completeness gate %.2f%% < %.2f%% (timeframe=%s)",
+                completeness_pct,
+                min_comp_pct,
+                config.timeframe,
+            )
+            return {
+                "coverage": coverage,
+                "status": "skipped_completeness_gate",
+                "timeframe": config.timeframe,
+                "completeness_pct": completeness_pct,
+                "min_completeness_pct": min_comp_pct,
+            }
         if dq.warnings:
             LOGGER.warning("Data quality warnings: %s", "; ".join(dq.warnings))
 
         sup, feature_sets_map = _build_dataset(df, config)
+        min_sup_rows = _min_sup_rows_for_horizon(config.candle_minutes)
+        if len(sup) < min_sup_rows:
+            LOGGER.warning(
+                "Skipping run due to low supervised rows %d < %d (timeframe=%s)",
+                len(sup),
+                min_sup_rows,
+                config.timeframe,
+            )
+            return {
+                "coverage": coverage,
+                "status": "skipped_low_samples",
+                "timeframe": config.timeframe,
+                "supervised_rows": int(len(sup)),
+                "min_supervised_rows": int(min_sup_rows),
+            }
         registry = load_registry(config.registry_path)
+        train_days_eff = _train_days_for_horizon(config)
         cv_splits = walk_forward_cv_splits(
             sup,
-            config.train_days,
+            train_days_eff,
             config.val_hours,
             config.test_hours,
             config.use_test,
-            folds=config.cv_folds,
+            folds=_cv_folds_for_horizon(config),
         )
         if not cv_splits:
             raise RuntimeError("No valid CV splits")
@@ -582,15 +861,30 @@ def run_tournament(config: TournamentConfig) -> Dict[str, Any]:
         per_task_candidates: Dict[str, List[Tuple[ModelSpec, str, List[str]]]] = {}
         per_task_feature_cols: Dict[str, Dict[str, List[str]]] = {}
         strict_horizon_pool = os.getenv("STRICT_HORIZON_MODEL_POOL", "1").strip().lower() not in {"0", "false", "no", "off"}
+        unstable_feats = _unstable_features(sup)
         for task in ["direction", "return", "range"]:
+            max_cands_for_task = config.max_candidates_per_target
+            low_sample_enable = os.getenv("LOW_SAMPLE_CANDIDATE_SHRINK_ENABLE", "1").strip().lower() in {"1", "true", "yes", "on"}
+            if low_sample_enable:
+                nrows = len(sup)
+                if config.candle_minutes >= 1440:
+                    low_n = max(50, int(os.getenv("LOW_SAMPLE_ROWS_LONG", "180")))
+                elif config.candle_minutes >= 120:
+                    low_n = max(120, int(os.getenv("LOW_SAMPLE_ROWS_MID", "360")))
+                else:
+                    low_n = 0
+                if low_n and nrows < low_n:
+                    scale = min(1.0, max(0.2, float(os.getenv("LOW_SAMPLE_CANDIDATE_SCALE", "0.5"))))
+                    max_cands_for_task = max(20, int(round(config.max_candidates_per_target * scale)))
             specs = get_candidates(
                 task,
-                config.max_candidates_per_target,
+                max_cands_for_task,
                 config.enable_dl,
                 candle_minutes=config.candle_minutes,
                 strict_horizon_pool=strict_horizon_pool,
             )
             dropped_features = _feature_drop_set(registry, task)
+            dropped_features = dropped_features.union(unstable_feats)
             fs_cols_map: Dict[str, List[str]] = {}
             candidates = []
             for fs_id, cols in feature_sets_map.items():
@@ -614,8 +908,8 @@ def run_tournament(config: TournamentConfig) -> Dict[str, Any]:
                 if all(r in cols for r in req):
                     filtered.append((spec, fs_id, cols))
             candidates = filtered
-            if len(candidates) > config.max_candidates_per_target:
-                candidates = _cap_candidates(candidates, config.max_candidates_per_target, config.random_seed)
+            if len(candidates) > max_cands_for_task:
+                candidates = _cap_candidates(candidates, max_cands_for_task, config.random_seed)
             per_task_candidates[task] = candidates
             per_task_feature_cols[task] = fs_cols_map
 
@@ -683,9 +977,15 @@ def run_tournament(config: TournamentConfig) -> Dict[str, Any]:
                         except TimeoutError:
                             LOGGER.info("Timeout: %s", spec.name)
                             progress_failed += 1
+                            progress_failed_other += 1
                         except Exception as exc:
                             LOGGER.warning("Failed: %s %s", spec.name, exc)
                             progress_failed += 1
+                            msg = str(exc).lower()
+                            if "nan" in msg or "inf" in msg or "input x contains" in msg:
+                                progress_failed_nan += 1
+                            else:
+                                progress_failed_other += 1
                         progress_done += 1
                         progress_last_model = _model_id(spec, fs_id)
                         _emit_progress()
@@ -699,6 +999,11 @@ def run_tournament(config: TournamentConfig) -> Dict[str, Any]:
                     except Exception as exc:
                         LOGGER.warning("Failed: %s %s", spec.name, exc)
                         progress_failed += 1
+                        msg = str(exc).lower()
+                        if "nan" in msg or "inf" in msg or "input x contains" in msg:
+                            progress_failed_nan += 1
+                        else:
+                            progress_failed_other += 1
                     progress_done += 1
                     progress_last_model = _model_id(spec, fs_id)
                     _emit_progress()
@@ -720,7 +1025,7 @@ def run_tournament(config: TournamentConfig) -> Dict[str, Any]:
             artifacts_dir = config.data_dir / "models" / task
             artifacts_dir.mkdir(parents=True, exist_ok=True)
             ts = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
-            top_k = max(1, min(config.ensemble_top_k, len(task_results)))
+            top_k = max(1, min(_ensemble_top_k_for_horizon(config), len(task_results)))
             ensemble_members: List[Dict[str, Any]] = []
             best_member: Optional[Dict[str, Any]] = None
 
@@ -789,6 +1094,16 @@ def run_tournament(config: TournamentConfig) -> Dict[str, Any]:
                             }
                 except Exception as exc:
                     LOGGER.warning("Failed to build stacking model: %s", exc)
+            dynamic_error_weights = {}
+            regime_weights = {}
+            if task == "return" and ensemble_members:
+                id_set = {m.get("model_id") for m in ensemble_members}
+                filtered_for_weights = [
+                    r for r in task_results
+                    if _model_id(r["spec"], r["feature_set_id"]) in id_set
+                ]
+                dynamic_error_weights = _build_member_error_weights(filtered_for_weights)
+                regime_weights = _build_regime_weights(filtered_for_weights)
 
             best = task_results[0]
             record_model_score(registry, best["family"], best["final_score"], config.history_keep)
@@ -825,6 +1140,11 @@ def run_tournament(config: TournamentConfig) -> Dict[str, Any]:
                 "members": ensemble_members,
                 "run_at": run_at,
             }
+            if dynamic_error_weights:
+                ensemble_record["error_weights"] = dynamic_error_weights
+            if regime_weights:
+                ensemble_record["regime_weights"] = regime_weights
+                ensemble_record["regime_top_members"] = _regime_top_members(regime_weights, top_k=3)
             if stacking_info:
                 ensemble_record["stacking"] = stacking_info
             registry.setdefault("ensembles", {})[task] = ensemble_record
@@ -833,7 +1153,7 @@ def run_tournament(config: TournamentConfig) -> Dict[str, Any]:
                 registry,
                 task,
                 challenger,
-                config.min_val_points,
+                _min_val_points_for_horizon(config),
                 config.champion_margin,
                 config.champion_margin_override,
                 config.champion_cooldown_hours,
@@ -899,7 +1219,7 @@ def run_tournament(config: TournamentConfig) -> Dict[str, Any]:
                 max_workers=config.max_workers,
                 timeframe=config.timeframe,
                 candle_minutes=config.candle_minutes,
-                train_days=config.train_days,
+                train_days=train_days_eff,
                 val_hours=config.val_hours,
                 max_candidates_total=config.max_candidates_total,
                 max_candidates_per_target=config.max_candidates_per_target,
@@ -910,6 +1230,14 @@ def run_tournament(config: TournamentConfig) -> Dict[str, Any]:
         except Exception as exc:
             LOGGER.warning("Failed to store scoreboard: %s", exc)
         _update_predictions_safe(config)
+        results["run_audit"] = {
+            "failed_models": int(progress_failed),
+            "failed_nan_like": int(progress_failed_nan),
+            "failed_other": int(progress_failed_other),
+            "train_days_effective": int(train_days_eff),
+            "supervised_rows": int(len(sup)),
+            "min_supervised_rows": int(min_sup_rows),
+        }
         LOGGER.info("Tournament complete")
         return results
     except Exception as exc:

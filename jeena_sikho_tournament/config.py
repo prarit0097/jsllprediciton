@@ -154,6 +154,9 @@ class TournamentConfig:
         env_use_test = os.getenv("USE_TEST")
         if env_use_test is not None:
             self.use_test = env_use_test.strip().lower() in {"1", "true", "yes", "on"}
+        env_min_val = os.getenv("MIN_VAL_POINTS")
+        if env_min_val and env_min_val.isdigit():
+            self.min_val_points = max(1, int(env_min_val))
 
 
 def _env_first(*keys: str) -> str:

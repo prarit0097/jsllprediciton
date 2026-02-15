@@ -69,9 +69,63 @@ def _summarize_rows(rows: List[Tuple[float, float]]) -> Dict[str, float]:
     }
 
 
+def _volatility_state(config: TournamentConfig) -> str:
+    if os.getenv("ADAPTIVE_RETRAIN_ENABLE", "1").strip().lower() in {"0", "false", "no", "off"}:
+        return "normal"
+    table = "ohlcv" if int(config.candle_minutes) == 60 else f"ohlcv_{int(config.candle_minutes)}m"
+    db = config.db_path
+    if not db.exists():
+        return "normal"
+    try:
+        con = sqlite3.connect(db)
+    except Exception:
+        return "normal"
+    try:
+        cur = con.execute(
+            f"""
+            SELECT close
+            FROM {table}
+            ORDER BY timestamp_utc DESC
+            LIMIT 260
+            """
+        )
+        vals = [float(r[0]) for r in cur.fetchall() if r and r[0] is not None]
+    except Exception:
+        con.close()
+        return "normal"
+    finally:
+        try:
+            con.close()
+        except Exception:
+            pass
+    if len(vals) < 80:
+        return "normal"
+    arr = np.asarray(list(reversed(vals)), dtype=float)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        ret = np.diff(np.log(arr))
+    ret = ret[np.isfinite(ret)]
+    if ret.size < 60:
+        return "normal"
+    recent = float(np.mean(np.abs(ret[-20:])))
+    base = float(np.mean(np.abs(ret[-120:-20]))) if ret.size >= 140 else float(np.mean(np.abs(ret[:-20])))
+    if base <= 1e-12:
+        return "normal"
+    ratio = recent / base
+    high_thr = float(os.getenv("VOL_RETRAIN_HIGH_RATIO", "1.35"))
+    low_thr = float(os.getenv("VOL_RETRAIN_LOW_RATIO", "0.75"))
+    if ratio >= high_thr:
+        return "high"
+    if ratio <= low_thr:
+        return "low"
+    return "normal"
+
+
 def should_retrain_on_drift(config: TournamentConfig) -> Tuple[bool, str]:
     if not _has_any_champion(config):
         return True, "no_champion_yet"
+    vol_state = _volatility_state(config)
+    if vol_state == "high":
+        return True, "volatility_high_force_retrain"
     db = config.db_path
     if not db.exists():
         return True, "no_db"
@@ -79,6 +133,10 @@ def should_retrain_on_drift(config: TournamentConfig) -> Tuple[bool, str]:
     ratio = float(os.getenv("DRIFT_MAPE_RATIO", "1.2"))
     mae_ratio = float(os.getenv("DRIFT_MAE_RATIO", "1.2"))
     hit_drop = float(os.getenv("DRIFT_HIT_DROP", "0.08"))
+    if vol_state == "low":
+        ratio = ratio * float(os.getenv("LOW_VOL_MAPE_MULT", "1.15"))
+        mae_ratio = mae_ratio * float(os.getenv("LOW_VOL_MAE_MULT", "1.15"))
+        hit_drop = hit_drop * float(os.getenv("LOW_VOL_HIT_MULT", "1.2"))
     if hit_drop > 1.0:
         hit_drop = hit_drop / 100.0
     frames = resolve_timeframes(config)

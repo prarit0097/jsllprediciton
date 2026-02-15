@@ -62,6 +62,28 @@ def load_nse_holidays(data_dir: Optional[Path] = None) -> Set[date]:
     return holidays
 
 
+def load_nse_completeness_exclusions(data_dir: Optional[Path] = None) -> Set[date]:
+    out: Set[date] = set()
+    raw = os.getenv("NSE_COMPLETENESS_EXCLUDE_DATES", "")
+    if raw:
+        for token in raw.replace(";", ",").split(","):
+            day = _parse_day(token)
+            if day:
+                out.add(day)
+    base_dir = data_dir or Path(os.getenv("APP_DATA_DIR", "data"))
+    file_path = os.getenv("NSE_COMPLETENESS_EXCLUDE_FILE", "").strip()
+    path = Path(file_path) if file_path else (base_dir / "nse_completeness_exclude.txt")
+    if path.exists():
+        for line in path.read_text(encoding="utf-8").splitlines():
+            clean = line.split("#", 1)[0].strip()
+            if not clean:
+                continue
+            day = _parse_day(clean)
+            if day:
+                out.add(day)
+    return out
+
+
 def is_nse_trading_day(ts_ist: datetime, holidays: Set[date]) -> bool:
     return ts_ist.weekday() < 5 and ts_ist.date() not in holidays
 

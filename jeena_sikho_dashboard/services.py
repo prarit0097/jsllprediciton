@@ -61,11 +61,30 @@ MATCH_MAX_NONZERO = 99.9999
 _RUN_LOCK = threading.Lock()
 _RUN_STATE = {"running": False, "last_started_at": None}
 _RUN_STATE_PATH = Path(os.getenv("APP_DATA_DIR", "data")) / "run_state.json"
+_CALIB_STATE_PATH = Path(os.getenv("APP_DATA_DIR", "data")) / "calibration_state.json"
 _PRICE_CACHE: Dict[str, Any] = {}
 _FX_CACHE: Dict[str, Any] = {}
 _TOURNAMENT_INTERVAL_MIN = int(os.getenv("TOURNAMENT_INTERVAL_MINUTES", "120"))
 _TOURNAMENT_START_MIN = int(os.getenv("TOURNAMENT_SCHEDULE_MINUTE", "1"))
 _NSE_HOLIDAYS = load_nse_holidays(Path(os.getenv("APP_DATA_DIR", "data")))
+
+
+def _load_calib_state() -> Dict[str, Any]:
+    if not _CALIB_STATE_PATH.exists():
+        return {}
+    try:
+        raw = json.loads(_CALIB_STATE_PATH.read_text(encoding="utf8"))
+        return raw if isinstance(raw, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_calib_state(state: Dict[str, Any]) -> None:
+    try:
+        _CALIB_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        _CALIB_STATE_PATH.write_text(json.dumps(state, indent=2), encoding="utf8")
+    except Exception:
+        pass
 
 
 def _quote_currency() -> str:
@@ -360,6 +379,19 @@ def _prediction_target_timestamp(pred_at: datetime, horizon_min: int, tf_minutes
     if not _is_indian_equity():
         anchor = _align_to_interval(pred_at, step)
         return anchor + timedelta(minutes=horizon)
+
+    if horizon >= 1440:
+        # NSE daily label is standardized to next trading-day close (15:30 IST).
+        steps = int(np.ceil(horizon / 1440.0))
+        cur_local = pred_at.astimezone(IST)
+        day = cur_local.date()
+        advanced = 0
+        while advanced < steps:
+            day = day + timedelta(days=1)
+            probe = datetime(day.year, day.month, day.day, 15, 30, tzinfo=IST)
+            if probe.weekday() < 5 and day not in _NSE_HOLIDAYS:
+                advanced += 1
+        return datetime(day.year, day.month, day.day, 15, 30, tzinfo=IST).astimezone(timezone.utc)
 
     anchor = align_to_nse_interval_floor(pred_at, step, _NSE_HOLIDAYS)
     full_steps = max(1, int(np.ceil(horizon / step)))
@@ -840,6 +872,9 @@ def _predict_return_from_ensemble(config: TournamentConfig, latest_row: pd.DataF
     candidates: List[Dict[str, Any]] = []
     pred_map: Dict[str, float] = {}
     regime_name = regime or _market_regime()
+    regime_weights = (ensemble.get("regime_weights") or {}).get(regime_name, {})
+    regime_top_members = (ensemble.get("regime_top_members") or {}).get(regime_name) or []
+    error_weights = ensemble.get("error_weights") or {}
     regime_pref = {
         "opening": {"micro_momentum", "momentum", "session", "vwap_flow"},
         "mid_session": {"trend", "trend_longer", "signal", "base"},
@@ -867,9 +902,11 @@ def _predict_return_from_ensemble(config: TournamentConfig, latest_row: pd.DataF
         except (TypeError, ValueError):
             weight_val = 1.0
         fs_id = str(member.get("feature_set_id") or "")
-        regime_bonus = 0.2 if fs_id in pref else 0.0
-        routed_weight = max(0.0, weight_val + regime_bonus)
         model_id = member.get("model_id", "unknown")
+        err_boost = float(error_weights.get(model_id, 0.0))
+        regime_gate = float(regime_weights.get(model_id, 0.0))
+        regime_bonus = 0.2 if fs_id in pref else 0.0
+        routed_weight = max(0.0, (0.6 * weight_val) + (0.25 * err_boost) + (0.15 * regime_gate) + regime_bonus)
         pred_map[model_id] = pred_val
         candidates.append(
             {
@@ -885,6 +922,10 @@ def _predict_return_from_ensemble(config: TournamentConfig, latest_row: pd.DataF
     candidates.sort(key=lambda c: c["weight"], reverse=True)
     top_n = max(1, int(os.getenv("ROUTING_TOP_MEMBERS", "3")))
     selected = candidates[:top_n]
+    if regime_top_members:
+        preferred = [c for c in candidates if str(c.get("model_id")) in set(regime_top_members)]
+        if preferred:
+            selected = preferred[: min(top_n, len(preferred))]
     preds = [float(c["pred"]) for c in selected]
     weights = [float(c["weight"]) for c in selected]
     used_members = [str(c["model_id"]) for c in selected]
@@ -921,7 +962,7 @@ def _predict_return_from_ensemble(config: TournamentConfig, latest_row: pd.DataF
 
     return {
         "predicted_return": predicted_return,
-        "model_name": "stacked_ridge" if used_stacking else f"ensemble_top{len(preds)}",
+        "model_name": "stacked_ridge" if used_stacking else f"gated_ensemble_top{len(preds)}",
         "feature_set": "ensemble",
         "ensemble_members": used_members,
         "ensemble_size": len(preds),
@@ -1059,28 +1100,170 @@ def _fit_return_calibrator(config: TournamentConfig, timeframe: str) -> Dict[str
             xs.append(x)
             ys.append(y)
     if len(xs) < min_samples:
-        return {"alpha": 0.0, "beta": 1.0, "samples": len(xs), "active": False}
+        return {"method": "none", "samples": len(xs), "active": False}
 
-    X = np.column_stack([np.ones(len(xs)), np.asarray(xs)])
-    y_arr = np.asarray(ys)
+    x_arr = np.asarray(xs, dtype=float)
+    y_arr = np.asarray(ys, dtype=float)
+    n = len(x_arr)
+    holdout = max(5, int(round(n * 0.2)))
+    holdout = min(max(5, holdout), n - 2)
+    tr_x, va_x = x_arr[:-holdout], x_arr[-holdout:]
+    tr_y, va_y = y_arr[:-holdout], y_arr[-holdout:]
+
+    candidates: List[Dict[str, Any]] = []
+
+    # Linear calibrator.
     try:
-        coeff, *_ = np.linalg.lstsq(X, y_arr, rcond=None)
-        alpha = float(coeff[0])
-        beta = float(coeff[1])
+        X = np.column_stack([np.ones(len(tr_x)), tr_x])
+        coeff, *_ = np.linalg.lstsq(X, tr_y, rcond=None)
+        alpha = float(max(-0.05, min(0.05, coeff[0])))
+        beta = float(max(-2.0, min(2.0, coeff[1])))
+        lin_pred = alpha + (beta * va_x)
+        lin_rmse = float(np.sqrt(np.mean((va_y - lin_pred) ** 2)))
+        candidates.append(
+            {
+                "method": "linear",
+                "alpha": alpha,
+                "beta": beta,
+                "samples": n,
+                "active": True,
+                "rmse": lin_rmse,
+            }
+        )
     except Exception:
-        return {"alpha": 0.0, "beta": 1.0, "samples": len(xs), "active": False}
+        pass
 
-    alpha = max(-0.05, min(0.05, alpha))
-    beta = max(-2.0, min(2.0, beta))
-    return {"alpha": alpha, "beta": beta, "samples": len(xs), "active": True}
+    # Isotonic calibrator.
+    try:
+        from sklearn.isotonic import IsotonicRegression  # type: ignore
+
+        iso = IsotonicRegression(out_of_bounds="clip")
+        iso.fit(tr_x, tr_y)
+        va_pred = iso.predict(va_x)
+        iso_rmse = float(np.sqrt(np.mean((va_y - va_pred) ** 2)))
+        candidates.append(
+            {
+                "method": "isotonic",
+                "samples": n,
+                "active": True,
+                "x": tr_x.tolist(),
+                "y": iso.predict(tr_x).tolist(),
+                "rmse": iso_rmse,
+            }
+        )
+    except Exception:
+        pass
+
+    # Quantile-bin calibrator (robust monotonic approximation).
+    try:
+        q = np.linspace(0.0, 1.0, 8)
+        bins = np.quantile(tr_x, q)
+        bins = np.unique(bins)
+        if bins.size >= 3:
+            mids: List[float] = []
+            vals: List[float] = []
+            for i in range(len(bins) - 1):
+                lo, hi = bins[i], bins[i + 1]
+                mask = (tr_x >= lo) & (tr_x <= hi if i == len(bins) - 2 else tr_x < hi)
+                if not mask.any():
+                    continue
+                mids.append(float(np.median(tr_x[mask])))
+                vals.append(float(np.median(tr_y[mask])))
+            if len(mids) >= 3:
+                va_pred = np.interp(va_x, mids, vals, left=vals[0], right=vals[-1])
+                q_rmse = float(np.sqrt(np.mean((va_y - va_pred) ** 2)))
+                candidates.append(
+                    {
+                        "method": "quantile",
+                        "samples": n,
+                        "active": True,
+                        "x": mids,
+                        "y": vals,
+                        "rmse": q_rmse,
+                    }
+                )
+    except Exception:
+        pass
+
+    if not candidates:
+        return {"method": "none", "samples": n, "active": False}
+
+    # Persist per-horizon calibration quality and use sticky selection to avoid noisy method-flips.
+    state = _load_calib_state()
+    tf_state = state.get(timeframe, {}) if isinstance(state, dict) else {}
+    method_scores = tf_state.get("method_scores", {}) if isinstance(tf_state, dict) else {}
+    alpha = min(1.0, max(0.05, float(os.getenv("CALIB_SCORE_EMA_ALPHA", "0.35"))))
+    switch_gain = min(0.5, max(0.0, float(os.getenv("CALIB_MIN_SWITCH_GAIN", "0.05"))))
+    sticky_margin = min(0.5, max(0.0, float(os.getenv("CALIB_STICKINESS_MARGIN", "0.08"))))
+
+    current_rmse = {str(c.get("method")): float(c.get("rmse", 1e9)) for c in candidates}
+    rolling_rmse: Dict[str, float] = {}
+    for method, rmse_val in current_rmse.items():
+        prev = method_scores.get(method)
+        try:
+            prev_val = float(prev)
+        except (TypeError, ValueError):
+            prev_val = rmse_val
+        if np.isfinite(prev_val):
+            rolling_rmse[method] = float((alpha * rmse_val) + ((1.0 - alpha) * prev_val))
+        else:
+            rolling_rmse[method] = float(rmse_val)
+
+    best_method = min(rolling_rmse.items(), key=lambda kv: kv[1])[0]
+    best = next((c for c in candidates if str(c.get("method")) == best_method), candidates[0])
+
+    prev_method = str(tf_state.get("selected_method", "")).strip().lower()
+    selected_reason = "best_rolling_rmse"
+    if prev_method and prev_method in current_rmse:
+        prev_roll = float(rolling_rmse.get(prev_method, 1e9))
+        best_roll = float(rolling_rmse.get(best_method, 1e9))
+        prev_cur = float(current_rmse.get(prev_method, 1e9))
+        best_cur = float(current_rmse.get(best_method, 1e9))
+        rel_gain = (prev_roll - best_roll) / max(1e-9, abs(prev_roll))
+        if (prev_cur <= best_cur * (1.0 + sticky_margin)) or (rel_gain < switch_gain):
+            best = next((c for c in candidates if str(c.get("method")) == prev_method), best)
+            best_method = prev_method
+            selected_reason = "sticky_previous_method"
+        else:
+            selected_reason = "switch_on_material_gain"
+
+    # Save rolling calibration scores by horizon.
+    try:
+        state = state if isinstance(state, dict) else {}
+        state[timeframe] = {
+            "selected_method": best_method,
+            "method_scores": rolling_rmse,
+            "samples": int(n),
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+        _save_calib_state(state)
+    except Exception:
+        pass
+
+    best["selected_from"] = [c.get("method") for c in candidates]
+    best["selection_reason"] = selected_reason
+    best["rolling_rmse"] = rolling_rmse
+    return best
 
 
 def _apply_return_calibrator(predicted_return: float, calibrator: Dict[str, Any]) -> float:
     if not calibrator or not calibrator.get("active"):
         return float(predicted_return)
-    alpha = float(calibrator.get("alpha", 0.0))
-    beta = float(calibrator.get("beta", 1.0))
-    return float(alpha + (beta * float(predicted_return)))
+    method = str(calibrator.get("method", "linear")).strip().lower()
+    x = float(predicted_return)
+    if method == "linear":
+        alpha = float(calibrator.get("alpha", 0.0))
+        beta = float(calibrator.get("beta", 1.0))
+        return float(alpha + (beta * x))
+    if method in {"isotonic", "quantile"}:
+        xs = np.asarray(calibrator.get("x") or [], dtype=float)
+        ys = np.asarray(calibrator.get("y") or [], dtype=float)
+        if xs.size >= 2 and ys.size >= 2 and xs.size == ys.size:
+            order = np.argsort(xs)
+            xs = xs[order]
+            ys = ys[order]
+            return float(np.interp(x, xs, ys, left=ys[0], right=ys[-1]))
+    return x
 
 
 def _summarize_ready_metrics(rows: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
@@ -1349,6 +1532,47 @@ def _apply_match_fields(row: Dict[str, Any]) -> Dict[str, Any]:
 def _decorate_last_ready(last_ready: Optional[Dict[str, Any]], horizon_min: int) -> Optional[Dict[str, Any]]:
     if not last_ready:
         return None
+    expected_target = _horizon_target_label(horizon_min)
+    raw_target = str(last_ready.get("prediction_target") or "").strip().lower()
+    reject_legacy = os.getenv("REJECT_LEGACY_LAST_READY", "1").strip().lower() in {"1", "true", "yes", "on"}
+    if reject_legacy:
+        if not raw_target:
+            return None
+        if not (raw_target == expected_target or raw_target.endswith(expected_target)):
+            return None
+
+    # Ignore very old matched rows so legacy regime rows don't pollute UI.
+    max_age_days = max(1, int(os.getenv("LAST_READY_MAX_AGE_DAYS", "120")))
+    try:
+        pred_at = _parse_iso_utc(str(last_ready.get("predicted_at")))
+        if (datetime.now(timezone.utc) - pred_at).total_seconds() > (max_age_days * 86400):
+            return None
+    except Exception:
+        pass
+
+    # Scale sanity check: if last matched predicted price is wildly off current JSLL scale, hide it.
+    try:
+        predicted_price = float(last_ready.get("predicted_price")) if last_ready.get("predicted_price") is not None else None
+    except (TypeError, ValueError):
+        predicted_price = None
+    if predicted_price is not None and predicted_price > 0:
+        ref_price: Optional[float] = None
+        try:
+            live = get_live_price()
+            ref_price = float(live.get("price") or 0.0)
+        except Exception:
+            pass
+        if ref_price is None or ref_price <= 0:
+            try:
+                ref_price = float(last_ready.get("current_price") or 0.0)
+            except (TypeError, ValueError):
+                ref_price = None
+        if ref_price is not None and ref_price > 0:
+            max_rel_gap = float(os.getenv("LAST_READY_MAX_REL_GAP", "3.0"))
+            rel_gap = abs(predicted_price - ref_price) / max(1e-9, abs(ref_price))
+            if rel_gap > max_rel_gap:
+                return None
+
     try:
         pred_at = _parse_iso_utc(last_ready["predicted_at"])
         delta_min = int(last_ready.get("prediction_horizon_min") or horizon_min)
@@ -1513,6 +1737,11 @@ def refresh_prediction(config: TournamentConfig) -> Dict[str, Any]:
         band_z = float(os.getenv("PRED_BAND_Z", "1.64"))
         low_price = _price_from_log_return(float(live_price), predicted_return - (band_z * ret_std_val))
         high_price = _price_from_log_return(float(live_price), predicted_return + (band_z * ret_std_val))
+        band_width_pct = (abs(high_price - low_price) / max(1e-9, float(live_price))) * 100.0
+        wide_band_pct = float(os.getenv("NO_SIGNAL_BAND_WIDTH_PCT", "8.0"))
+        wide_band = band_width_pct >= wide_band_pct
+        guardrail_on = os.getenv("NO_SIGNAL_GUARDRAIL_ENABLE", "1").strip().lower() in {"1", "true", "yes", "on"}
+        no_signal = guardrail_on and (skipped_low_conf or (low_confidence and wide_band))
 
         record = {
             "predicted_at": datetime.now(timezone.utc).isoformat(),
@@ -1521,7 +1750,7 @@ def refresh_prediction(config: TournamentConfig) -> Dict[str, Any]:
             "predicted_price": predicted_price,
             "actual_price_1h": None,
             "match_percent": None,
-            "status": "skipped_low_confidence" if skipped_low_conf else "pending",
+            "status": "no_signal" if no_signal else ("skipped_low_confidence" if skipped_low_conf else "pending"),
             "model_name": pred["model_name"],
             "feature_set": pred["feature_set"],
             "run_id": run_id,
@@ -1540,6 +1769,10 @@ def refresh_prediction(config: TournamentConfig) -> Dict[str, Any]:
         record["bias_correction"] = bias
         if skipped_low_conf:
             record["note"] = f"skipped due to low confidence < {skip_threshold:.1f}%"
+        elif no_signal:
+            record["note"] = (
+                f"no-signal guardrail (conf={confidence_pct:.1f}%, band={band_width_pct:.2f}% >= {wide_band_pct:.2f}%)"
+            )
         if calibrator.get("active"):
             record["calibration"] = calibrator
         _decorate_pending_target(record, horizon_min)

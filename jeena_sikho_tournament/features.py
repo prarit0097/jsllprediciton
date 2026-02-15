@@ -1,4 +1,7 @@
 import os
+import re
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Iterable, Optional
 
 import numpy as np
@@ -27,6 +30,189 @@ def _target_label_for_minutes(candle_minutes: int) -> str:
     return f"y_ret_{minutes}m"
 
 
+def _is_indian_equity_symbol() -> bool:
+    sym = (os.getenv("MARKET_YFINANCE_SYMBOL", "") or "").strip().upper()
+    return sym.endswith(".NS") or sym.endswith(".BO")
+
+
+def _safe_symbol_tag(symbol: str) -> str:
+    clean = re.sub(r"[^A-Za-z0-9]+", "_", str(symbol or "").strip().lower()).strip("_")
+    return clean or "sym"
+
+
+def _parse_symbol_list(raw: str, default: str) -> list[str]:
+    text = (raw or "").strip()
+    if not text:
+        text = default
+    out: list[str] = []
+    for token in text.replace("|", ",").replace(";", ",").split(","):
+        t = token.strip()
+        if t:
+            out.append(t)
+    return out
+
+
+def _load_event_calendar(index_utc: pd.DatetimeIndex) -> pd.DataFrame:
+    out = pd.DataFrame(index=index_utc)
+    out["event_result_day"] = 0
+    out["event_dividend_day"] = 0
+    out["event_corp_announce_day"] = 0
+    out["event_any_day"] = 0
+    if index_utc.empty:
+        return out
+
+    file_path = os.getenv("EVENT_CALENDAR_FILE", "").strip()
+    if not file_path:
+        file_path = str(Path(os.getenv("APP_DATA_DIR", "data")) / "jsll_events.csv")
+    path = Path(file_path)
+    if not path.exists():
+        return out
+    try:
+        ev = pd.read_csv(path)
+    except Exception:
+        return out
+    if ev.empty:
+        return out
+
+    # Expected columns: date,event_type (result|dividend|corporate)
+    date_col = "date" if "date" in ev.columns else None
+    type_col = "event_type" if "event_type" in ev.columns else None
+    if not date_col:
+        return out
+    ev = ev.copy()
+    ev["__date"] = pd.to_datetime(ev[date_col], errors="coerce").dt.date
+    ev = ev.dropna(subset=["__date"])
+    if ev.empty:
+        return out
+    if not type_col:
+        ev["__type"] = "corporate"
+    else:
+        ev["__type"] = ev[type_col].astype(str).str.strip().str.lower()
+
+    idx_local = index_utc.tz_convert("Asia/Kolkata")
+    idx_dates = pd.Series(idx_local.date, index=index_utc)
+    result_days = set(ev.loc[ev["__type"].str.contains("result", na=False), "__date"].tolist())
+    div_days = set(ev.loc[ev["__type"].str.contains("div", na=False), "__date"].tolist())
+    corp_days = set(ev.loc[ev["__type"].str.contains("corp|announce|board", na=False), "__date"].tolist())
+    all_days = set(ev["__date"].tolist())
+
+    out["event_result_day"] = idx_dates.isin(result_days).astype(int)
+    out["event_dividend_day"] = idx_dates.isin(div_days).astype(int)
+    out["event_corp_announce_day"] = idx_dates.isin(corp_days).astype(int)
+    out["event_any_day"] = idx_dates.isin(all_days).astype(int)
+    return out
+
+
+def _load_delivery_percent(index_utc: pd.DatetimeIndex, volume: pd.Series) -> pd.Series:
+    path_raw = os.getenv("DELIVERY_PCT_FILE", "").strip()
+    if path_raw:
+        path = Path(path_raw)
+        if path.exists():
+            try:
+                ddf = pd.read_csv(path)
+                ts_col = "timestamp_utc" if "timestamp_utc" in ddf.columns else ("date" if "date" in ddf.columns else None)
+                val_col = "delivery_pct" if "delivery_pct" in ddf.columns else None
+                if ts_col and val_col:
+                    ddf = ddf[[ts_col, val_col]].dropna()
+                    ddf["timestamp_utc"] = pd.to_datetime(ddf[ts_col], errors="coerce", utc=True)
+                    ddf = ddf.dropna(subset=["timestamp_utc"]).set_index("timestamp_utc").sort_index()
+                    s = ddf[val_col].astype(float).reindex(index_utc).ffill(limit=12)
+                    if not s.dropna().empty:
+                        return s.clip(0, 100)
+            except Exception:
+                pass
+
+    # Proxy when exchange delivery file is unavailable.
+    win = max(20, int(_bars_for_hours(24, 60)))
+    pct_rank = volume.rolling(win, min_periods=5).rank(pct=True) * 100.0
+    return pct_rank.clip(0, 100)
+
+
+def _load_exogenous_context(index_utc: pd.DatetimeIndex, candle_minutes: int) -> pd.DataFrame:
+    out = pd.DataFrame(index=index_utc)
+    if index_utc.empty:
+        return out
+    if os.getenv("EXOGENOUS_ENABLE", "1").strip().lower() in {"0", "false", "no", "off"}:
+        return out
+
+    symbols = _parse_symbol_list(
+        os.getenv("EXOGENOUS_MARKET_SYMBOLS", ""),
+        "^NSEI,^NSEBANK,USDINR=X,^INDIAVIX",
+    )
+    if not symbols:
+        return out
+    try:
+        import yfinance as yf  # type: ignore
+    except Exception:
+        return out
+
+    start = (index_utc.min() - pd.Timedelta(days=7)).to_pydatetime().astimezone(timezone.utc)
+    end = (index_utc.max() + pd.Timedelta(days=2)).to_pydatetime().astimezone(timezone.utc)
+    interval = "60m" if candle_minutes <= 120 else "1d"
+    if interval == "60m":
+        max_intraday_days = max(30, int(os.getenv("EXOGENOUS_MAX_INTRADAY_DAYS", "729")))
+        now_utc = datetime.now(timezone.utc)
+        intraday_floor = now_utc - pd.Timedelta(days=max_intraday_days).to_pytimedelta()
+        if start < intraday_floor:
+            start = intraday_floor
+    chunk_days = max(30, int(os.getenv("EXOGENOUS_CHUNK_DAYS", "700")))
+
+    def _download_chunked(sym: str) -> pd.DataFrame:
+        parts = []
+        cur = start
+        while cur < end:
+            nxt = min(cur + pd.Timedelta(days=chunk_days).to_pytimedelta(), end)
+            try:
+                part = yf.download(
+                    sym,
+                    start=cur,
+                    end=nxt,
+                    interval=interval,
+                    auto_adjust=True,
+                    progress=False,
+                )
+            except Exception:
+                part = pd.DataFrame()
+            if part is not None and not part.empty:
+                parts.append(part)
+            cur = nxt
+        if not parts:
+            return pd.DataFrame()
+        out = pd.concat(parts)
+        if isinstance(out.columns, pd.MultiIndex):
+            out.columns = [str(c[0]) for c in out.columns]
+        out = out[~out.index.duplicated(keep="last")]
+        return out.sort_index()
+
+    for sym in symbols:
+        tag = _safe_symbol_tag(sym)
+        raw = _download_chunked(sym)
+        if raw is None or raw.empty:
+            continue
+        if "Close" not in raw.columns:
+            continue
+        s = raw["Close"].astype(float).dropna()
+        s.index = pd.to_datetime(s.index, utc=True)
+        s = s[~s.index.duplicated(keep="last")].sort_index()
+        s = s.reindex(index_utc).ffill(limit=max(1, int(1440 / max(1, candle_minutes))))
+        ret = np.log(s).diff(1)
+        vol = ret.rolling(max(5, _bars_for_hours(24, candle_minutes)), min_periods=5).std(ddof=0)
+        out[f"exo_{tag}_ret"] = ret
+        out[f"exo_{tag}_vol"] = vol
+    return out
+
+
+def _next_nse_day_close_target(df: pd.DataFrame) -> pd.Series:
+    if df.empty:
+        return pd.Series(dtype=float)
+    idx_local = df.index.tz_convert("Asia/Kolkata")
+    day = pd.Series(idx_local.date, index=df.index)
+    day_close = df.groupby(day)["close"].last()
+    next_day_close = day_close.shift(-1)
+    mapped_next = day.map(next_day_close)
+    return np.log((mapped_next + 1e-12) / (df["close"] + 1e-12))
+
+
 def resolve_feature_windows_for_horizon(
     candle_minutes: int,
     feature_windows_hours: Optional[Iterable[int]],
@@ -52,10 +238,10 @@ def resolve_feature_windows_for_horizon(
 def allowed_feature_sets_for_horizon(candle_minutes: int) -> set[str]:
     minutes = max(1, int(candle_minutes))
     if minutes <= 120:
-        return {"minimal", "base", "momentum", "micro_momentum", "session", "vwap_flow", "signal", "trend", "volatility"}
+        return {"minimal", "base", "momentum", "micro_momentum", "session", "vwap_flow", "signal", "trend", "volatility", "market_ctx"}
     if minutes >= 1440:
-        return {"minimal", "base", "long", "trend_longer", "volatility", "session", "signal", "trend"}
-    return {"minimal", "base", "momentum", "signal", "trend", "volatility", "session", "vwap_flow", "trend_longer"}
+        return {"minimal", "base", "long", "trend_longer", "volatility", "session", "signal", "trend", "market_ctx"}
+    return {"minimal", "base", "momentum", "signal", "trend", "volatility", "session", "vwap_flow", "trend_longer", "market_ctx"}
 
 
 def compute_features(
@@ -131,6 +317,12 @@ def compute_features(
     df["vol_chg"] = volume.pct_change(1, fill_method=None)
     df["vol_mean_24"] = volume.rolling(vwap_window, min_periods=vwap_window).mean()
     df["vol_std_24"] = volume.rolling(vwap_window, min_periods=vwap_window).std(ddof=0)
+    vol_min_periods = min(max(2, int(vwap_window / 4)), int(vwap_window))
+    df["volume_shock_pct"] = (
+        volume.rolling(vwap_window, min_periods=vol_min_periods).rank(pct=True) * 100.0
+    )
+    df["vwap_dev_persist"] = df["vwap_dist"].rolling(max(3, _bars_for_hours(6, candle_minutes)), min_periods=3).mean()
+    df["delivery_pct"] = _load_delivery_percent(df.index, volume)
 
     fast = _ema(close, _bars_for_hours(12, candle_minutes))
     slow = _ema(close, _bars_for_hours(48, candle_minutes))
@@ -158,6 +350,20 @@ def compute_features(
     prev_close = close.shift(1)
     gap = (df["open"] - prev_close) / (prev_close + 1e-9)
     df["gap_from_prev_close"] = np.where(new_day, gap, 0.0)
+    prev_day_high = high.groupby(date_series).transform("max").shift(1)
+    prev_day_low = low.groupby(date_series).transform("min").shift(1)
+    df["prev_day_high_break"] = (close > prev_day_high).astype(int)
+    df["prev_day_low_break"] = (close < prev_day_low).astype(int)
+
+    event_df = _load_event_calendar(df.index)
+    if not event_df.empty:
+        for col in event_df.columns:
+            df[col] = event_df[col]
+
+    exog = _load_exogenous_context(df.index, candle_minutes)
+    if not exog.empty:
+        for col in exog.columns:
+            df[col] = exog[col]
 
     df = df.replace([np.inf, -np.inf], np.nan)
     return df
@@ -165,6 +371,7 @@ def compute_features(
 
 def feature_sets(df: pd.DataFrame) -> dict:
     cols = list(df.columns)
+    exo_cols = [c for c in cols if c.startswith("exo_")]
     base = [
         "ret_1c",
         "ret_1h",
@@ -178,6 +385,9 @@ def feature_sets(df: pd.DataFrame) -> dict:
         "atr_14",
         "vwap_24",
         "vwap_dist",
+        "volume_shock_pct",
+        "delivery_pct",
+        "vwap_dev_persist",
     ]
     vol = [
         "atr_14",
@@ -206,6 +416,8 @@ def feature_sets(df: pd.DataFrame) -> dict:
         "vol_chg",
         "vol_mean_24",
         "vol_std_24",
+        "volume_shock_pct",
+        "delivery_pct",
         "vwap_24",
         "vwap_dist",
     ]
@@ -298,6 +510,9 @@ def feature_sets(df: pd.DataFrame) -> dict:
         "range_flag",
         "day_of_week",
         "gap_from_prev_close",
+        "prev_day_high_break",
+        "prev_day_low_break",
+        "event_any_day",
     ]
     micro_momentum = [
         "ret_1c",
@@ -317,7 +532,18 @@ def feature_sets(df: pd.DataFrame) -> dict:
         "ret_1c",
         "ret_1h",
         "vol_24",
+        "volume_shock_pct",
+        "delivery_pct",
+        "vwap_dev_persist",
+        "prev_day_high_break",
+        "prev_day_low_break",
+        "event_any_day",
     ]
+    market_ctx = [
+        "day_of_week",
+        "gap_from_prev_close",
+        "event_any_day",
+    ] + exo_cols
 
     sets = {
         "base": base,
@@ -335,6 +561,7 @@ def feature_sets(df: pd.DataFrame) -> dict:
         "micro_momentum": micro_momentum,
         "minimal": minimal,
         "session": session,
+        "market_ctx": market_ctx,
     }
 
     cleaned = {}
@@ -350,7 +577,10 @@ def make_supervised(
 ) -> pd.DataFrame:
     df = compute_features(df, candle_minutes=candle_minutes, feature_windows_hours=feature_windows_hours)
     target_label = _target_label_for_minutes(candle_minutes)
-    df[target_label] = df["ret_1c"].shift(-1)
+    if candle_minutes >= 1440 and _is_indian_equity_symbol():
+        df[target_label] = _next_nse_day_close_target(df)
+    else:
+        df[target_label] = df["ret_1c"].shift(-1)
     if candle_minutes <= 120:
         default_low_q, default_high_q = 0.02, 0.98
     elif candle_minutes >= 1440:
@@ -361,9 +591,11 @@ def make_supervised(
     high_q = float(os.getenv("TARGET_WINSOR_UPPER", str(default_high_q)))
     low_q = min(max(low_q, 0.0), 0.49)
     high_q = min(max(high_q, 0.51), 1.0)
-    lo = float(df[target_label].quantile(low_q))
-    hi = float(df[target_label].quantile(high_q))
-    df[target_label] = df[target_label].clip(lower=lo, upper=hi)
+    winsor_min_rows = max(10, int(os.getenv("TARGET_WINSOR_MIN_ROWS", "200")))
+    if len(df) >= winsor_min_rows:
+        lo = float(df[target_label].quantile(low_q))
+        hi = float(df[target_label].quantile(high_q))
+        df[target_label] = df[target_label].clip(lower=lo, upper=hi)
 
     if candle_minutes <= 120:
         default_event_gap, default_event_clip = 0.06, 0.035
@@ -401,5 +633,23 @@ def make_supervised(
     if drop_event_rows and "is_event_day" in df.columns:
         df = df.loc[df["is_event_day"] == 0]
 
-    df = df.dropna()
+    # Avoid wiping whole horizon datasets when optional context features are sparse.
+    num_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+    protected = {
+        target_label,
+        "y_ret_raw",
+        "y_ret",
+        "y_ret_model",
+        "y_dir",
+        "target_scale",
+    }
+    fill_cols = [c for c in num_cols if c not in protected]
+    fill_sparse = os.getenv("FILL_SPARSE_FEATURES", "1").strip().lower() in {"1", "true", "yes", "on"}
+    if fill_sparse and fill_cols:
+        df[fill_cols] = df[fill_cols].ffill().bfill()
+    required = [c for c in [target_label, "y_ret_raw", "y_ret_model", "y_dir", "target_scale"] if c in df.columns]
+    if required:
+        df = df.dropna(subset=required)
+    else:
+        df = df.dropna()
     return df

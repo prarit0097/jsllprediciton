@@ -13,7 +13,9 @@ from .config import TournamentConfig
 from .features import compute_features, make_supervised
 from .models_zoo import get_candidates
 from .features import feature_sets
+from .market_calendar import load_nse_holidays
 from .storage import Storage
+from .validator import validate_ohlcv_quality
 from .registry import load_registry
 from .predict import predict_latest
 from .sample_run import run_dry_tournament
@@ -141,6 +143,11 @@ def _missing_intervals(series: pd.DatetimeIndex, candle_minutes: int) -> int:
     return len(full.difference(series))
 
 
+def _is_nse_mode(config: TournamentConfig) -> bool:
+    sym = (config.yfinance_symbol or "").strip().upper()
+    return sym.endswith(".NS") or sym.endswith(".BO")
+
+
 def check_data(config: TournamentConfig) -> Tuple[CheckResult, Dict[str, str]]:
     res = CheckResult("Data")
     summary = {}
@@ -153,7 +160,18 @@ def check_data(config: TournamentConfig) -> Tuple[CheckResult, Dict[str, str]]:
     df = df.sort_index()
     earliest = df.index.min()
     latest = df.index.max()
-    missing = _missing_intervals(df.index, config.candle_minutes)
+    nse_mode = _is_nse_mode(config)
+    if nse_mode:
+        dq_full = validate_ohlcv_quality(
+            df,
+            config.candle_minutes,
+            nse_mode=True,
+            holidays=load_nse_holidays(config.data_dir),
+            max_missing_ratio=float(os.getenv("MAX_MISSING_RATIO", "0.15")),
+        )
+        missing = int((dq_full.stats or {}).get("missing_intervals", 0))
+    else:
+        missing = _missing_intervals(df.index, config.candle_minutes)
 
     summary["rows"] = str(len(df))
     summary["earliest"] = str(earliest)
@@ -178,8 +196,19 @@ def check_data(config: TournamentConfig) -> Tuple[CheckResult, Dict[str, str]]:
 
     last_30 = df.loc[df.index >= _now_utc() - timedelta(days=30)]
     if not last_30.empty:
-        expected = int((24 * 60 / max(1, config.candle_minutes)) * 30)
-        completeness = 1 - (_missing_intervals(last_30.index, config.candle_minutes) / expected)
+        if nse_mode:
+            dq_30 = validate_ohlcv_quality(
+                last_30,
+                config.candle_minutes,
+                nse_mode=True,
+                holidays=load_nse_holidays(config.data_dir),
+                max_missing_ratio=float(os.getenv("MAX_MISSING_RATIO", "0.15")),
+            )
+            miss_ratio = float((dq_30.stats or {}).get("missing_ratio", 1.0))
+            completeness = max(0.0, min(1.0, 1.0 - miss_ratio))
+        else:
+            expected = int((24 * 60 / max(1, config.candle_minutes)) * 30)
+            completeness = 1 - (_missing_intervals(last_30.index, config.candle_minutes) / expected)
         summary["last_30d_completeness"] = f"{completeness:.2%}"
     return res, summary
 
@@ -201,12 +230,30 @@ def check_features(config: TournamentConfig) -> CheckResult:
             index=idx,
         )
         sup = make_supervised(data, candle_minutes=config.candle_minutes, feature_windows_hours=config.feature_windows)
-        orig = np.log(data["close"]).diff().shift(-1)
-        aligned = orig.loc[sup.index]
-        if not np.allclose(sup["y_ret"].values, aligned.values, equal_nan=False):
-            res.fail("y_ret target misaligned")
-        if not np.all((sup["y_dir"].values == (sup["y_ret"].values > 0).astype(int))):
-            res.fail("y_dir target misaligned")
+        required = {"y_ret_raw", "y_ret_model", "y_ret", "y_dir", "target_scale"}
+        if not required.issubset(set(sup.columns)):
+            missing = sorted(list(required.difference(set(sup.columns))))
+            res.fail(f"Missing supervised target columns: {', '.join(missing)}")
+            return res
+
+        if not np.all((sup["y_dir"].values == (sup["y_ret_raw"].values > 0).astype(int))):
+            res.fail("y_dir target misaligned with y_ret_raw")
+            return res
+
+        if not np.allclose(sup["y_ret"].values, sup["y_ret_raw"].values, atol=1e-12, rtol=1e-9):
+            res.fail("y_ret must mirror y_ret_raw")
+            return res
+
+        mode = os.getenv("RETURN_TARGET_MODE", "volnorm_logret").strip().lower()
+        if mode in {"volnorm", "volnorm_logret", "normalized"}:
+            rec = sup["y_ret_model"].to_numpy() * sup["target_scale"].to_numpy()
+            if not np.allclose(rec, sup["y_ret_raw"].to_numpy(), atol=1e-6, rtol=1e-3):
+                res.fail("y_ret_model * target_scale mismatch with y_ret_raw")
+                return res
+        else:
+            if not np.allclose(sup["y_ret_model"].values, sup["y_ret_raw"].values, atol=1e-12, rtol=1e-9):
+                res.fail("y_ret_model should match y_ret_raw in raw target mode")
+                return res
 
         feats = compute_features(
             data,

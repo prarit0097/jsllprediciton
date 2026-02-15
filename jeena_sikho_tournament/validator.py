@@ -6,7 +6,7 @@ from typing import Dict, List, Set
 
 import pandas as pd
 
-from .market_calendar import IST, is_nse_trading_day
+from .market_calendar import IST, is_nse_trading_day, load_nse_completeness_exclusions
 
 
 @dataclass
@@ -26,12 +26,16 @@ def _expected_index_nse(df: pd.DataFrame, candle_minutes: int, holidays: Set) ->
     step = max(1, int(candle_minutes))
     start = df.index.min().tz_convert(IST).date()
     end = df.index.max().tz_convert(IST).date()
+    excluded = load_nse_completeness_exclusions()
     all_slots = []
     cur = pd.Timestamp(start, tz=IST)
     end_ts = pd.Timestamp(end, tz=IST)
     open_min = 9 * 60 + 15
     close_min = 15 * 60 + 30
     while cur.date() <= end_ts.date():
+        if cur.date() in excluded:
+            cur = cur + timedelta(days=1)
+            continue
         if is_nse_trading_day(cur.to_pydatetime(), holidays):
             day_open = cur.replace(hour=9, minute=15, second=0, microsecond=0)
             if step >= 1440:

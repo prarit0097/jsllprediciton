@@ -8,7 +8,7 @@ from typing import Dict, List, Optional, Set, Tuple
 import pandas as pd
 import requests
 
-from .market_calendar import IST, is_nse_trading_day, load_nse_holidays
+from .market_calendar import IST, is_nse_trading_day, load_nse_completeness_exclusions, load_nse_holidays
 
 
 @dataclass
@@ -89,9 +89,13 @@ def _expected_nse_slots(start_utc: pd.Timestamp, end_utc: pd.Timestamp, interval
     start_ist = start_utc.tz_convert(IST)
     end_ist = end_utc.tz_convert(IST)
     day = start_ist.date()
+    excluded = load_nse_completeness_exclusions()
     slots: List[pd.Timestamp] = []
     while day <= end_ist.date():
         cur = dt.datetime.combine(day, dt.time(9, 15), tzinfo=IST)
+        if day in excluded:
+            day = day + dt.timedelta(days=1)
+            continue
         if is_nse_trading_day(cur, holidays):
             if step >= 1440:
                 ts = dt.datetime.combine(day, dt.time(15, 30), tzinfo=IST)
