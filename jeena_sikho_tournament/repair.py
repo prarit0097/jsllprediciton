@@ -32,7 +32,7 @@ def _parse_timeframes(value: str) -> List[str]:
 
 
 def _resolve_timeframes(config: TournamentConfig) -> List[str]:
-    env_list = os.getenv("MARKET_TIMEFRAMES") or os.getenv("TIMEFRAMES") or os.getenv("BTC_TIMEFRAMES")
+    env_list = os.getenv("MARKET_TIMEFRAMES") or os.getenv("TIMEFRAMES")
     if env_list:
         parsed = _parse_timeframes(env_list)
         if parsed:

@@ -3,6 +3,9 @@ import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+PREDICTIONS_TABLE = "market_predictions"
+LEGACY_PREDICTIONS_TABLE = "btc_predictions"
+
 
 def get_db_path() -> Path:
     data_dir = Path(os.getenv("APP_DATA_DIR", "data"))
@@ -96,9 +99,38 @@ def ensure_tables() -> None:
             )
             """
         )
+        tables = {row[0] for row in con.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+        if LEGACY_PREDICTIONS_TABLE in tables and PREDICTIONS_TABLE not in tables:
+            con.execute(f"ALTER TABLE {LEGACY_PREDICTIONS_TABLE} RENAME TO {PREDICTIONS_TABLE}")
+        elif LEGACY_PREDICTIONS_TABLE in tables and PREDICTIONS_TABLE in tables:
+            # One-time bridge when both tables exist: copy missing historical rows forward.
+            con.execute(
+                f"""
+                INSERT INTO {PREDICTIONS_TABLE} (
+                    predicted_at, current_price, predicted_return, predicted_price,
+                    predicted_price_low, predicted_price_high, actual_price_1h, match_percent, status, model_name,
+                    feature_set, run_id, prediction_target, prediction_horizon_min, timeframe, timeframe_minutes,
+                    confidence_pct, low_confidence, regime
+                )
+                SELECT
+                    b.predicted_at, b.current_price, b.predicted_return, b.predicted_price,
+                    b.predicted_price_low, b.predicted_price_high, b.actual_price_1h, b.match_percent, b.status, b.model_name,
+                    b.feature_set, b.run_id, b.prediction_target, b.prediction_horizon_min, b.timeframe, b.timeframe_minutes,
+                    b.confidence_pct, b.low_confidence, b.regime
+                FROM {LEGACY_PREDICTIONS_TABLE} b
+                WHERE NOT EXISTS (
+                    SELECT 1
+                    FROM {PREDICTIONS_TABLE} m
+                    WHERE m.predicted_at = b.predicted_at
+                      AND COALESCE(m.timeframe, '') = COALESCE(b.timeframe, '')
+                      AND COALESCE(m.prediction_target, '') = COALESCE(b.prediction_target, '')
+                      AND COALESCE(m.model_name, '') = COALESCE(b.model_name, '')
+                )
+                """
+            )
         con.execute(
-            """
-            CREATE TABLE IF NOT EXISTS btc_predictions (
+            f"""
+            CREATE TABLE IF NOT EXISTS {PREDICTIONS_TABLE} (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 predicted_at TEXT,
                 current_price REAL,
@@ -122,25 +154,25 @@ def ensure_tables() -> None:
             )
             """
         )
-        cols = {row[1] for row in con.execute("PRAGMA table_info(btc_predictions)").fetchall()}
+        cols = {row[1] for row in con.execute(f"PRAGMA table_info({PREDICTIONS_TABLE})").fetchall()}
         if "prediction_target" not in cols:
-            con.execute("ALTER TABLE btc_predictions ADD COLUMN prediction_target TEXT")
+            con.execute(f"ALTER TABLE {PREDICTIONS_TABLE} ADD COLUMN prediction_target TEXT")
         if "prediction_horizon_min" not in cols:
-            con.execute("ALTER TABLE btc_predictions ADD COLUMN prediction_horizon_min INTEGER")
+            con.execute(f"ALTER TABLE {PREDICTIONS_TABLE} ADD COLUMN prediction_horizon_min INTEGER")
         if "timeframe" not in cols:
-            con.execute("ALTER TABLE btc_predictions ADD COLUMN timeframe TEXT")
+            con.execute(f"ALTER TABLE {PREDICTIONS_TABLE} ADD COLUMN timeframe TEXT")
         if "timeframe_minutes" not in cols:
-            con.execute("ALTER TABLE btc_predictions ADD COLUMN timeframe_minutes INTEGER")
+            con.execute(f"ALTER TABLE {PREDICTIONS_TABLE} ADD COLUMN timeframe_minutes INTEGER")
         if "predicted_price_low" not in cols:
-            con.execute("ALTER TABLE btc_predictions ADD COLUMN predicted_price_low REAL")
+            con.execute(f"ALTER TABLE {PREDICTIONS_TABLE} ADD COLUMN predicted_price_low REAL")
         if "predicted_price_high" not in cols:
-            con.execute("ALTER TABLE btc_predictions ADD COLUMN predicted_price_high REAL")
+            con.execute(f"ALTER TABLE {PREDICTIONS_TABLE} ADD COLUMN predicted_price_high REAL")
         if "confidence_pct" not in cols:
-            con.execute("ALTER TABLE btc_predictions ADD COLUMN confidence_pct REAL")
+            con.execute(f"ALTER TABLE {PREDICTIONS_TABLE} ADD COLUMN confidence_pct REAL")
         if "low_confidence" not in cols:
-            con.execute("ALTER TABLE btc_predictions ADD COLUMN low_confidence INTEGER")
+            con.execute(f"ALTER TABLE {PREDICTIONS_TABLE} ADD COLUMN low_confidence INTEGER")
         if "regime" not in cols:
-            con.execute("ALTER TABLE btc_predictions ADD COLUMN regime TEXT")
+            con.execute(f"ALTER TABLE {PREDICTIONS_TABLE} ADD COLUMN regime TEXT")
 
 
 def insert_run(
@@ -410,12 +442,12 @@ def get_latest_prediction() -> Optional[Dict[str, Any]]:
     ensure_tables()
     with connect() as con:
         cur = con.execute(
-            """
+            f"""
             SELECT id, predicted_at, current_price, predicted_return, predicted_price,
                    predicted_price_low, predicted_price_high, actual_price_1h, match_percent, status, model_name,
                    feature_set, run_id, prediction_target, prediction_horizon_min, timeframe, timeframe_minutes,
                    confidence_pct, low_confidence, regime
-            FROM btc_predictions
+            FROM {PREDICTIONS_TABLE}
             ORDER BY id DESC LIMIT 1
             """
         )
@@ -450,12 +482,12 @@ def get_latest_ready_prediction() -> Optional[Dict[str, Any]]:
     ensure_tables()
     with connect() as con:
         cur = con.execute(
-            """
+            f"""
             SELECT id, predicted_at, current_price, predicted_return, predicted_price,
                    predicted_price_low, predicted_price_high, actual_price_1h, match_percent, status, model_name,
                    feature_set, run_id, prediction_target, prediction_horizon_min, timeframe, timeframe_minutes,
                    confidence_pct, low_confidence, regime
-            FROM btc_predictions
+            FROM {PREDICTIONS_TABLE}
             WHERE status = 'ready'
             ORDER BY id DESC LIMIT 1
             """
@@ -491,8 +523,8 @@ def insert_prediction(row: Dict[str, Any]) -> int:
     ensure_tables()
     with connect() as con:
         cur = con.execute(
-            """
-            INSERT INTO btc_predictions (
+            f"""
+            INSERT INTO {PREDICTIONS_TABLE} (
                 predicted_at, current_price, predicted_return, predicted_price,
                 predicted_price_low, predicted_price_high, actual_price_1h, match_percent, status, model_name,
                 feature_set, run_id, prediction_target, prediction_horizon_min, timeframe, timeframe_minutes,
@@ -528,8 +560,8 @@ def update_prediction(pred_id: int, actual_price: float, match_percent: Optional
     ensure_tables()
     with connect() as con:
         con.execute(
-            """
-            UPDATE btc_predictions
+            f"""
+            UPDATE {PREDICTIONS_TABLE}
             SET actual_price_1h = ?, match_percent = ?, status = ?
             WHERE id = ?
             """,
@@ -541,10 +573,10 @@ def list_pending_predictions(cutoff_iso: str) -> List[Dict[str, Any]]:
     ensure_tables()
     with connect() as con:
         cur = con.execute(
-            """
+            f"""
             SELECT id, predicted_at, current_price, predicted_return, predicted_price,
                    prediction_horizon_min, timeframe, timeframe_minutes, confidence_pct, low_confidence, regime
-            FROM btc_predictions
+            FROM {PREDICTIONS_TABLE}
             WHERE status = 'pending' AND predicted_at <= ?
             ORDER BY predicted_at ASC
             """,
@@ -573,12 +605,12 @@ def get_latest_prediction_for_timeframe(timeframe: str) -> Optional[Dict[str, An
     ensure_tables()
     with connect() as con:
         cur = con.execute(
-            """
+            f"""
             SELECT id, predicted_at, current_price, predicted_return, predicted_price,
                    predicted_price_low, predicted_price_high, actual_price_1h, match_percent, status, model_name,
                    feature_set, run_id, prediction_target, prediction_horizon_min, timeframe, timeframe_minutes,
                    confidence_pct, low_confidence, regime
-            FROM btc_predictions
+            FROM {PREDICTIONS_TABLE}
             WHERE timeframe = ?
             ORDER BY id DESC LIMIT 1
             """,
@@ -615,12 +647,12 @@ def get_latest_ready_prediction_for_timeframe(timeframe: str) -> Optional[Dict[s
     ensure_tables()
     with connect() as con:
         cur = con.execute(
-            """
+            f"""
             SELECT id, predicted_at, current_price, predicted_return, predicted_price,
                    predicted_price_low, predicted_price_high, actual_price_1h, match_percent, status, model_name,
                    feature_set, run_id, prediction_target, prediction_horizon_min, timeframe, timeframe_minutes,
                    confidence_pct, low_confidence, regime
-            FROM btc_predictions
+            FROM {PREDICTIONS_TABLE}
             WHERE status = 'ready' AND timeframe = ?
             ORDER BY id DESC LIMIT 1
             """,
@@ -657,9 +689,9 @@ def get_recent_ready_predictions(timeframe: str, limit: int) -> List[Dict[str, A
     ensure_tables()
     with connect() as con:
         cur = con.execute(
-            """
+            f"""
             SELECT predicted_return, current_price, actual_price_1h, predicted_price, match_percent
-            FROM btc_predictions
+            FROM {PREDICTIONS_TABLE}
             WHERE status = 'ready' AND timeframe = ?
             ORDER BY id DESC LIMIT ?
             """,

@@ -47,7 +47,7 @@ def config_for_timeframe(base: TournamentConfig, timeframe: str) -> TournamentCo
 
 
 def resolve_timeframes(base: TournamentConfig) -> List[str]:
-    env_list = os.getenv("MARKET_TIMEFRAMES") or os.getenv("TIMEFRAMES") or os.getenv("BTC_TIMEFRAMES")
+    env_list = os.getenv("MARKET_TIMEFRAMES") or os.getenv("TIMEFRAMES")
     if env_list:
         return _parse_timeframes(env_list)
     return list(DEFAULT_TIMEFRAMES)

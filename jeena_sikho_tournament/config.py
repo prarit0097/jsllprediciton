@@ -78,18 +78,18 @@ class TournamentConfig:
         if env_yf_symbol:
             self.yfinance_symbol = env_yf_symbol.strip()
 
-        env_timeframes = _env_first("MARKET_TIMEFRAMES", "TIMEFRAMES", "BTC_TIMEFRAMES")
+        env_timeframes = _env_first("MARKET_TIMEFRAMES", "TIMEFRAMES")
         if env_timeframes:
             tokens = [t.strip() for t in env_timeframes.replace("|", ",").replace(";", ",").split(",") if t.strip()]
             if tokens:
                 self.timeframe = tokens[0]
-        env_tf = _env_first("MARKET_TIMEFRAME", "TIMEFRAME", "BTC_TIMEFRAME")
+        env_tf = _env_first("MARKET_TIMEFRAME", "TIMEFRAME")
         if env_tf and not env_timeframes:
             self.timeframe = env_tf
-        env_cm = _env_first("MARKET_CANDLE_MINUTES", "CANDLE_MINUTES", "BTC_CANDLE_MINUTES")
+        env_cm = _env_first("MARKET_CANDLE_MINUTES", "CANDLE_MINUTES")
         if env_cm and env_cm.isdigit() and not env_timeframes:
             self.candle_minutes = int(env_cm)
-        env_table = _env_first("MARKET_OHLCV_TABLE", "OHLCV_TABLE", "BTC_OHLCV_TABLE")
+        env_table = _env_first("MARKET_OHLCV_TABLE", "OHLCV_TABLE")
         if env_table and not env_timeframes:
             self.ohlcv_table = env_table
 

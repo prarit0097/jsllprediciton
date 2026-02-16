@@ -4,7 +4,6 @@ from django.views.generic.base import RedirectView
 from . import views
 
 urlpatterns = [
-    path('btc/', RedirectView.as_view(url='/', permanent=False), name='btc_dashboard_legacy'),
     path('jeena-sikho/', RedirectView.as_view(url='/', permanent=False), name='jeena_sikho_dashboard'),
 
     path('api/jeena-sikho/price', views.api_price, name='js_price'),

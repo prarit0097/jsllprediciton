@@ -8,6 +8,7 @@ import numpy as np
 
 from .config import TournamentConfig
 from .multi_timeframe import resolve_timeframes
+from jeena_sikho_dashboard.db import PREDICTIONS_TABLE
 
 
 def _load_registry(path: Path) -> Dict:
@@ -147,9 +148,9 @@ def should_retrain_on_drift(config: TournamentConfig) -> Tuple[bool, str]:
     try:
         for tf in frames:
             cur = con.execute(
-                """
+                f"""
                 SELECT predicted_price, actual_price_1h
-                FROM btc_predictions
+                FROM {PREDICTIONS_TABLE}
                 WHERE status = 'ready' AND timeframe = ?
                 ORDER BY id DESC
                 LIMIT ?

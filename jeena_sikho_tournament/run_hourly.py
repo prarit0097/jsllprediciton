@@ -190,7 +190,7 @@ def main():
             print(f"Skipping run: {reason}. Set FORCE_RUN=1 to override.")
             return
         print(f"Drift retrain trigger: {reason}")
-    if os.getenv("MARKET_TIMEFRAMES") or os.getenv("TIMEFRAMES") or os.getenv("BTC_TIMEFRAMES"):
+    if os.getenv("MARKET_TIMEFRAMES") or os.getenv("TIMEFRAMES"):
         run_multi_timeframe_tournament(config)
     else:
         tf_cfg = config_for_timeframe(config, config.timeframe)
