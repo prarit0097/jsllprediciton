@@ -39,3 +39,28 @@ def test_validator_nse_boundary_violation():
     report = validate_ohlcv_quality(df, 60, nse_mode=True, holidays=set(), max_missing_ratio=1.0)
     assert report.ok is False
     assert any("nse_session_boundary_violation" in e for e in report.errors)
+
+
+def test_validator_flags_unexpected_multiday_intervals(monkeypatch):
+    # Daily rows should fail when validating 2d cadence.
+    monkeypatch.setenv("MULTIDAY_STRICT_CALENDAR_DQ", "1")
+    idx = pd.DatetimeIndex(
+        [
+            pd.Timestamp("2026-02-09 10:00:00+00:00"),
+            pd.Timestamp("2026-02-10 10:00:00+00:00"),
+            pd.Timestamp("2026-02-11 10:00:00+00:00"),
+        ]
+    )
+    df = pd.DataFrame(
+        {
+            "open": [100.0, 101.0, 102.0],
+            "high": [101.0, 102.0, 103.0],
+            "low": [99.0, 100.0, 101.0],
+            "close": [100.5, 101.5, 102.5],
+            "volume": [1000.0, 1000.0, 1000.0],
+        },
+        index=idx,
+    )
+    report = validate_ohlcv_quality(df, 2880, nse_mode=True, holidays=set(), max_missing_ratio=1.0)
+    assert report.ok is False
+    assert any("unexpected_intervals_for_multiday" in e for e in report.errors)

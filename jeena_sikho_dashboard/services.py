@@ -29,6 +29,7 @@ from .db import (
     get_latest_ready_prediction_for_timeframe,
     get_latest_run,
     get_ohlcv_close_at,
+    get_ohlcv_open_at,
     get_recent_ready_predictions,
     get_recent_runs,
     get_scores,
@@ -381,7 +382,16 @@ def _prediction_target_timestamp(pred_at: datetime, horizon_min: int, tf_minutes
         return anchor + timedelta(minutes=horizon)
 
     if horizon >= 1440:
-        # NSE daily label is standardized to next trading-day close (15:30 IST).
+        # Optional mode for 1d: match next trading-day open (09:15 IST).
+        if horizon == 1440 and _daily_target_point() == "open":
+            cur_local = pred_at.astimezone(IST)
+            day = cur_local.date()
+            while True:
+                day = day + timedelta(days=1)
+                probe = datetime(day.year, day.month, day.day, 9, 15, tzinfo=IST)
+                if probe.weekday() < 5 and day not in _NSE_HOLIDAYS:
+                    return probe.astimezone(timezone.utc)
+        # Default: next trading-day close (15:30 IST).
         steps = int(np.ceil(horizon / 1440.0))
         cur_local = pred_at.astimezone(IST)
         day = cur_local.date()
@@ -795,7 +805,7 @@ def update_pending_predictions(config: TournamentConfig) -> None:
         target_iso = target_ts.isoformat()
 
         table = "ohlcv" if int(tf_minutes) == 60 else f"ohlcv_{int(tf_minutes)}m"
-        actual = get_ohlcv_close_at(target_iso, table=table)
+        actual = _get_ohlcv_target_price(target_iso, table, int(horizon_min))
         if actual is None:
             try:
                 actual = get_live_price()["price"]
@@ -807,6 +817,24 @@ def update_pending_predictions(config: TournamentConfig) -> None:
 
 def _target_mode() -> str:
     return os.getenv("RETURN_TARGET_MODE", "volnorm_logret").strip().lower()
+
+
+def _daily_target_point() -> str:
+    raw = os.getenv("DAILY_TARGET_POINT", "close").strip().lower()
+    if raw in {"open", "close"}:
+        return raw
+    return "close"
+
+
+def _get_ohlcv_target_price(target_iso: str, table: str, horizon_min: int) -> Optional[float]:
+    # 1d open-mode compares against next-day 09:15 open; all other horizons use close.
+    if _is_indian_equity() and int(horizon_min) == 1440 and _daily_target_point() == "open":
+        # Daily table rows are stamped at 15:30; opening tick lives in 1h base table.
+        px = get_ohlcv_open_at(target_iso, table="ohlcv")
+        if px is not None:
+            return px
+        return get_ohlcv_open_at(target_iso, table=table)
+    return get_ohlcv_close_at(target_iso, table=table)
 
 
 def _target_scale_from_latest(latest_row: pd.DataFrame) -> float:
@@ -1657,6 +1685,7 @@ def refresh_prediction(config: TournamentConfig) -> Dict[str, Any]:
         if _is_indian_equity() and market_open is False and latest:
             _apply_match_fields(latest)
             latest["status"] = latest.get("status") or "market_closed"
+            _decorate_pending_target(latest, horizon_min)
             latest["last_ready"] = _decorate_last_ready(
                 get_latest_ready_prediction_for_timeframe(timeframe),
                 horizon_min,

@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
+import numpy as np
 import pandas as pd
 import requests
 
@@ -111,7 +112,17 @@ def _expected_nse_slots(start_utc: pd.Timestamp, end_utc: pd.Timestamp, interval
     if not slots:
         return pd.DatetimeIndex([], tz="UTC")
     idx = pd.DatetimeIndex(slots, tz="UTC")
-    return idx[(idx >= start_utc) & (idx <= end_utc)]
+    idx = idx[(idx >= start_utc) & (idx <= end_utc)]
+    if step < 1440:
+        return idx
+
+    # For multi-day horizons (2d/3d...), expected slots are every N trading-day close.
+    n_trading_days = max(1, int(np.ceil(step / 1440.0)))
+    close_mask = (idx.tz_convert(IST).hour == 15) & (idx.tz_convert(IST).minute == 30)
+    close_slots = idx[close_mask]
+    if len(close_slots) == 0:
+        return close_slots
+    return close_slots[::n_trading_days]
 
 
 def _enforce_nse_slots(df: pd.DataFrame, interval_minutes: int, symbol: str) -> pd.DataFrame:
@@ -394,8 +405,9 @@ def _aggregate_ohlcv(df: pd.DataFrame, interval_minutes: int, symbol: str = "") 
     out.index = idx_local
 
     if interval_minutes >= 1440:
-        g = out.groupby(out.index.date)
-        agg = g.agg(
+        # First, build strict 1D trading-day bars, then roll them into N-day bars.
+        day_g = out.groupby(out.index.date)
+        daily = day_g.agg(
             open=("open", "first"),
             high=("high", "max"),
             low=("low", "min"),
@@ -403,7 +415,29 @@ def _aggregate_ohlcv(df: pd.DataFrame, interval_minutes: int, symbol: str = "") 
             volume=("volume", "sum"),
             source=("source", "last"),
         )
-        agg.index = pd.to_datetime(agg.index).tz_localize(IST) + pd.Timedelta(hours=15, minutes=30)
+        if daily.empty:
+            return pd.DataFrame(columns=["timestamp_utc", "open", "high", "low", "close", "volume", "source"])
+        daily.index = pd.to_datetime(daily.index).tz_localize(IST) + pd.Timedelta(hours=15, minutes=30)
+        n_days = max(1, int(np.ceil(interval_minutes / 1440.0)))
+        seq = np.arange(len(daily))
+        daily["chunk_id"] = seq // n_days
+        chunk = daily.groupby("chunk_id")
+        agg = chunk.agg(
+            open=("open", "first"),
+            high=("high", "max"),
+            low=("low", "min"),
+            close=("close", "last"),
+            volume=("volume", "sum"),
+            source=("source", "last"),
+            _slot_count=("close", "size"),
+            _end_ts=("close", lambda s: s.index.max()),
+        )
+        # Keep only full N-day bars; partial tail bars should not be published.
+        agg = agg[agg["_slot_count"] == n_days]
+        if agg.empty:
+            return pd.DataFrame(columns=["timestamp_utc", "open", "high", "low", "close", "volume", "source"])
+        agg.index = pd.DatetimeIndex(agg["_end_ts"])
+        agg = agg.drop(columns=["_slot_count", "_end_ts"])
     else:
         rule = f"{int(interval_minutes)}min"
         agg = out.resample(
@@ -428,5 +462,6 @@ def _aggregate_ohlcv(df: pd.DataFrame, interval_minutes: int, symbol: str = "") 
 
     agg.index = agg.index.tz_convert("UTC")
     agg = _enforce_nse_slots(agg, interval_minutes, symbol)
-    agg = agg.reset_index().rename(columns={"index": "timestamp_utc"})
+    agg.index.name = "timestamp_utc"
+    agg = agg.reset_index()
     return agg

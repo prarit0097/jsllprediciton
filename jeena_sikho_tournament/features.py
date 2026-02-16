@@ -202,14 +202,23 @@ def _load_exogenous_context(index_utc: pd.DatetimeIndex, candle_minutes: int) ->
     return out
 
 
-def _next_nse_day_close_target(df: pd.DataFrame) -> pd.Series:
+def _daily_target_point() -> str:
+    raw = os.getenv("DAILY_TARGET_POINT", "close").strip().lower()
+    if raw in {"open", "close"}:
+        return raw
+    return "close"
+
+
+def _nse_future_day_price_target(df: pd.DataFrame, days_ahead: int = 1, price_col: str = "close") -> pd.Series:
     if df.empty:
         return pd.Series(dtype=float)
+    step = max(1, int(days_ahead))
+    col = "open" if str(price_col).strip().lower() == "open" else "close"
     idx_local = df.index.tz_convert("Asia/Kolkata")
     day = pd.Series(idx_local.date, index=df.index)
-    day_close = df.groupby(day)["close"].last()
-    next_day_close = day_close.shift(-1)
-    mapped_next = day.map(next_day_close)
+    day_price = df.groupby(day)[col].first() if col == "open" else df.groupby(day)[col].last()
+    future_day_price = day_price.shift(-step)
+    mapped_next = day.map(future_day_price)
     return np.log((mapped_next + 1e-12) / (df["close"] + 1e-12))
 
 
@@ -585,7 +594,12 @@ def make_supervised(
         df = df.dropna(subset=exo_cols, how="all")
     target_label = _target_label_for_minutes(candle_minutes)
     if candle_minutes >= 1440 and _is_indian_equity_symbol():
-        df[target_label] = _next_nse_day_close_target(df)
+        # 1d can be configured to next-day open matching (default remains close).
+        if int(candle_minutes) == 1440 and _daily_target_point() == "open":
+            df[target_label] = _nse_future_day_price_target(df, days_ahead=1, price_col="open")
+        else:
+            future_days = max(1, int(np.ceil(candle_minutes / 1440.0)))
+            df[target_label] = _nse_future_day_price_target(df, days_ahead=future_days, price_col="close")
     else:
         df[target_label] = df["ret_1c"].shift(-1)
     if candle_minutes <= 120:

@@ -2,8 +2,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import timedelta
+import os
 from typing import Dict, List, Set
 
+import numpy as np
 import pandas as pd
 
 from .market_calendar import IST, is_nse_trading_day, load_nse_completeness_exclusions
@@ -49,7 +51,11 @@ def _expected_index_nse(df: pd.DataFrame, candle_minutes: int, holidays: Set) ->
         cur = cur + timedelta(days=1)
     if not all_slots:
         return pd.DatetimeIndex([], tz="UTC")
-    return pd.DatetimeIndex(all_slots, tz="UTC")
+    idx = pd.DatetimeIndex(all_slots, tz="UTC")
+    if step < 1440:
+        return idx
+    n_trading_days = max(1, int(np.ceil(step / 1440.0)))
+    return idx[::n_trading_days]
 
 
 def validate_ohlcv_quality(
@@ -110,7 +116,12 @@ def validate_ohlcv_quality(
         if (~align_ok).any():
             errors.append("nse_interval_alignment_violation")
 
-    expected = _expected_index_nse(df, candle_minutes, holidays) if nse_mode else _expected_index_24x7(df, candle_minutes)
+    step = max(1, int(candle_minutes))
+    strict_multiday_calendar = os.getenv("MULTIDAY_STRICT_CALENDAR_DQ", "0").strip().lower() in {"1", "true", "yes", "on"}
+    if nse_mode and step >= 1440 and not strict_multiday_calendar:
+        expected = df.index
+    else:
+        expected = _expected_index_nse(df, candle_minutes, holidays) if nse_mode else _expected_index_24x7(df, candle_minutes)
     if len(expected) > 0:
         missing = len(expected.difference(df.index))
         ratio = float(missing / max(1, len(expected)))
@@ -121,5 +132,10 @@ def validate_ohlcv_quality(
             errors.append(f"missing_ratio_too_high:{ratio:.4f}")
         elif ratio > max_missing_ratio * 0.5:
             warnings.append(f"missing_ratio_warning:{ratio:.4f}")
+        if nse_mode and step >= 1440 and strict_multiday_calendar:
+            unexpected = len(df.index.difference(expected))
+            stats["unexpected_intervals"] = float(unexpected)
+            if unexpected > 0:
+                errors.append(f"unexpected_intervals_for_multiday:{unexpected}")
 
     return DataQualityReport(ok=len(errors) == 0, errors=errors, warnings=warnings, stats=stats)

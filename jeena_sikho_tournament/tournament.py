@@ -63,9 +63,15 @@ def _write_run_state(
         payload["progress"] = progress
     _RUN_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
     tmp = _RUN_STATE_PATH.with_suffix(".tmp")
-    with tmp.open("w", encoding="utf8") as f:
-        json.dump(payload, f)
-    tmp.replace(_RUN_STATE_PATH)
+    try:
+        with tmp.open("w", encoding="utf8") as f:
+            json.dump(payload, f)
+        tmp.replace(_RUN_STATE_PATH)
+    except PermissionError as exc:
+        # Concurrent background schedulers on Windows can temporarily lock run_state.json.
+        LOGGER.warning("Run-state write skipped due to file lock: %s", exc)
+    except OSError as exc:
+        LOGGER.warning("Run-state write skipped due to OS error: %s", exc)
 
 
 def _setup_logging(log_path: Path) -> None:

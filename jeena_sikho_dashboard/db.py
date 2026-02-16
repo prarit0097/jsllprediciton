@@ -723,3 +723,18 @@ def get_ohlcv_close_at(timestamp_iso: str, table: str = "ohlcv") -> Optional[flo
     if not row:
         return None
     return float(row[0])
+
+
+def get_ohlcv_open_at(timestamp_iso: str, table: str = "ohlcv") -> Optional[float]:
+    try:
+        with connect() as con:
+            cur = con.execute(
+                f"SELECT open FROM {table} WHERE timestamp_utc = ? LIMIT 1",
+                (timestamp_iso,),
+            )
+            row = cur.fetchone()
+    except sqlite3.OperationalError:
+        return None
+    if not row:
+        return None
+    return float(row[0])

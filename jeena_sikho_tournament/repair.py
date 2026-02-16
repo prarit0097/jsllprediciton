@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
@@ -9,7 +10,7 @@ from typing import Any, Dict, List, Tuple
 import pandas as pd
 
 from .config import TournamentConfig
-from .data_sources import fetch_and_stitch
+from .data_sources import _aggregate_ohlcv, fetch_and_stitch
 from .market_calendar import load_nse_holidays
 from .storage import Storage
 from .validator import validate_ohlcv_quality
@@ -83,31 +84,76 @@ def _missing_slots(storage: Storage, lookback_days: int, config: TournamentConfi
     recent = df.loc[df.index >= cutoff]
     if recent.empty:
         recent = df
+    if config.candle_minutes >= 1440 and (config.yfinance_symbol or "").upper().endswith((".NS", ".BO")):
+        # Multi-day NSE tables are rebuilt from 1h base bars, so slot-level fetch repair is not required.
+        return pd.DatetimeIndex([], tz="UTC"), recent
+    # For multi-day NSE bars, keep cadence phase anchored to full-table origin.
     expected = _expected_index(recent, config.candle_minutes, config)
     missing = expected.difference(recent.index)
     return missing, recent
 
 
+def _populate_multiday_from_hourly(config: TournamentConfig, lookback_days: int) -> Dict[str, int]:
+    if config.candle_minutes < 1440:
+        return {"inserted": 0, "fetched_rows": 0}
+    sym = (config.yfinance_symbol or "").upper()
+    if not sym.endswith((".NS", ".BO")):
+        return {"inserted": 0, "fetched_rows": 0}
+
+    base_storage = Storage(config.db_path, "ohlcv")
+    base_df = base_storage.load().sort_index()
+    if base_df.empty:
+        return {"inserted": 0, "fetched_rows": 0}
+
+    if base_df.empty:
+        return {"inserted": 0, "fetched_rows": 0}
+
+    hourly = base_df.reset_index().rename(columns={"index": "timestamp_utc"})
+    aggregated = _aggregate_ohlcv(hourly, config.candle_minutes, config.yfinance_symbol)
+    if aggregated.empty:
+        return {"inserted": 0, "fetched_rows": int(len(hourly))}
+    aggregated["timestamp_utc"] = pd.to_datetime(aggregated["timestamp_utc"], utc=True)
+    aggregated = aggregated.set_index("timestamp_utc").sort_index()
+    target_storage = Storage(config.db_path, config.ohlcv_table)
+    target_storage.init_db()
+    with sqlite3.connect(target_storage.db_path) as con:
+        con.execute(f"DELETE FROM {target_storage.table}")
+    target_storage.upsert(aggregated)
+    return {"inserted": int(len(aggregated)), "fetched_rows": int(len(hourly))}
+
+
 def repair_timeframe_data(config: TournamentConfig, lookback_days: int = 120) -> Dict[str, Any]:
     storage = Storage(config.db_path, config.ohlcv_table)
     storage.init_db()
+    synthesized = _populate_multiday_from_hourly(config, lookback_days)
     missing, recent = _missing_slots(storage, lookback_days, config)
     before_missing = int(len(missing))
-    inserted = 0
-    fetched_rows = 0
+    inserted = int(synthesized.get("inserted", 0))
+    fetched_rows = int(synthesized.get("fetched_rows", 0))
     if before_missing > 0:
         # Fetch only covering missing span.
         start = (missing.min() - timedelta(minutes=max(1, config.candle_minutes) * 2)).to_pydatetime()
         merged, _ = fetch_and_stitch(config.symbol, config.yfinance_symbol, start, config.timeframe, config.candle_minutes)
         if not merged.empty:
-            fetched_rows = int(len(merged))
+            fetched_rows += int(len(merged))
             m = merged.copy()
             m["timestamp_utc"] = pd.to_datetime(m["timestamp_utc"], utc=True)
             m = m.set_index("timestamp_utc")
             only_missing = m.loc[m.index.isin(missing)]
-            inserted = int(len(only_missing))
+            inserted += int(len(only_missing))
             if not only_missing.empty:
                 storage.upsert(only_missing)
+    elif recent.empty:
+        # Bootstrap empty tables with a bounded lookback fetch.
+        start = (datetime.now(timezone.utc) - timedelta(days=max(1, lookback_days))).replace(minute=0, second=0, microsecond=0)
+        merged, _ = fetch_and_stitch(config.symbol, config.yfinance_symbol, start, config.timeframe, config.candle_minutes)
+        if not merged.empty:
+            fetched_rows += int(len(merged))
+            m = merged.copy()
+            m["timestamp_utc"] = pd.to_datetime(m["timestamp_utc"], utc=True)
+            m = m.set_index("timestamp_utc")
+            storage.upsert(m)
+            inserted += int(len(m))
     refreshed = storage.load().sort_index()
     cutoff = datetime.now(timezone.utc) - timedelta(days=max(1, lookback_days))
     validate_df = refreshed.loc[refreshed.index >= cutoff] if not refreshed.empty else refreshed
