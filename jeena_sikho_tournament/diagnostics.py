@@ -216,6 +216,8 @@ def check_data(config: TournamentConfig) -> Tuple[CheckResult, Dict[str, str]]:
 def check_features(config: TournamentConfig) -> CheckResult:
     res = CheckResult("Features")
     try:
+        prev_exo_req = os.getenv("EXOGENOUS_REQUIRED")
+        os.environ["EXOGENOUS_REQUIRED"] = "0"
         freq = f"{config.candle_minutes}min"
         idx = pd.date_range("2024-01-01", periods=300, freq=freq, tz="UTC")
         rng = np.random.default_rng(1)
@@ -272,8 +274,19 @@ def check_features(config: TournamentConfig) -> CheckResult:
                 warnings.append(col)
         if warnings:
             res.warn(f"Potential leakage signals in: {', '.join(warnings[:5])}")
+        if prev_exo_req is None:
+            os.environ.pop("EXOGENOUS_REQUIRED", None)
+        else:
+            os.environ["EXOGENOUS_REQUIRED"] = prev_exo_req
     except Exception as exc:
         res.fail(f"Feature check error: {exc}")
+        try:
+            if prev_exo_req is None:
+                os.environ.pop("EXOGENOUS_REQUIRED", None)
+            else:
+                os.environ["EXOGENOUS_REQUIRED"] = prev_exo_req
+        except Exception:
+            pass
     return res
 
 
@@ -285,8 +298,14 @@ def check_tests() -> CheckResult:
     try:
         import subprocess
 
+        prev_exo_req = os.getenv("EXOGENOUS_REQUIRED")
+        os.environ["EXOGENOUS_REQUIRED"] = "0"
         cmd = [sys.executable, "-m", "pytest", "tests/test_leakage.py", "tests/test_splits.py"]
         result = subprocess.run(cmd, capture_output=True, text=True)
+        if prev_exo_req is None:
+            os.environ.pop("EXOGENOUS_REQUIRED", None)
+        else:
+            os.environ["EXOGENOUS_REQUIRED"] = prev_exo_req
         if result.returncode != 0:
             res.fail("pytest failed")
     except Exception as exc:

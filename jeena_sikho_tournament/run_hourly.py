@@ -8,6 +8,7 @@ from .drift import should_retrain_on_drift
 from .market_calendar import IST, NSE_OPEN_MIN, NSE_RUN_CLOSE_MIN, is_nse_run_window, load_nse_holidays
 from .multi_timeframe import config_for_timeframe, run_multi_timeframe_tournament
 from .repair import run_nightly_repair
+from .run_weekly_reopt import run_weekly_reoptimization
 from .tournament import run_tournament
 from .env import load_env
 
@@ -112,6 +113,22 @@ def _should_run_scheduled_repair(now_utc: datetime, state: dict) -> bool:
     return True
 
 
+def _should_run_weekly_reopt(now_utc: datetime, state: dict) -> bool:
+    if os.getenv("WEEKLY_REOPT_ENABLE", "1").strip().lower() not in {"1", "true", "yes", "on"}:
+        return False
+    now_ist = now_utc.astimezone(IST)
+    run_day = int(os.getenv("WEEKLY_REOPT_DAY", "6"))  # Sunday
+    if now_ist.weekday() != run_day:
+        return False
+    minute = _minute_of_day_ist(now_utc)
+    start_min = int(os.getenv("WEEKLY_REOPT_START_MIN", "1080"))  # 18:00 IST
+    end_min = int(os.getenv("WEEKLY_REOPT_END_MIN", "1380"))      # 23:00 IST
+    if minute < start_min or minute > end_min:
+        return False
+    week_marker = f"{now_ist.isocalendar().year}-W{now_ist.isocalendar().week:02d}"
+    return state.get("weekly_reopt_done_for") != week_marker
+
+
 def _run_repair_with_profile(config: TournamentConfig, lookback_days: int, label: str) -> None:
     prev = os.getenv("REPAIR_LOOKBACK_DAYS")
     os.environ["REPAIR_LOOKBACK_DAYS"] = str(max(1, lookback_days))
@@ -154,6 +171,15 @@ def _handle_maintenance_windows(config: TournamentConfig, now_utc: datetime) -> 
         days = int(os.getenv("SCHEDULED_AUTO_REPAIR_LOOKBACK_DAYS", "30"))
         _run_repair_with_profile(config, days, "Scheduled")
         state["last_scheduled_repair_at"] = now_utc.isoformat()
+        changed = True
+        _save_maintenance_state(config, state)
+        return True
+
+    if _should_run_weekly_reopt(now_utc, state):
+        report = run_weekly_reoptimization(config)
+        state["weekly_reopt_done_for"] = f"{now_ist.isocalendar().year}-W{now_ist.isocalendar().week:02d}"
+        state["last_weekly_reopt_at"] = now_utc.isoformat()
+        state["last_weekly_reopt_diag_ok"] = bool(report.get("diagnostics_ok"))
         changed = True
         _save_maintenance_state(config, state)
         return True

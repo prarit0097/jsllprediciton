@@ -576,6 +576,13 @@ def make_supervised(
     feature_windows_hours: Optional[Iterable[int]] = None,
 ) -> pd.DataFrame:
     df = compute_features(df, candle_minutes=candle_minutes, feature_windows_hours=feature_windows_hours)
+    exo_required = os.getenv("EXOGENOUS_REQUIRED", "0").strip().lower() in {"1", "true", "yes", "on"}
+    if exo_required:
+        exo_cols = [c for c in df.columns if c.startswith("exo_")]
+        # Mandatory market context: if exogenous feeds are unavailable, skip supervised frame.
+        if not exo_cols:
+            return df.iloc[0:0]
+        df = df.dropna(subset=exo_cols, how="all")
     target_label = _target_label_for_minutes(candle_minutes)
     if candle_minutes >= 1440 and _is_indian_equity_symbol():
         df[target_label] = _next_nse_day_close_target(df)

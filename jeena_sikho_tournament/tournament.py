@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import sqlite3
 from copy import deepcopy
 from concurrent.futures import ProcessPoolExecutor, TimeoutError
 from datetime import datetime, timedelta, timezone
@@ -17,6 +18,7 @@ from .features import allowed_feature_sets_for_horizon, feature_sets, make_super
 from .metrics import accuracy, f1_score, mae, pinball_loss, coverage
 from .models_zoo import ModelSpec, build_quantile_bundle, get_candidates
 from .registry import (
+    ChampionDecision,
     load_registry,
     record_model_score,
     save_registry,
@@ -28,7 +30,7 @@ from .storage import Storage
 from .validator import validate_ohlcv_quality
 from .market_calendar import load_nse_holidays
 from .repair import repair_timeframe_data
-from jeena_sikho_dashboard.db import insert_run, insert_scores
+from jeena_sikho_dashboard.db import PREDICTIONS_TABLE, insert_run, insert_scores
 
 def _update_predictions_safe(config) -> None:
     try:
@@ -259,6 +261,63 @@ def _min_val_points_for_horizon(config: TournamentConfig) -> int:
     return max(1, int(config.min_val_points))
 
 
+def _target_label_for_minutes(minutes: int) -> str:
+    mins = max(1, int(minutes))
+    if mins % 1440 == 0:
+        return f"y_ret_{max(1, mins // 1440)}d"
+    if mins % 60 == 0:
+        return f"y_ret_{max(1, mins // 60)}h"
+    return f"y_ret_{mins}m"
+
+
+def _min_recent_matches_for_horizon(candle_minutes: int) -> int:
+    minutes = max(1, int(candle_minutes))
+    if minutes <= 60:
+        key = "MIN_READY_MATCHES_SHORT"
+        default = "24"
+    elif minutes >= 1440:
+        key = "MIN_READY_MATCHES_LONG"
+        default = "8"
+    else:
+        key = "MIN_READY_MATCHES_MID"
+        default = "16"
+    raw = os.getenv(key) or os.getenv("MIN_READY_MATCHES", default)
+    try:
+        return max(0, int(raw))
+    except Exception:
+        return int(default)
+
+
+def _recent_ready_match_count(config: TournamentConfig, lookback_days: int = 180) -> int:
+    db = config.db_path
+    if not db.exists():
+        return 0
+    target = _target_label_for_minutes(config.candle_minutes)
+    since = (datetime.now(timezone.utc) - timedelta(days=max(7, int(lookback_days)))).isoformat()
+    try:
+        con = sqlite3.connect(db)
+        cur = con.execute(
+            f"""
+            SELECT COUNT(*)
+            FROM {PREDICTIONS_TABLE}
+            WHERE status = 'ready'
+              AND timeframe = ?
+              AND predicted_at >= ?
+              AND COALESCE(prediction_target, '') IN (?, ?)
+            """,
+            (str(config.timeframe), since, target, f"direction_{target}"),
+        )
+        row = cur.fetchone()
+        return int(row[0]) if row and row[0] is not None else 0
+    except Exception:
+        return 0
+    finally:
+        try:
+            con.close()
+        except Exception:
+            pass
+
+
 def _regime_code_from_val(val_df: pd.DataFrame) -> np.ndarray:
     if val_df.empty:
         return np.array([], dtype=int)
@@ -362,19 +421,26 @@ def _unstable_features(df: pd.DataFrame) -> set:
 def _primary_score_reg_weighted(
     mae_val: float,
     y_true: np.ndarray,
+    y_pred: np.ndarray,
     dir_acc: float,
     close_hit: float,
     candle_minutes: int,
 ) -> float:
     mae_component = _primary_score_reg(mae_val, y_true)
+    y_true_arr = np.asarray(y_true, dtype=float)
+    y_pred_arr = np.asarray(y_pred, dtype=float)
+    # Calibration proxy: prediction dispersion should be close to true dispersion.
+    true_scale = float(np.std(y_true_arr)) + 1e-9
+    pred_scale = float(np.std(y_pred_arr)) + 1e-9
+    cal_component = max(0.0, 1.0 - min(1.0, abs(pred_scale - true_scale) / true_scale))
     minutes = max(1, int(candle_minutes))
     if minutes <= 60:
-        w_mae, w_dir, w_hit = 0.55, 0.25, 0.20
+        w_mae, w_dir, w_hit, w_cal = 0.45, 0.20, 0.15, 0.20
     elif minutes >= 1440:
-        w_mae, w_dir, w_hit = 0.35, 0.40, 0.25
+        w_mae, w_dir, w_hit, w_cal = 0.25, 0.45, 0.25, 0.05
     else:
-        w_mae, w_dir, w_hit = 0.50, 0.30, 0.20
-    return float((w_mae * mae_component) + (w_dir * float(dir_acc)) + (w_hit * float(close_hit)))
+        w_mae, w_dir, w_hit, w_cal = 0.45, 0.30, 0.20, 0.05
+    return float((w_mae * mae_component) + (w_dir * float(dir_acc)) + (w_hit * float(close_hit)) + (w_cal * cal_component))
 
 
 def _primary_score_range(pinball: float, y_true: np.ndarray, cov: float) -> float:
@@ -507,6 +573,11 @@ def _feature_drop_set(registry: Dict[str, Any], task: str) -> set:
     if not counts:
         return existing
     to_drop = {f for f, c in counts.items() if c <= min_hits and f not in protected}
+    cooldown_runs = max(0, int(os.getenv("FEATURE_DROP_COOLDOWN_RUNS", "2")))
+    if cooldown_runs > 0:
+        run_count = len(((registry.get("feature_importance") or {}).get(task)) or [])
+        if run_count < cooldown_runs:
+            to_drop = set()
     merged = existing.union(to_drop)
     max_drop = max(0, int(os.getenv("FEATURE_DROP_MAX", "20")))
     if max_drop and len(merged) > max_drop:
@@ -571,7 +642,7 @@ def _evaluate_candidate(args: Tuple[ModelSpec, str, str, List[Tuple[pd.DataFrame
             log_ret = y_val
             positions = (y_pred > 0).astype(int)
             net, mdd, trading = trading_score(positions, log_ret, config.fee_slippage)
-            primary = _primary_score_reg_weighted(mae_val, y_val, dir_acc, close_hit, config.candle_minutes)
+            primary = _primary_score_reg_weighted(mae_val, y_val, y_pred, dir_acc, close_hit, config.candle_minutes)
             fold_metrics.append(
                 {"mae": mae_val, "rmse": rmse_val, "dir_acc": dir_acc, "close_hit": close_hit, "net": net, "mdd": mdd}
             )
@@ -1144,20 +1215,26 @@ def run_tournament(config: TournamentConfig) -> Dict[str, Any]:
                 ensemble_record["error_weights"] = dynamic_error_weights
             if regime_weights:
                 ensemble_record["regime_weights"] = regime_weights
-                ensemble_record["regime_top_members"] = _regime_top_members(regime_weights, top_k=3)
+                regime_k = max(1, int(os.getenv("ROUTING_TOP_MEMBERS", "4")))
+                ensemble_record["regime_top_members"] = _regime_top_members(regime_weights, top_k=regime_k)
             if stacking_info:
                 ensemble_record["stacking"] = stacking_info
             registry.setdefault("ensembles", {})[task] = ensemble_record
 
-            decision = update_champion(
-                registry,
-                task,
-                challenger,
-                _min_val_points_for_horizon(config),
-                config.champion_margin,
-                config.champion_margin_override,
-                config.champion_cooldown_hours,
-            )
+            min_matches = _min_recent_matches_for_horizon(config.candle_minutes) if task == "return" else 0
+            matched_cnt = _recent_ready_match_count(config, lookback_days=int(os.getenv("READY_MATCH_LOOKBACK_DAYS", "180"))) if task == "return" else 0
+            if task == "return" and matched_cnt < min_matches:
+                decision = ChampionDecision(False, "insufficient_recent_matches")
+            else:
+                decision = update_champion(
+                    registry,
+                    task,
+                    challenger,
+                    _min_val_points_for_horizon(config),
+                    config.champion_margin,
+                    config.champion_margin_override,
+                    config.champion_cooldown_hours,
+                )
 
             registry["history"][task].append({
                 "timestamp": datetime.now(timezone.utc).isoformat(),

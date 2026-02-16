@@ -1375,6 +1375,16 @@ def _build_backtest_report(config: TournamentConfig) -> List[Dict[str, Any]]:
     return out
 
 
+def _production_ready_map(config: TournamentConfig) -> Dict[str, bool]:
+    report = _build_backtest_report(config)
+    out: Dict[str, bool] = {}
+    for row in report:
+        tf = str(row.get("timeframe") or "")
+        if tf:
+            out[tf] = bool(row.get("production_ready"))
+    return out
+
+
 def _compute_drift_status(config: TournamentConfig) -> Dict[str, Any]:
     window = max(20, int(os.getenv("DRIFT_WINDOW", "60")))
     ratio = float(os.getenv("DRIFT_MAPE_RATIO", "1.2"))
@@ -1623,6 +1633,9 @@ def refresh_prediction(config: TournamentConfig) -> Dict[str, Any]:
     run_id = latest_run["id"] if latest_run else None
     market_open = _market_state(datetime.now(timezone.utc)).get("market_open")
 
+    prod_gate_enable = os.getenv("PRODUCTION_GATE_ENABLE", "1").strip().lower() in {"1", "true", "yes", "on"}
+    prod_ready = _production_ready_map(config) if prod_gate_enable else {}
+
     for timeframe in get_timeframes(config):
         tf_cfg = _config_for_timeframe(config, timeframe)
         horizon_min = max(1, tf_cfg.candle_minutes)
@@ -1658,6 +1671,18 @@ def refresh_prediction(config: TournamentConfig) -> Dict[str, Any]:
                     "timeframe_minutes": horizon_min,
                     "prediction_horizon_min": horizon_min,
                     "status": "no_price",
+                }
+            )
+            continue
+
+        if prod_gate_enable and (prod_ready.get(timeframe) is False):
+            predictions.append(
+                {
+                    "timeframe": timeframe,
+                    "timeframe_minutes": horizon_min,
+                    "prediction_horizon_min": horizon_min,
+                    "prediction_target": target_label,
+                    "status": "blocked_by_backtest_gate",
                 }
             )
             continue
