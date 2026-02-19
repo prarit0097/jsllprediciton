@@ -151,10 +151,6 @@ function renderRunTimer() {
 function renderProgress(state) {
   const el = document.getElementById('run-progress');
   if (!el) return;
-  if (!state?.running) {
-    el.style.display = 'none';
-    return;
-  }
   const progress = state?.progress;
   const total = progress?.total;
   const done = progress?.done;
@@ -166,8 +162,12 @@ function renderProgress(state) {
   el.style.display = '';
   const safeDone = Math.max(0, Math.min(Number(done) || 0, total));
   const pct = Math.round((safeDone / total) * 100);
-  const taskLabel = task ? ` | ${task}` : '';
-  el.textContent = `Progress: ${safeDone}/${total} (${pct}%)${taskLabel}`;
+  if (state?.running) {
+    const taskLabel = task ? ` | ${task}` : '';
+    el.textContent = `Models trained: ${safeDone}/${total} (${pct}%)${taskLabel}`;
+    return;
+  }
+  el.textContent = `Last trained: ${safeDone}/${total} (${pct}%)`;
 }
 
 function expectedTimeLabel(candidateCount) {

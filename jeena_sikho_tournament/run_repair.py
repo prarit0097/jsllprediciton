@@ -7,7 +7,8 @@ from .repair import run_nightly_repair
 
 
 def main() -> None:
-    load_env()
+    # Keep caller-provided env overrides (e.g. MARKET_TIMEFRAMES=2d,3d) for focused repair runs.
+    load_env(overwrite=False)
     cfg = TournamentConfig()
     cfg.base_dir = Path(".")
     report = run_nightly_repair(cfg)

@@ -826,6 +826,30 @@ def _daily_target_point() -> str:
     return "close"
 
 
+def _confidence_thresholds_for_horizon(horizon_min: int) -> tuple[float, float]:
+    hm = max(1, int(horizon_min))
+    if hm <= 120:
+        low_key = "LOW_CONFIDENCE_PCT_SHORT"
+        skip_key = "LOW_CONFIDENCE_SKIP_PCT_SHORT"
+    elif hm >= 1440:
+        low_key = "LOW_CONFIDENCE_PCT_LONG"
+        skip_key = "LOW_CONFIDENCE_SKIP_PCT_LONG"
+    else:
+        low_key = "LOW_CONFIDENCE_PCT_MID"
+        skip_key = "LOW_CONFIDENCE_SKIP_PCT_MID"
+    low_raw = os.getenv(low_key, os.getenv("LOW_CONFIDENCE_PCT", "45"))
+    skip_raw = os.getenv(skip_key, os.getenv("LOW_CONFIDENCE_SKIP_PCT", "0"))
+    try:
+        low = float(low_raw)
+    except Exception:
+        low = 45.0
+    try:
+        skip = float(skip_raw)
+    except Exception:
+        skip = 0.0
+    return low, skip
+
+
 def _get_ohlcv_target_price(target_iso: str, table: str, horizon_min: int) -> Optional[float]:
     # 1d open-mode compares against next-day 09:15 open; all other horizons use close.
     if _is_indian_equity() and int(horizon_min) == 1440 and _daily_target_point() == "open":
@@ -1297,6 +1321,7 @@ def _apply_return_calibrator(predicted_return: float, calibrator: Dict[str, Any]
 def _summarize_ready_metrics(rows: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     if not rows:
         return None
+    max_scale_ratio = max(1.5, float(os.getenv("METRICS_MAX_SCALE_RATIO", "5.0")))
     abs_errors: List[float] = []
     pct_errors: List[float] = []
     hit_total = 0
@@ -1306,6 +1331,21 @@ def _summarize_ready_metrics(rows: List[Dict[str, Any]]) -> Optional[Dict[str, A
     for row in rows:
         predicted = row.get("predicted_price")
         actual = row.get("actual_price_1h")
+        current = row.get("current_price")
+        scale_vals: List[float] = []
+        for v in (predicted, actual, current):
+            try:
+                fv = float(v) if v is not None else None
+            except (TypeError, ValueError):
+                fv = None
+            if fv is not None and fv > 0:
+                scale_vals.append(fv)
+        if len(scale_vals) >= 2:
+            lo = min(scale_vals)
+            hi = max(scale_vals)
+            if lo > 0 and (hi / lo) > max_scale_ratio:
+                # Guard against legacy/contaminated rows from a different price scale.
+                continue
         if predicted is None or actual is None:
             continue
         metrics = _compute_match_metrics(predicted, actual)
@@ -1315,7 +1355,6 @@ def _summarize_ready_metrics(rows: List[Dict[str, Any]]) -> Optional[Dict[str, A
             pct_errors.append(float(metrics["pct_error"]))
 
         predicted_ret = row.get("predicted_return")
-        current = row.get("current_price")
         if predicted_ret is None or current is None or actual is None:
             continue
         try:
@@ -1771,9 +1810,8 @@ def refresh_prediction(config: TournamentConfig) -> Dict[str, Any]:
         calibrator = _fit_return_calibrator(tf_cfg, timeframe)
         predicted_return = _apply_return_calibrator(predicted_return, calibrator)
         confidence_pct = float(pred.get("confidence_pct") or 55.0)
-        low_conf_threshold = float(os.getenv("LOW_CONFIDENCE_PCT", "45"))
+        low_conf_threshold, skip_threshold = _confidence_thresholds_for_horizon(horizon_min)
         downweight = float(os.getenv("LOW_CONF_DOWNWEIGHT", "0.5"))
-        skip_threshold = float(os.getenv("LOW_CONFIDENCE_SKIP_PCT", "0"))
         low_confidence = confidence_pct < low_conf_threshold
         skipped_low_conf = skip_threshold > 0 and confidence_pct < skip_threshold
         if low_confidence:

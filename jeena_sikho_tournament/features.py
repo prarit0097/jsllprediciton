@@ -226,8 +226,23 @@ def resolve_feature_windows_for_horizon(
     candle_minutes: int,
     feature_windows_hours: Optional[Iterable[int]],
 ) -> list[int]:
-    base = list(feature_windows_hours) if feature_windows_hours is not None else [2, 4, 8, 12, 24, 48, 72, 96, 168]
     minutes = max(1, int(candle_minutes))
+    base = list(feature_windows_hours) if feature_windows_hours is not None else [2, 4, 8, 12, 24, 48, 72, 96, 168]
+    if minutes <= 120:
+        env_key = "FEATURE_WINDOWS_SHORT"
+    elif minutes >= 1440:
+        env_key = "FEATURE_WINDOWS_LONG"
+    else:
+        env_key = "FEATURE_WINDOWS_MID"
+    env_raw = os.getenv(env_key, "").strip()
+    if env_raw:
+        parsed: list[int] = []
+        for token in env_raw.replace("|", ",").replace(";", ",").split(","):
+            t = token.strip()
+            if t.isdigit():
+                parsed.append(int(t))
+        if parsed:
+            base = parsed
     if minutes <= 120:
         preferred = [2, 4, 8, 12, 24, 48, 72, 96]
     elif minutes >= 1440:
@@ -585,13 +600,21 @@ def make_supervised(
     feature_windows_hours: Optional[Iterable[int]] = None,
 ) -> pd.DataFrame:
     df = compute_features(df, candle_minutes=candle_minutes, feature_windows_hours=feature_windows_hours)
-    exo_required = os.getenv("EXOGENOUS_REQUIRED", "0").strip().lower() in {"1", "true", "yes", "on"}
-    if exo_required:
-        exo_cols = [c for c in df.columns if c.startswith("exo_")]
-        # Mandatory market context: if exogenous feeds are unavailable, skip supervised frame.
+    exo_mode = os.getenv("EXOGENOUS_REQUIRED", "0").strip().lower()
+    exo_cols = [c for c in df.columns if c.startswith("exo_")]
+    exo_required = exo_mode in {"1", "true", "yes", "on"}
+    exo_auto = exo_mode in {"auto", "adaptive"}
+    if exo_required or exo_auto:
+        # Mandatory market context: if exogenous feeds are unavailable, optionally fall back.
         if not exo_cols:
-            return df.iloc[0:0]
-        df = df.dropna(subset=exo_cols, how="all")
+            if exo_required:
+                return df.iloc[0:0]
+        else:
+            coverage = float(df[exo_cols].notna().any(axis=1).mean()) if len(df) else 0.0
+            auto_min = float(os.getenv("EXOGENOUS_AUTO_MIN_COVERAGE", "0.85"))
+            enforce = exo_required or (exo_auto and coverage >= auto_min)
+            if enforce:
+                df = df.dropna(subset=exo_cols, how="all")
     target_label = _target_label_for_minutes(candle_minutes)
     if candle_minutes >= 1440 and _is_indian_equity_symbol():
         # 1d can be configured to next-day open matching (default remains close).

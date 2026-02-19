@@ -3,7 +3,7 @@ import os
 from typing import Optional
 
 
-def load_env(path: Optional[Path] = None) -> None:
+def load_env(path: Optional[Path] = None, overwrite: bool = True) -> None:
     env_path = path or (Path(__file__).resolve().parent.parent / '.env')
     if not env_path.exists():
         return
@@ -17,4 +17,6 @@ def load_env(path: Optional[Path] = None) -> None:
         key = key.strip()
         val = val.strip().strip('"').strip("'")
         if key:
+            if (not overwrite) and (key in os.environ):
+                continue
             os.environ[key] = val

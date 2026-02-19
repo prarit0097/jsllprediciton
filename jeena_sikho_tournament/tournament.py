@@ -94,6 +94,48 @@ def _resolve_run_mode(config: TournamentConfig) -> str:
     return config.run_mode
 
 
+def _run_mode_for_horizon(config: TournamentConfig) -> str:
+    minutes = max(1, int(config.candle_minutes))
+    if minutes <= 120:
+        key = "RUN_MODE_SHORT"
+    elif minutes >= 1440:
+        key = "RUN_MODE_LONG"
+    else:
+        key = "RUN_MODE_MID"
+    raw = os.getenv(key, "").strip().lower()
+    if raw:
+        return raw
+    return _resolve_run_mode(config)
+
+
+def _max_candidates_per_target_for_horizon(config: TournamentConfig) -> int:
+    minutes = max(1, int(config.candle_minutes))
+    if minutes <= 120:
+        key = "MAX_CANDIDATES_PER_TARGET_SHORT"
+    elif minutes >= 1440:
+        key = "MAX_CANDIDATES_PER_TARGET_LONG"
+    else:
+        key = "MAX_CANDIDATES_PER_TARGET_MID"
+    raw = os.getenv(key, "")
+    if raw.isdigit():
+        return max(10, int(raw))
+    return max(10, int(config.max_candidates_per_target))
+
+
+def _max_candidates_total_for_horizon(config: TournamentConfig) -> int:
+    minutes = max(1, int(config.candle_minutes))
+    if minutes <= 120:
+        key = "MAX_CANDIDATES_TOTAL_SHORT"
+    elif minutes >= 1440:
+        key = "MAX_CANDIDATES_TOTAL_LONG"
+    else:
+        key = "MAX_CANDIDATES_TOTAL_MID"
+    raw = os.getenv(key, "")
+    if raw.isdigit():
+        return max(20, int(raw))
+    return max(20, int(config.max_candidates_total))
+
+
 def _prep_data(config: TournamentConfig) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     storage = Storage(config.db_path, config.ohlcv_table)
     storage.init_db()
@@ -933,14 +975,16 @@ def run_tournament(config: TournamentConfig) -> Dict[str, Any]:
         results: Dict[str, Any] = {"coverage": coverage}
         run_at = run_started_at.isoformat()
 
-        run_mode = _resolve_run_mode(config)
+        run_mode = _run_mode_for_horizon(config)
+        max_candidates_per_target_eff = _max_candidates_per_target_for_horizon(config)
+        max_candidates_total_eff = _max_candidates_total_for_horizon(config)
 
         per_task_candidates: Dict[str, List[Tuple[ModelSpec, str, List[str]]]] = {}
         per_task_feature_cols: Dict[str, Dict[str, List[str]]] = {}
         strict_horizon_pool = os.getenv("STRICT_HORIZON_MODEL_POOL", "1").strip().lower() not in {"0", "false", "no", "off"}
         unstable_feats = _unstable_features(sup)
         for task in ["direction", "return", "range"]:
-            max_cands_for_task = config.max_candidates_per_target
+            max_cands_for_task = max_candidates_per_target_eff
             low_sample_enable = os.getenv("LOW_SAMPLE_CANDIDATE_SHRINK_ENABLE", "1").strip().lower() in {"1", "true", "yes", "on"}
             if low_sample_enable:
                 nrows = len(sup)
@@ -952,7 +996,7 @@ def run_tournament(config: TournamentConfig) -> Dict[str, Any]:
                     low_n = 0
                 if low_n and nrows < low_n:
                     scale = min(1.0, max(0.2, float(os.getenv("LOW_SAMPLE_CANDIDATE_SCALE", "0.5"))))
-                    max_cands_for_task = max(20, int(round(config.max_candidates_per_target * scale)))
+                    max_cands_for_task = max(20, int(round(max_candidates_per_target_eff * scale)))
             specs = get_candidates(
                 task,
                 max_cands_for_task,
@@ -991,8 +1035,8 @@ def run_tournament(config: TournamentConfig) -> Dict[str, Any]:
             per_task_feature_cols[task] = fs_cols_map
 
         all_candidates = [c for task in per_task_candidates for c in per_task_candidates[task]]
-        if len(all_candidates) > config.max_candidates_total:
-            capped = _cap_candidates(all_candidates, config.max_candidates_total, config.random_seed)
+        if len(all_candidates) > max_candidates_total_eff:
+            capped = _cap_candidates(all_candidates, max_candidates_total_eff, config.random_seed)
             per_task_candidates = {"direction": [], "return": [], "range": []}
             for spec, fs_id, cols in capped:
                 per_task_candidates[spec.task].append((spec, fs_id, cols))

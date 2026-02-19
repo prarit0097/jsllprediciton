@@ -88,3 +88,23 @@ def test_1d_nse_target_can_use_next_day_open(monkeypatch):
     expected = np.log(opens[pos + 1] / closes[pos])
     got = float(sup.loc[first_idx, "y_ret_1d"])
     assert np.isclose(got, expected, rtol=1e-9, atol=1e-12)
+
+
+def test_exogenous_required_auto_falls_back_when_exo_unavailable(monkeypatch):
+    monkeypatch.setenv("EXOGENOUS_ENABLE", "0")
+    monkeypatch.setenv("EXOGENOUS_REQUIRED", "auto")
+    monkeypatch.setenv("EVENT_DAY_DROP_FROM_TRAIN", "0")
+    idx = pd.date_range("2026-01-01", periods=200, freq="60min", tz="UTC")
+    base = np.linspace(100.0, 120.0, len(idx))
+    df = pd.DataFrame(
+        {
+            "open": base,
+            "high": base + 1.0,
+            "low": base - 1.0,
+            "close": base + 0.2,
+            "volume": np.full(len(idx), 1000.0),
+        },
+        index=idx,
+    )
+    sup = make_supervised(df, candle_minutes=60, feature_windows_hours=[2, 4, 8, 12, 24])
+    assert not sup.empty
