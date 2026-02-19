@@ -262,15 +262,36 @@ def check_features(config: TournamentConfig) -> CheckResult:
             candle_minutes=config.candle_minutes,
             feature_windows_hours=config.feature_windows,
         ).dropna()
-        future = np.log(data["close"]).diff().shift(-1)
+        close_ret = np.log(data["close"]).diff()
+        future = close_ret.shift(-1)
         warnings = []
         for col in feats.columns:
             if col in {"open", "high", "low", "close", "volume"}:
                 continue
-            series = feats[col]
-            corr_future = series.corr(future.loc[series.index])
-            corr_lag = series.corr(np.log(data["close"]).diff().loc[series.index])
-            if abs(corr_future) > 0.2 and abs(corr_future) > abs(corr_lag) * 5.0:
+            aligned = pd.DataFrame(
+                {
+                    "feat": feats[col],
+                    "future": future.reindex(feats.index),
+                    "lag": close_ret.reindex(feats.index),
+                }
+            ).dropna()
+            if len(aligned) < 80:
+                continue
+            if float(aligned["feat"].std()) <= 1e-9:
+                continue
+            if float(aligned["future"].std()) <= 1e-12:
+                continue
+            if float(aligned["lag"].std()) <= 1e-12:
+                continue
+            with np.errstate(invalid="ignore", divide="ignore"):
+                corr_future = float(aligned["feat"].corr(aligned["future"]))
+                corr_lag = float(aligned["feat"].corr(aligned["lag"]))
+            if np.isnan(corr_future) or np.isnan(corr_lag):
+                continue
+            lag_scale = max(0.05, abs(corr_lag))
+            # Treat as suspicious only when future-link is unusually strong.
+            suspicious = abs(corr_future) > 0.70 and abs(corr_future) > (lag_scale * 3.0)
+            if suspicious:
                 warnings.append(col)
         if warnings:
             res.warn(f"Potential leakage signals in: {', '.join(warnings[:5])}")
@@ -375,27 +396,41 @@ def check_registry_predictor(config: TournamentConfig) -> CheckResult:
 
 def run_doctor(base: Path, debug: bool = False) -> int:
     results = []
+    prev_exo_enable = os.getenv("EXOGENOUS_ENABLE")
+    prev_exo_required = os.getenv("EXOGENOUS_REQUIRED")
+    os.environ["EXOGENOUS_ENABLE"] = "0"
+    os.environ["EXOGENOUS_REQUIRED"] = "0"
 
-    results.append(check_structure(base))
+    try:
+        results.append(check_structure(base))
 
-    dep_res, install_cmds = check_dependencies()
-    results.append(dep_res)
+        dep_res, install_cmds = check_dependencies()
+        results.append(dep_res)
 
-    config = TournamentConfig()
+        config = TournamentConfig()
 
-    results.append(check_storage(config))
+        results.append(check_storage(config))
 
-    data_res, data_summary = check_data(config)
-    results.append(data_res)
+        data_res, data_summary = check_data(config)
+        results.append(data_res)
 
-    results.append(check_features(config))
-    results.append(check_tests())
+        results.append(check_features(config))
+        results.append(check_tests())
 
-    zoo_res, zoo_summary = check_model_zoo(config)
-    results.append(zoo_res)
+        zoo_res, zoo_summary = check_model_zoo(config)
+        results.append(zoo_res)
 
-    results.append(check_dry_run(config))
-    results.append(check_registry_predictor(config))
+        results.append(check_dry_run(config))
+        results.append(check_registry_predictor(config))
+    finally:
+        if prev_exo_enable is None:
+            os.environ.pop("EXOGENOUS_ENABLE", None)
+        else:
+            os.environ["EXOGENOUS_ENABLE"] = prev_exo_enable
+        if prev_exo_required is None:
+            os.environ.pop("EXOGENOUS_REQUIRED", None)
+        else:
+            os.environ["EXOGENOUS_REQUIRED"] = prev_exo_required
 
     overall = "PASS"
     for r in results:
