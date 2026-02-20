@@ -26,6 +26,18 @@ def _pid_alive(pid: int) -> bool:
         return False
 
 
+def _parse_iso_ts(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        ts = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    return ts.astimezone(timezone.utc)
+
+
 def _acquire_scheduler_lock() -> bool:
     _SCHEDULER_LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
     if _SCHEDULER_LOCK_PATH.exists():
@@ -75,6 +87,24 @@ def _is_running() -> bool:
     except Exception:
         return False
     return bool(data.get("running"))
+
+
+def _cooldown_remaining_seconds(min_gap_seconds: int) -> int:
+    if min_gap_seconds <= 0:
+        return 0
+    state_path = Path("data") / "run_state.json"
+    if not state_path.exists():
+        return 0
+    try:
+        data = json.loads(state_path.read_text(encoding="utf-8"))
+    except Exception:
+        return 0
+    anchor = _parse_iso_ts(data.get("last_finished_at")) or _parse_iso_ts(data.get("last_started_at"))
+    if anchor is None:
+        return 0
+    age = (datetime.now(timezone.utc) - anchor).total_seconds()
+    remaining = int(max(0.0, float(min_gap_seconds) - age))
+    return remaining
 
 
 def _is_indian_equity(config: TournamentConfig) -> bool:
@@ -254,6 +284,14 @@ def main():
         config = TournamentConfig()
         config.base_dir = Path(".")
         force_run = os.getenv("FORCE_RUN", "").strip().lower() in {"1", "true", "yes", "on"}
+        default_gap = max(60, int(os.getenv("TOURNAMENT_INTERVAL_MINUTES", "60")) * 60)
+        min_gap_seconds = max(0, int(os.getenv("RUN_MIN_GAP_SECONDS", str(default_gap))))
+        if not force_run:
+            remain = _cooldown_remaining_seconds(min_gap_seconds)
+            if remain > 0:
+                mm, ss = divmod(remain, 60)
+                print(f"Cooldown active; skipping. Next run in {mm:02d}:{ss:02d}. Set FORCE_RUN=1 to override.")
+                return
         holidays = load_nse_holidays(config.data_dir)
         now_utc = datetime.now(timezone.utc)
 

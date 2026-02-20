@@ -1917,28 +1917,55 @@ def latest_prediction(config: TournamentConfig, update_pending: bool = True) -> 
 def run_status() -> Dict[str, Any]:
     state = dict(_RUN_STATE)
     file_state = _read_run_state_file()
-    if not file_state:
-        return state
+    if file_state:
+        running = bool(state.get("running") or file_state.get("running"))
+        state["running"] = running
 
-    running = bool(state.get("running") or file_state.get("running"))
-    state["running"] = running
+        file_started = _parse_iso(file_state.get("last_started_at"))
+        mem_started = _parse_iso(state.get("last_started_at"))
+        if file_started and (not mem_started or file_started > mem_started):
+            state["last_started_at"] = file_state.get("last_started_at")
 
-    file_started = _parse_iso(file_state.get("last_started_at"))
-    mem_started = _parse_iso(state.get("last_started_at"))
-    if file_started and (not mem_started or file_started > mem_started):
-        state["last_started_at"] = file_state.get("last_started_at")
+        if file_state.get("last_finished_at"):
+            state["last_finished_at"] = file_state.get("last_finished_at")
+        if file_state.get("progress"):
+            state["progress"] = file_state.get("progress")
 
-    if file_state.get("last_finished_at"):
-        state["last_finished_at"] = file_state.get("last_finished_at")
-    if file_state.get("progress"):
-        state["progress"] = file_state.get("progress")
+        started = _parse_iso(state.get("last_started_at"))
+        finished = _parse_iso(state.get("last_finished_at"))
+        if started and finished:
+            duration = max(0.0, (finished - started).total_seconds())
+            state["duration_seconds"] = duration
 
-    started = _parse_iso(state.get("last_started_at"))
-    finished = _parse_iso(state.get("last_finished_at"))
-    if started and finished:
-        duration = max(0.0, (finished - started).total_seconds())
-        state["duration_seconds"] = duration
-
+    # When idle, prefer latest completed DB run for "last time / last trained"
+    # to avoid stale partial progress from aborted/skipped cycles.
+    if not state.get("running"):
+        latest_run = get_latest_run()
+        if latest_run:
+            db_started = latest_run.get("run_started_at") or latest_run.get("run_at")
+            db_finished = latest_run.get("run_finished_at") or latest_run.get("run_at")
+            if db_started:
+                state["last_started_at"] = db_started
+            if db_finished:
+                state["last_finished_at"] = db_finished
+            try:
+                db_duration = float(latest_run.get("duration_seconds") or 0.0)
+            except (TypeError, ValueError):
+                db_duration = 0.0
+            if db_duration > 0:
+                state["duration_seconds"] = db_duration
+            try:
+                db_count = int(latest_run.get("candidate_count") or 0)
+            except (TypeError, ValueError):
+                db_count = 0
+            if db_count > 0:
+                state["progress"] = {
+                    "total": db_count,
+                    "done": db_count,
+                    "failed": 0,
+                    "task": "completed",
+                    "updated_at": db_finished,
+                }
     return state
 
 
