@@ -621,6 +621,19 @@ async function loadSummary() {
     if (driftEl) {
       driftEl.textContent = `Drift: ${drift.alert ? 'ALERT (retrain recommended)' : 'stable'}`;
     }
+    const kite = data.kite_auth || {};
+    const kiteEl = document.getElementById('kite-auth-status');
+    if (kiteEl) {
+      if (!kite.enabled) {
+        kiteEl.textContent = 'Kite auth: disabled';
+      } else {
+        const token = kite.access_token_present ? `present (${kite.access_token_tail || '***'})` : 'missing';
+        const src = kite.token_source || '--';
+        const upd = kite.updated_at ? fmtDateTime(kite.updated_at) : '--';
+        const user = kite.user_id || '--';
+        kiteEl.textContent = `Kite auth: ${token} | source: ${src} | user: ${user} | updated: ${upd}`;
+      }
+    }
     const byH = data.champions_by_horizon || {};
     const horizonEl = document.getElementById('champions-horizon');
     if (horizonEl) {

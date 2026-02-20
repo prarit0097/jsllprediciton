@@ -10,6 +10,9 @@ import pandas as pd
 import requests
 
 from .market_calendar import IST, is_nse_trading_day, load_nse_completeness_exclusions, load_nse_holidays
+from .kite_client import fetch_kite_ohlcv, is_kite_enabled
+
+LOGGER = logging.getLogger(__name__)
 
 
 @dataclass
@@ -300,7 +303,7 @@ def stitch_sources(sources: List[pd.DataFrame], interval_minutes: int, symbol: s
         return pd.DataFrame(), CoverageReport(None, 0, 0, interval_minutes)
 
     merged = merged.dropna(subset=["timestamp_utc", "open", "high", "low", "close", "volume"])
-    priority = {"binance": 2, "cryptocompare": 1, "yfinance": 0, "yfinance_adj": 3, "yfinance_fallback": 4}
+    priority = {"kite": -2, "binance": 2, "cryptocompare": 1, "yfinance": 0, "yfinance_adj": 3, "yfinance_fallback": 4}
     latest_by_source = merged.groupby("source")["timestamp_utc"].max().to_dict()
     freshest_src = max(latest_by_source, key=latest_by_source.get) if latest_by_source else None
     if freshest_src is not None:
@@ -336,13 +339,29 @@ def fetch_and_stitch(
     end = dt.datetime.now(dt.timezone.utc)
     is_nse_symbol = (yfinance_symbol or "").strip().upper().endswith(".NS") or (yfinance_symbol or "").strip().upper().endswith(".BO")
     if is_nse_symbol:
-        ydf_primary = fetch_yfinance(yfinance_symbol, start, end, auto_adjust=False, source_name="yfinance")
-        ydf_fallback = fetch_yfinance(yfinance_symbol, start, end, auto_adjust=True, source_name="yfinance_adj")
-        if not ydf_primary.empty and interval_minutes != 60:
-            ydf_primary = _aggregate_ohlcv(ydf_primary, interval_minutes, yfinance_symbol)
-        if not ydf_fallback.empty and interval_minutes != 60:
-            ydf_fallback = _aggregate_ohlcv(ydf_fallback, interval_minutes, yfinance_symbol)
-        merged, report = stitch_sources([ydf_primary, ydf_fallback], interval_minutes, yfinance_symbol)
+        nse_sources: List[pd.DataFrame] = []
+        allow_yf_fallback = os.getenv("KITE_ALLOW_YFINANCE_FALLBACK", "1").strip().lower() in {"1", "true", "yes", "on"}
+
+        if is_kite_enabled():
+            try:
+                kdf = fetch_kite_ohlcv(start=start, end=end, interval="60minute")
+                if not kdf.empty and interval_minutes != 60:
+                    kdf = _aggregate_ohlcv(kdf, interval_minutes, yfinance_symbol)
+                if not kdf.empty:
+                    nse_sources.append(kdf)
+            except Exception as exc:
+                LOGGER.warning("Kite OHLCV fetch failed; using fallback sources: %s", exc)
+
+        if allow_yf_fallback or not nse_sources:
+            ydf_primary = fetch_yfinance(yfinance_symbol, start, end, auto_adjust=False, source_name="yfinance")
+            ydf_fallback = fetch_yfinance(yfinance_symbol, start, end, auto_adjust=True, source_name="yfinance_adj")
+            if not ydf_primary.empty and interval_minutes != 60:
+                ydf_primary = _aggregate_ohlcv(ydf_primary, interval_minutes, yfinance_symbol)
+            if not ydf_fallback.empty and interval_minutes != 60:
+                ydf_fallback = _aggregate_ohlcv(ydf_fallback, interval_minutes, yfinance_symbol)
+            nse_sources.extend([ydf_primary, ydf_fallback])
+
+        merged, report = stitch_sources(nse_sources, interval_minutes, yfinance_symbol)
         return merged, report
     sources = []
     sources.append(fetch_binance(symbol, timeframe, start))

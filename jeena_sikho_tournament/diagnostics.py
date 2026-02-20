@@ -13,7 +13,7 @@ from .config import TournamentConfig
 from .features import compute_features, make_supervised
 from .models_zoo import get_candidates
 from .features import feature_sets
-from .market_calendar import load_nse_holidays
+from .market_calendar import IST, NSE_CLOSE_MIN, load_nse_holidays, is_nse_market_open, is_nse_trading_day
 from .storage import Storage
 from .validator import validate_ohlcv_quality
 from .registry import load_registry
@@ -182,8 +182,49 @@ def check_data(config: TournamentConfig) -> Tuple[CheckResult, Dict[str, str]]:
     if earliest > start:
         res.warn("Earliest data is after 2015-01-01")
 
-    if latest < _now_utc() - timedelta(hours=2):
-        res.warn("Latest data is stale (>2h)")
+    now_utc = _now_utc()
+    if latest < now_utc - timedelta(hours=2):
+        stale = True
+        if nse_mode:
+            holidays = load_nse_holidays(config.data_dir)
+            now_ist = now_utc.astimezone(IST)
+            latest_ist = latest.tz_convert(IST)
+            if not is_nse_market_open(now_utc, holidays):
+                # Outside market hours, compare against the most recent trading-day expected close slot.
+                recent_day = now_ist.date()
+                probe = now_ist
+                if not is_nse_trading_day(probe, holidays):
+                    while not is_nse_trading_day(probe, holidays):
+                        probe = (probe - timedelta(days=1)).replace(hour=12, minute=0, second=0, microsecond=0)
+                    recent_day = probe.date()
+                elif (now_ist.hour * 60 + now_ist.minute) < (9 * 60 + 15):
+                    probe = (now_ist - timedelta(days=1)).replace(hour=12, minute=0, second=0, microsecond=0)
+                    while not is_nse_trading_day(probe, holidays):
+                        probe = (probe - timedelta(days=1)).replace(hour=12, minute=0, second=0, microsecond=0)
+                    recent_day = probe.date()
+
+                close_min = NSE_CLOSE_MIN
+                if config.candle_minutes >= 1440:
+                    exp_min = close_min
+                else:
+                    open_min = 9 * 60 + 15
+                    span = close_min - open_min
+                    exp_min = open_min + (span // max(1, config.candle_minutes)) * max(1, config.candle_minutes)
+                exp_h, exp_m = divmod(exp_min, 60)
+                expected_slot = datetime(
+                    recent_day.year,
+                    recent_day.month,
+                    recent_day.day,
+                    exp_h,
+                    exp_m,
+                    tzinfo=IST,
+                )
+                # Allow one interval grace for delayed inserts.
+                grace = timedelta(minutes=max(60, int(config.candle_minutes)))
+                if latest_ist >= (expected_slot - grace):
+                    stale = False
+        if stale:
+            res.warn("Latest data is stale (>2h)")
 
     if df.index.duplicated().any():
         res.fail("Duplicate timestamps found")

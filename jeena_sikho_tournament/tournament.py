@@ -71,6 +71,7 @@ def _write_run_state(
         "last_started_at": started_at,
         "last_finished_at": finished_at,
         "status": status,
+        "pid": os.getpid(),
         "updated_at": datetime.now(timezone.utc).isoformat(),
         "source": "tournament",
     }
@@ -294,8 +295,21 @@ def _train_days_for_horizon(config: TournamentConfig) -> int:
     return max(30, int(config.train_days))
 
 
+def _horizon_env_suffix(candle_minutes: int) -> str:
+    minutes = max(1, int(candle_minutes))
+    if minutes % 1440 == 0:
+        return f"{max(1, minutes // 1440)}D"
+    if minutes % 60 == 0:
+        return f"{max(1, minutes // 60)}H"
+    return f"{minutes}M"
+
+
 def _min_sup_rows_for_horizon(candle_minutes: int) -> int:
     minutes = max(1, int(candle_minutes))
+    exact_key = f"MIN_SUP_ROWS_{_horizon_env_suffix(minutes)}"
+    raw_exact = os.getenv(exact_key)
+    if raw_exact and raw_exact.isdigit():
+        return max(10, int(raw_exact))
     if minutes <= 60:
         key = "MIN_SUP_ROWS_SHORT"
         default = "240"
@@ -313,6 +327,13 @@ def _min_sup_rows_for_horizon(candle_minutes: int) -> int:
 
 def _completeness_min_for_horizon(candle_minutes: int) -> float:
     minutes = max(1, int(candle_minutes))
+    exact_key = f"COMPLETENESS_MIN_PCT_{_horizon_env_suffix(minutes)}"
+    raw_exact = os.getenv(exact_key)
+    if raw_exact:
+        try:
+            return float(raw_exact)
+        except ValueError:
+            pass
     if minutes <= 60:
         key = "COMPLETENESS_MIN_PCT_SHORT"
     elif minutes >= 1440:
@@ -330,6 +351,10 @@ def _completeness_min_for_horizon(candle_minutes: int) -> float:
 
 def _min_val_points_for_horizon(config: TournamentConfig) -> int:
     minutes = max(1, int(config.candle_minutes))
+    exact_key = f"MIN_VAL_POINTS_{_horizon_env_suffix(minutes)}"
+    raw_exact = os.getenv(exact_key)
+    if raw_exact and raw_exact.isdigit():
+        return max(1, int(raw_exact))
     if minutes <= 60:
         key = "MIN_VAL_POINTS_SHORT"
     elif minutes >= 1440:
@@ -353,6 +378,10 @@ def _target_label_for_minutes(minutes: int) -> str:
 
 def _min_recent_matches_for_horizon(candle_minutes: int) -> int:
     minutes = max(1, int(candle_minutes))
+    exact_key = f"MIN_READY_MATCHES_{_horizon_env_suffix(minutes)}"
+    raw_exact = os.getenv(exact_key)
+    if raw_exact and raw_exact.isdigit():
+        return max(0, int(raw_exact))
     if minutes <= 60:
         key = "MIN_READY_MATCHES_SHORT"
         default = "24"

@@ -12,10 +12,18 @@ import requests
 
 from jeena_sikho_tournament.config import TournamentConfig, _timeframe_to_minutes
 from jeena_sikho_tournament.data_sources import fetch_and_stitch
+from jeena_sikho_tournament.data_sources import _expected_nse_slots
 from jeena_sikho_tournament.features import make_supervised, resolve_feature_windows_for_horizon
+from jeena_sikho_tournament.kite_client import (
+    current_kite_access_token,
+    fetch_kite_ltp,
+    is_kite_enabled,
+    load_kite_auth_state,
+)
 from jeena_sikho_tournament.market_calendar import (
     IST,
     align_to_nse_interval_floor,
+    is_nse_run_window,
     load_nse_holidays,
     next_nse_slot_at_or_after,
     nse_market_state,
@@ -133,6 +141,43 @@ def _parse_iso(value: Optional[str]) -> Optional[datetime]:
     return None
 
 
+def _run_state_stale_seconds() -> int:
+    return max(600, int(os.getenv("RUN_STATE_STALE_SECONDS", "10800")))
+
+
+def _pid_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def _is_stale_file_run_state(file_state: Dict[str, Any]) -> bool:
+    if not bool(file_state.get("running")):
+        return False
+    try:
+        pid = int(file_state.get("pid", 0))
+    except Exception:
+        pid = 0
+    if pid and not _pid_alive(pid):
+        return True
+    progress = file_state.get("progress") if isinstance(file_state.get("progress"), dict) else {}
+    anchor = _parse_iso(
+        (progress or {}).get("updated_at")
+        or file_state.get("updated_at")
+        or file_state.get("last_started_at")
+    )
+    if anchor is None:
+        return False
+    if anchor.tzinfo is None:
+        anchor = anchor.replace(tzinfo=timezone.utc)
+    age = (datetime.now(timezone.utc) - anchor.astimezone(timezone.utc)).total_seconds()
+    return age > float(_run_state_stale_seconds())
+
+
 def _read_run_state_file() -> Optional[Dict[str, Any]]:
     if not _RUN_STATE_PATH.exists():
         return None
@@ -146,15 +191,48 @@ def _read_run_state_file() -> Optional[Dict[str, Any]]:
     return None
 
 
+def _scheduler_min_gap_seconds() -> int:
+    default_gap = max(60, int(os.getenv("TOURNAMENT_INTERVAL_MINUTES", "60")) * 60)
+    return max(0, int(os.getenv("RUN_MIN_GAP_SECONDS", str(default_gap))))
+
+
+def _next_slot_local(after_local: datetime, interval_min: int, start_minute: int) -> datetime:
+    base = after_local.replace(hour=0, minute=start_minute, second=0, microsecond=0)
+    if base >= after_local:
+        return base
+    slot = base
+    while slot < after_local:
+        slot = slot + timedelta(minutes=interval_min)
+    return slot
+
+
+def _cooldown_ready_local(now_local: datetime) -> datetime:
+    state = _read_run_state_file() or {}
+    anchor = _parse_iso(state.get("last_finished_at")) or _parse_iso(state.get("last_started_at"))
+    if not anchor:
+        return now_local
+    if anchor.tzinfo is None:
+        anchor = anchor.replace(tzinfo=timezone.utc)
+    ready_at = anchor.astimezone(now_local.tzinfo) + timedelta(seconds=_scheduler_min_gap_seconds())
+    return ready_at if ready_at > now_local else now_local
+
+
 def _next_scheduled_time_local(now_local: datetime) -> datetime:
     interval = max(1, int(_TOURNAMENT_INTERVAL_MIN))
     minute = max(0, min(59, int(_TOURNAMENT_START_MIN)))
-    base = now_local.replace(hour=0, minute=minute, second=0, microsecond=0)
-    if base > now_local:
-        return base
-    next_time = base
-    while next_time <= now_local:
-        next_time = next_time + timedelta(minutes=interval)
+    earliest = _cooldown_ready_local(now_local)
+    next_time = _next_slot_local(earliest, interval, minute)
+    if not _is_indian_equity():
+        return next_time
+
+    # Keep "Next" aligned with scheduler eligibility: cooldown + NSE run window.
+    guard = 0
+    while guard < 800:
+        check_utc = next_time.astimezone(timezone.utc)
+        if is_nse_run_window(check_utc, _NSE_HOLIDAYS):
+            return next_time
+        next_time = _next_slot_local(next_time + timedelta(minutes=interval), interval, minute)
+        guard += 1
     return next_time
 
 
@@ -192,6 +270,10 @@ def _fetch_yfinance_price() -> float:
         if val is not None:
             return float(val)
     raise RuntimeError(f"yfinance price unavailable for {MARKET_YFINANCE_SYMBOL}")
+
+
+def _fetch_kite_price() -> float:
+    return float(fetch_kite_ltp())
 
 
 def _fetch_coinbase_price() -> float:
@@ -257,15 +339,31 @@ def _get_fx_rate() -> Dict[str, Any]:
 
 
 def get_live_price() -> Dict[str, Any]:
-    if PRICE_SOURCE == "yfinance":
+    kite_enabled = is_kite_enabled()
+    kite_yf_fallback = os.getenv("KITE_ALLOW_YFINANCE_FALLBACK", "1").strip().lower() in {"1", "true", "yes", "on"}
+
+    if PRICE_SOURCE == "kite":
+        src: List[tuple[str, Any]] = []
+        if kite_enabled:
+            src.append(("kite", _fetch_kite_price))
+        if kite_yf_fallback:
+            src.append(("yfinance", _fetch_yfinance_price))
+        sources = tuple(src)
+    elif PRICE_SOURCE == "yfinance":
         sources = (("yfinance", _fetch_yfinance_price),)
     else:
-        sources = (
-            ("yfinance", _fetch_yfinance_price),
-            ("binance", _fetch_binance_price),
-            ("coinbase", _fetch_coinbase_price),
-            ("kraken", _fetch_kraken_price),
+        src: List[tuple[str, Any]] = []
+        if kite_enabled:
+            src.append(("kite", _fetch_kite_price))
+        src.extend(
+            [
+                ("yfinance", _fetch_yfinance_price),
+                ("binance", _fetch_binance_price),
+                ("coinbase", _fetch_coinbase_price),
+                ("kraken", _fetch_kraken_price),
+            ]
         )
+        sources = tuple(src)
     now = datetime.now(timezone.utc)
     now_iso = now.isoformat()
     quote_ccy = _quote_currency()
@@ -277,7 +375,7 @@ def get_live_price() -> Dict[str, Any]:
             _PRICE_CACHE.update({"price": price, "updated_at": now_iso, "source": name, "quote_currency": quote_ccy})
             result: Dict[str, Any] = {"price": price, "updated_at": now_iso, "source": name, "quote_currency": quote_ccy}
             result.update(market_state)
-            if name == "yfinance" and market_state.get("market_open") is False:
+            if name in {"yfinance", "kite"} and market_state.get("market_open") is False:
                 result["price_mode"] = "last_traded"
             else:
                 result["price_mode"] = "live"
@@ -301,7 +399,7 @@ def get_live_price() -> Dict[str, Any]:
         cached["stale"] = True
         cached.update(market_state)
         if "price_mode" not in cached:
-            if cached.get("source") == "yfinance" and market_state.get("market_open") is False:
+            if cached.get("source") in {"yfinance", "kite"} and market_state.get("market_open") is False:
                 cached["price_mode"] = "last_traded"
             else:
                 cached["price_mode"] = "live"
@@ -574,24 +672,18 @@ def _expected_points_in_window(start_utc: datetime, end_utc: datetime, tf_minute
     if not nse_mode:
         rng = pd.date_range(start=start_utc, end=end_utc, freq=f"{step}min", tz="UTC")
         return int(len(rng))
-    cur = start_utc.astimezone(IST)
-    end_local = end_utc.astimezone(IST)
-    count = 0
-    while cur.date() <= end_local.date():
-        day = cur.date()
-        day_start = datetime(day.year, day.month, day.day, 9, 15, tzinfo=cur.tzinfo)
-        day_end = datetime(day.year, day.month, day.day, 15, 30, tzinfo=cur.tzinfo)
-        if day_start.weekday() < 5 and day not in _NSE_HOLIDAYS:
-            minute = 9 * 60 + 15
-            while minute <= (15 * 60 + 30):
-                hh, mm = divmod(minute, 60)
-                slot = datetime(day.year, day.month, day.day, hh, mm, tzinfo=cur.tzinfo)
-                slot_utc = slot.astimezone(timezone.utc)
-                if start_utc <= slot_utc <= end_utc:
-                    count += 1
-                minute += step
-        cur = cur + timedelta(days=1)
-    return int(count)
+    start_ts = pd.Timestamp(start_utc)
+    end_ts = pd.Timestamp(end_utc)
+    if start_ts.tzinfo is None:
+        start_ts = start_ts.tz_localize("UTC")
+    else:
+        start_ts = start_ts.tz_convert("UTC")
+    if end_ts.tzinfo is None:
+        end_ts = end_ts.tz_localize("UTC")
+    else:
+        end_ts = end_ts.tz_convert("UTC")
+    slots = _expected_nse_slots(start_ts, end_ts, step, _NSE_HOLIDAYS)
+    return int(len(slots))
 
 
 def _completeness_by_horizon(config: TournamentConfig) -> List[Dict[str, Any]]:
@@ -702,6 +794,34 @@ def get_price_at_timestamp(config: TournamentConfig, value: str) -> Dict[str, An
     return result
 
 
+def get_kite_auth_status() -> Dict[str, Any]:
+    enabled = is_kite_enabled()
+    api_key = (os.getenv("KITE_API_KEY", "") or "").strip()
+    api_secret = (os.getenv("KITE_API_SECRET", "") or "").strip()
+    client_id = (os.getenv("KITE_CLIENT_ID", "") or "").strip()
+    instrument_token = (os.getenv("KITE_INSTRUMENT_TOKEN", "") or "").strip()
+    auth_state = load_kite_auth_state()
+    token = current_kite_access_token()
+    updated_at = auth_state.get("updated_at")
+    token_source = "auth_file" if (auth_state.get("access_token") or "").strip() else ("env" if token else "missing")
+    return {
+        "enabled": enabled,
+        "configured": bool(api_key and api_secret and client_id),
+        "api_key_present": bool(api_key),
+        "api_secret_present": bool(api_secret),
+        "client_id_present": bool(client_id),
+        "access_token_present": bool(token),
+        "access_token_tail": (token[-6:] if token else None),
+        "token_source": token_source,
+        "updated_at": updated_at,
+        "instrument_token_present": bool(instrument_token),
+        "instrument_token": (instrument_token if instrument_token else None),
+        "user_id": auth_state.get("user_id"),
+        "user_name": auth_state.get("user_name"),
+        "login_time": auth_state.get("login_time"),
+    }
+
+
 def get_tournament_summary(config: TournamentConfig) -> Dict[str, Any]:
     primary_tf = get_primary_timeframe(config)
     tf_cfg = _config_for_timeframe(config, primary_tf)
@@ -763,6 +883,7 @@ def get_tournament_summary(config: TournamentConfig) -> Dict[str, Any]:
     backtest_report = _build_backtest_report(config)
     auto_retrain = bool(drift_status.get("alert"))
     completeness_rows = _completeness_by_horizon(config)
+    kite_auth = get_kite_auth_status()
     return {
         "last_run_at": run_at,
         "last_run_started_at": run_started_at,
@@ -776,6 +897,7 @@ def get_tournament_summary(config: TournamentConfig) -> Dict[str, Any]:
         "drift_status": drift_status,
         "backtest_report": backtest_report,
         "completeness_by_horizon": completeness_rows,
+        "kite_auth": kite_auth,
         "auto_retrain_recommended": auto_retrain,
     }
 
@@ -1918,7 +2040,10 @@ def run_status() -> Dict[str, Any]:
     state = dict(_RUN_STATE)
     file_state = _read_run_state_file()
     if file_state:
-        running = bool(state.get("running") or file_state.get("running"))
+        file_running = bool(file_state.get("running"))
+        if file_running and not bool(state.get("running")) and _is_stale_file_run_state(file_state):
+            file_running = False
+        running = bool(state.get("running") or file_running)
         state["running"] = running
 
         file_started = _parse_iso(file_state.get("last_started_at"))

@@ -3,13 +3,15 @@ import logging
 import os
 
 from django.http import JsonResponse
-from django.shortcuts import render
+from django.shortcuts import redirect, render
 from django.views.decorators.csrf import csrf_exempt
 
 from jeena_sikho_tournament.config import TournamentConfig
+from jeena_sikho_tournament.kite_client import exchange_request_token, kite_login_url
 
 from .services import (
     get_live_price,
+    get_kite_auth_status,
     get_price_at_timestamp,
     get_scoreboard,
     get_tournament_summary,
@@ -43,6 +45,36 @@ def dashboard(request):
     )
 
 
+def kite_login(request):
+    try:
+        return redirect(kite_login_url())
+    except Exception as exc:
+        LOGGER.exception("kite login url error")
+        return JsonResponse({"error": str(exc)}, status=500)
+
+
+def kite_callback(request):
+    request_token = (request.GET.get("request_token") or "").strip()
+    if not request_token:
+        return JsonResponse({"error": "request_token missing"}, status=400)
+    try:
+        data = exchange_request_token(request_token)
+        access_token = (data.get("access_token") or "").strip()
+        return JsonResponse(
+            {
+                "ok": True,
+                "message": "Kite access token updated",
+                "user_id": data.get("user_id"),
+                "user_name": data.get("user_name"),
+                "login_time": data.get("login_time"),
+                "access_token_tail": (access_token[-6:] if access_token else None),
+            }
+        )
+    except Exception as exc:
+        LOGGER.exception("kite callback error")
+        return JsonResponse({"error": str(exc)}, status=502)
+
+
 def api_price(request):
     try:
         data = get_live_price()
@@ -50,6 +82,14 @@ def api_price(request):
     except Exception as exc:
         LOGGER.exception("price error")
         return JsonResponse({"error": str(exc)}, status=502)
+
+
+def api_kite_auth_status(request):
+    try:
+        return JsonResponse(get_kite_auth_status())
+    except Exception as exc:
+        LOGGER.exception("kite auth status error")
+        return JsonResponse({"error": str(exc)}, status=500)
 
 
 def api_price_at(request):

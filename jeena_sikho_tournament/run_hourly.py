@@ -38,6 +38,39 @@ def _parse_iso_ts(value: str | None) -> datetime | None:
     return ts.astimezone(timezone.utc)
 
 
+def _run_state_is_stale(data: dict) -> bool:
+    if not bool(data.get("running")):
+        return False
+    try:
+        pid = int(data.get("pid", 0))
+    except Exception:
+        pid = 0
+    if pid and not _pid_alive(pid):
+        return True
+    anchor = _parse_iso_ts(
+        (data.get("progress") or {}).get("updated_at")
+        or data.get("updated_at")
+        or data.get("last_started_at")
+    )
+    if anchor is None:
+        return False
+    stale_sec = max(600, int(os.getenv("RUN_STATE_STALE_SECONDS", "10800")))
+    age = (datetime.now(timezone.utc) - anchor).total_seconds()
+    return age > stale_sec
+
+
+def _reset_stale_run_state(path: Path, data: dict) -> None:
+    try:
+        data["running"] = False
+        data["status"] = "stale_reset"
+        data["last_finished_at"] = datetime.now(timezone.utc).isoformat()
+        data["updated_at"] = datetime.now(timezone.utc).isoformat()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(data), encoding="utf-8")
+    except Exception:
+        pass
+
+
 def _acquire_scheduler_lock() -> bool:
     _SCHEDULER_LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
     if _SCHEDULER_LOCK_PATH.exists():
@@ -85,6 +118,9 @@ def _is_running() -> bool:
     try:
         data = json.loads(state_path.read_text(encoding="utf-8"))
     except Exception:
+        return False
+    if _run_state_is_stale(data):
+        _reset_stale_run_state(state_path, data)
         return False
     return bool(data.get("running"))
 
