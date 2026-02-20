@@ -1,6 +1,7 @@
 from pathlib import Path
 import json
 import os
+import atexit
 from datetime import datetime, timezone
 
 from .config import TournamentConfig
@@ -11,6 +12,58 @@ from .repair import run_nightly_repair
 from .run_weekly_reopt import run_weekly_reoptimization
 from .tournament import run_tournament
 from .env import load_env
+
+_SCHEDULER_LOCK_PATH = Path(os.getenv("APP_DATA_DIR", "data")) / "run_hourly.lock"
+
+
+def _pid_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def _acquire_scheduler_lock() -> bool:
+    _SCHEDULER_LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+    if _SCHEDULER_LOCK_PATH.exists():
+        try:
+            data = json.loads(_SCHEDULER_LOCK_PATH.read_text(encoding="utf-8"))
+            pid = int(data.get("pid", 0))
+        except Exception:
+            pid = 0
+        if pid and _pid_alive(pid):
+            print(f"Scheduler already running (pid={pid}); skipping duplicate run_hourly process.")
+            return False
+        try:
+            _SCHEDULER_LOCK_PATH.unlink()
+        except Exception:
+            pass
+    payload = {
+        "pid": os.getpid(),
+        "started_at": datetime.now(timezone.utc).isoformat(),
+    }
+    try:
+        fd = os.open(str(_SCHEDULER_LOCK_PATH), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(payload, f)
+    except FileExistsError:
+        print("Scheduler lock exists; another run_hourly process is active.")
+        return False
+    return True
+
+
+def _release_scheduler_lock() -> None:
+    try:
+        if _SCHEDULER_LOCK_PATH.exists():
+            data = json.loads(_SCHEDULER_LOCK_PATH.read_text(encoding="utf-8"))
+            if int(data.get("pid", 0)) != os.getpid():
+                return
+            _SCHEDULER_LOCK_PATH.unlink()
+    except Exception:
+        pass
 
 
 def _is_running() -> bool:
@@ -191,36 +244,42 @@ def _handle_maintenance_windows(config: TournamentConfig, now_utc: datetime) -> 
 
 def main():
     load_env()
-    if _is_running():
-        print("Tournament already running; skipping.")
+    if not _acquire_scheduler_lock():
         return
-    config = TournamentConfig()
-    config.base_dir = Path(".")
-    force_run = os.getenv("FORCE_RUN", "").strip().lower() in {"1", "true", "yes", "on"}
-    holidays = load_nse_holidays(config.data_dir)
-    now_utc = datetime.now(timezone.utc)
+    atexit.register(_release_scheduler_lock)
+    try:
+        if _is_running():
+            print("Tournament already running; skipping.")
+            return
+        config = TournamentConfig()
+        config.base_dir = Path(".")
+        force_run = os.getenv("FORCE_RUN", "").strip().lower() in {"1", "true", "yes", "on"}
+        holidays = load_nse_holidays(config.data_dir)
+        now_utc = datetime.now(timezone.utc)
 
-    if _is_indian_equity(config) and not force_run:
-        if _handle_maintenance_windows(config, now_utc):
-            print("Maintenance window action executed; tournament skipped this cycle.")
-            return
+        if _is_indian_equity(config) and not force_run:
+            if _handle_maintenance_windows(config, now_utc):
+                print("Maintenance window action executed; tournament skipped this cycle.")
+                return
 
-    if _is_indian_equity(config) and not force_run:
-        if not is_nse_run_window(now_utc, holidays):
-            print("Outside NSE run window; skipping. Set FORCE_RUN=1 to override.")
-            return
-    auto_retrain = os.getenv("AUTO_RETRAIN_ON_DRIFT", "1").strip().lower() in {"1", "true", "yes", "on"}
-    if auto_retrain and not force_run:
-        should_run, reason = should_retrain_on_drift(config)
-        if not should_run:
-            print(f"Skipping run: {reason}. Set FORCE_RUN=1 to override.")
-            return
-        print(f"Drift retrain trigger: {reason}")
-    if os.getenv("MARKET_TIMEFRAMES") or os.getenv("TIMEFRAMES"):
-        run_multi_timeframe_tournament(config)
-    else:
-        tf_cfg = config_for_timeframe(config, config.timeframe)
-        run_tournament(tf_cfg)
+        if _is_indian_equity(config) and not force_run:
+            if not is_nse_run_window(now_utc, holidays):
+                print("Outside NSE run window; skipping. Set FORCE_RUN=1 to override.")
+                return
+        auto_retrain = os.getenv("AUTO_RETRAIN_ON_DRIFT", "1").strip().lower() in {"1", "true", "yes", "on"}
+        if auto_retrain and not force_run:
+            should_run, reason = should_retrain_on_drift(config)
+            if not should_run:
+                print(f"Skipping run: {reason}. Set FORCE_RUN=1 to override.")
+                return
+            print(f"Drift retrain trigger: {reason}")
+        if os.getenv("MARKET_TIMEFRAMES") or os.getenv("TIMEFRAMES"):
+            run_multi_timeframe_tournament(config)
+        else:
+            tf_cfg = config_for_timeframe(config, config.timeframe)
+            run_tournament(tf_cfg)
+    finally:
+        _release_scheduler_lock()
 
 
 if __name__ == "__main__":

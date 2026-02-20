@@ -2,9 +2,12 @@ import json
 import logging
 import os
 import sqlite3
+import warnings
+import time
 from copy import deepcopy
 from concurrent.futures import ProcessPoolExecutor, TimeoutError
 from datetime import datetime, timedelta, timezone
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -31,6 +34,18 @@ from .validator import validate_ohlcv_quality
 from .market_calendar import load_nse_holidays
 from .repair import repair_timeframe_data
 from jeena_sikho_dashboard.db import PREDICTIONS_TABLE, insert_run, insert_scores
+
+try:
+    from sklearn.exceptions import ConvergenceWarning  # type: ignore
+except Exception:  # pragma: no cover
+    class ConvergenceWarning(Warning):
+        pass
+
+try:
+    from scipy.linalg import LinAlgWarning  # type: ignore
+except Exception:  # pragma: no cover
+    class LinAlgWarning(Warning):
+        pass
 
 def _update_predictions_safe(config) -> None:
     try:
@@ -63,23 +78,41 @@ def _write_run_state(
         payload["progress"] = progress
     _RUN_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
     tmp = _RUN_STATE_PATH.with_suffix(".tmp")
-    try:
-        with tmp.open("w", encoding="utf8") as f:
-            json.dump(payload, f)
-        tmp.replace(_RUN_STATE_PATH)
-    except PermissionError as exc:
-        # Concurrent background schedulers on Windows can temporarily lock run_state.json.
-        LOGGER.warning("Run-state write skipped due to file lock: %s", exc)
-    except OSError as exc:
-        LOGGER.warning("Run-state write skipped due to OS error: %s", exc)
+    retries = max(1, int(os.getenv("RUN_STATE_WRITE_RETRIES", "5")))
+    retry_ms = max(20, int(os.getenv("RUN_STATE_WRITE_RETRY_MS", "120")))
+    for attempt in range(1, retries + 1):
+        try:
+            with tmp.open("w", encoding="utf8") as f:
+                json.dump(payload, f)
+            tmp.replace(_RUN_STATE_PATH)
+            return
+        except PermissionError as exc:
+            if attempt >= retries:
+                LOGGER.warning("Run-state write skipped due to file lock: %s", exc)
+                return
+            time.sleep(retry_ms / 1000.0)
+        except OSError as exc:
+            if attempt >= retries:
+                LOGGER.warning("Run-state write skipped due to OS error: %s", exc)
+                return
+            time.sleep(retry_ms / 1000.0)
 
 
 def _setup_logging(log_path: Path) -> None:
     log_path.parent.mkdir(parents=True, exist_ok=True)
+    max_mb = max(1.0, float(os.getenv("TOURNAMENT_LOG_MAX_MB", "20")))
+    backups = max(2, int(os.getenv("TOURNAMENT_LOG_BACKUPS", "8")))
+    file_handler = RotatingFileHandler(
+        log_path,
+        maxBytes=int(max_mb * 1024 * 1024),
+        backupCount=backups,
+        encoding="utf8",
+    )
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(message)s",
-        handlers=[logging.FileHandler(log_path, encoding="utf8"), logging.StreamHandler()],
+        handlers=[file_handler, logging.StreamHandler()],
+        force=True,
     )
 
 
@@ -504,14 +537,20 @@ def _final_score(trading: float, primary: float, stability: float, config: Tourn
 
 def _fit_predict_direction(spec: ModelSpec, X_train, y_train, X_val):
     model = spec.model
-    model.fit(X_train, y_train)
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", category=ConvergenceWarning)
+        warnings.filterwarnings("ignore", category=LinAlgWarning)
+        model.fit(X_train, y_train)
     y_pred = model.predict(X_val)
     return model, y_pred
 
 
 def _fit_predict_reg(spec: ModelSpec, X_train, y_train, X_val):
     model = spec.model
-    model.fit(X_train, y_train)
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", category=ConvergenceWarning)
+        warnings.filterwarnings("ignore", category=LinAlgWarning)
+        model.fit(X_train, y_train)
     y_pred = model.predict(X_val)
     return model, y_pred
 
@@ -519,7 +558,10 @@ def _fit_predict_reg(spec: ModelSpec, X_train, y_train, X_val):
 def _fit_predict_range(spec: ModelSpec, X_train, y_train, X_val):
     quantiles = (0.1, 0.5, 0.9)
     model = build_quantile_bundle(spec, quantiles)
-    model.fit(X_train, y_train)
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", category=ConvergenceWarning)
+        warnings.filterwarnings("ignore", category=LinAlgWarning)
+        model.fit(X_train, y_train)
     y_pred = model.predict(X_val)
     return model, y_pred
 
