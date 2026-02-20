@@ -83,6 +83,14 @@ def _pick_by_horizon(candle_minutes: int, short_vals, mid_vals, long_vals):
     return mid_vals
 
 
+def _lgb_silent_kwargs() -> Dict[str, Any]:
+    # Silence LightGBM console spam like "No further splits with positive gain".
+    return {
+        "verbosity": -1,
+        "verbose": -1,
+    }
+
+
 def _sklearn_candidates(task: str, candle_minutes: int) -> List[ModelSpec]:
     specs: List[ModelSpec] = []
     try:
@@ -299,7 +307,12 @@ def _optional_boosters(task: str) -> List[ModelSpec]:
                 specs.append(
                     ModelSpec(
                         f"lgb_clf_{n}_lr{lr}_l{leaves}",
-                        lgb.LGBMClassifier(n_estimators=n, learning_rate=lr, num_leaves=leaves),
+                        lgb.LGBMClassifier(
+                            n_estimators=n,
+                            learning_rate=lr,
+                            num_leaves=leaves,
+                            **_lgb_silent_kwargs(),
+                        ),
                         task,
                         {"family": "lgb", "group": "fast"},
                     )
@@ -355,7 +368,12 @@ def _optional_boosters(task: str) -> List[ModelSpec]:
                 specs.append(
                     ModelSpec(
                         f"lgb_reg_{n}_lr{lr}_l{leaves}",
-                        lgb.LGBMRegressor(n_estimators=n, learning_rate=lr, num_leaves=leaves),
+                        lgb.LGBMRegressor(
+                            n_estimators=n,
+                            learning_rate=lr,
+                            num_leaves=leaves,
+                            **_lgb_silent_kwargs(),
+                        ),
                         task,
                         {"family": "lgb", "group": "fast"},
                     )
@@ -388,7 +406,13 @@ def _optional_boosters(task: str) -> List[ModelSpec]:
                 specs.append(
                     ModelSpec(
                         f"lgb_q_{n}_lr{lr}_l{leaves}",
-                        lgb.LGBMRegressor(objective="quantile", n_estimators=n, learning_rate=lr, num_leaves=leaves),
+                        lgb.LGBMRegressor(
+                            objective="quantile",
+                            n_estimators=n,
+                            learning_rate=lr,
+                            num_leaves=leaves,
+                            **_lgb_silent_kwargs(),
+                        ),
                         task,
                         {"quantile": True, "family": "lgb_q", "group": "fast"},
                     )
@@ -488,7 +512,12 @@ def build_quantile_bundle(spec: ModelSpec, quantiles: Tuple[float, float, float]
         if spec.name.startswith("lgb_q"):
             import lightgbm as lgb  # type: ignore
 
-            q_models[q] = lgb.LGBMRegressor(objective="quantile", alpha=q, n_estimators=n_estimators)
+            q_models[q] = lgb.LGBMRegressor(
+                objective="quantile",
+                alpha=q,
+                n_estimators=n_estimators,
+                **_lgb_silent_kwargs(),
+            )
         elif spec.name.startswith("hgb_q"):
             q_models[q] = HistGradientBoostingRegressor(loss="quantile", quantile=q, max_iter=n_estimators)
         else:

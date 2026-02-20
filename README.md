@@ -5,7 +5,7 @@ Production-style Django project for NSE-focused price prediction, tournament-bas
 ## What It Does
 
 - Tracks live JSLL market price (via yfinance)
-- Runs multi-timeframe tournaments (`1h`, `2h`, `1d`)
+- Runs multi-timeframe tournaments (`1h`, `2h`, `1d`, `2d`, `3d`, `4d`, `5d`, `6d`, `7d`) via `MARKET_TIMEFRAMES`
 - Trains direction/return/range models and selects champions
 - Produces horizon-wise predictions with:
   - confidence score
@@ -76,7 +76,7 @@ Nightly gap-repair + validation job:
 ## Key Environment Variables
 
 - `MARKET_YFINANCE_SYMBOL=JSLL.NS`
-- `MARKET_TIMEFRAMES=1h,2h,1d`
+- `MARKET_TIMEFRAMES=1h,2h,1d,2d,3d,4d,5d,6d,7d`
 - `RUN_MODE=daily`
 - `MAX_CANDIDATES_TOTAL`, `MAX_CANDIDATES_PER_TARGET`
 - `TOURNAMENT_CV_FOLDS`

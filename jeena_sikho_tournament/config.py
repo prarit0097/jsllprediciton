@@ -20,9 +20,9 @@ class TournamentConfig:
 
     symbol: str = "BTC/USDT"
     yfinance_symbol: str = "BTC-USD"
-    timeframe: str = "10m"
-    candle_minutes: int = 10
-    ohlcv_table: str = "ohlcv_10m"
+    timeframe: str = "1h"
+    candle_minutes: int = 60
+    ohlcv_table: str = "ohlcv"
     start_date_utc: str = "2015-01-01 00:00:00"
     data_lookback_years: int = 20
     update_every_hours: int = 1

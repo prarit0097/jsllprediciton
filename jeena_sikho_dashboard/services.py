@@ -55,7 +55,7 @@ COINBASE_SPOT_URL = f"https://api.coinbase.com/v2/prices/{COINBASE_SPOT_PAIR}/sp
 KRAKEN_PAIR = os.getenv("KRAKEN_PAIR", "XXBTZUSD")
 KRAKEN_TICKER_URL = f"https://api.kraken.com/0/public/Ticker?pair={KRAKEN_PAIR}"
 LEGACY_PREDICTION_HORIZON_MINUTES = 60
-DEFAULT_TIMEFRAMES = ["1m", "3m", "5m", "10m", "15m", "30m", "1h", "2h", "4h"]
+DEFAULT_TIMEFRAMES = ["1h", "2h", "1d"]
 MATCH_EPS = 1e-6
 MATCH_MAX_NONZERO = 99.9999
 
