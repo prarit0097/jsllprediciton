@@ -60,15 +60,19 @@ def kite_callback(request):
     try:
         data = exchange_request_token(request_token)
         access_token = (data.get("access_token") or "").strip()
+        login_time = data.get("login_time")
+        if hasattr(login_time, "isoformat"):
+            login_time = login_time.isoformat()
         return JsonResponse(
             {
                 "ok": True,
                 "message": "Kite access token updated",
                 "user_id": data.get("user_id"),
                 "user_name": data.get("user_name"),
-                "login_time": data.get("login_time"),
+                "login_time": login_time,
                 "access_token_tail": (access_token[-6:] if access_token else None),
-            }
+            },
+            json_dumps_params={"default": str},
         )
     except Exception as exc:
         LOGGER.exception("kite callback error")
@@ -136,7 +140,8 @@ def api_tournament_run(request):
     except Exception:
         body = {}
     mode = body.get("run_mode")
-    status = run_tournament_async(_config(), mode)
+    force_restart = bool(body.get("force_restart"))
+    status = run_tournament_async(_config(), mode, force_restart=force_restart)
     return JsonResponse(status)
 
 

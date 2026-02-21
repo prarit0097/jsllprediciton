@@ -8,6 +8,7 @@ from .config import TournamentConfig
 from .drift import should_retrain_on_drift
 from .market_calendar import IST, NSE_OPEN_MIN, NSE_RUN_CLOSE_MIN, is_nse_run_window, load_nse_holidays
 from .multi_timeframe import config_for_timeframe, run_multi_timeframe_tournament
+from .kite_client import is_kite_enabled, kite_login_url, probe_kite_token_health
 from .repair import run_nightly_repair
 from .run_weekly_reopt import run_weekly_reoptimization
 from .tournament import run_tournament
@@ -16,13 +17,49 @@ from .env import load_env
 _SCHEDULER_LOCK_PATH = Path(os.getenv("APP_DATA_DIR", "data")) / "run_hourly.lock"
 
 
+def _pid_alive_windows(pid: int) -> bool:
+    try:
+        import ctypes
+    except Exception:
+        return False
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    STILL_ACTIVE = 259
+    kernel32 = ctypes.windll.kernel32
+    handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
+    if not handle:
+        err = ctypes.GetLastError()
+        # Access denied means the process exists but is not queryable.
+        return err == 5
+    try:
+        exit_code = ctypes.c_ulong()
+        if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+            # If exit code cannot be read, keep scheduler conservative.
+            return True
+        return int(exit_code.value) == STILL_ACTIVE
+    finally:
+        try:
+            kernel32.CloseHandle(handle)
+        except Exception:
+            pass
+
+
 def _pid_alive(pid: int) -> bool:
     if pid <= 0:
         return False
+    if os.name == "nt":
+        return _pid_alive_windows(pid)
     try:
         os.kill(pid, 0)
         return True
+    except PermissionError:
+        # Process exists but access is restricted.
+        return True
+    except ProcessLookupError:
+        return False
     except OSError:
+        return False
+    except Exception:
+        # Windows can raise SystemError (WinError 87) for stale/invalid PIDs.
         return False
 
 
@@ -194,6 +231,29 @@ def _should_run_preopen_refill(now_utc: datetime, state: dict) -> bool:
     return state.get("preopen_refill_done_for") != marker
 
 
+def _should_run_kite_token_healthcheck(now_utc: datetime, state: dict) -> bool:
+    if os.getenv("KITE_TOKEN_HEALTHCHECK_ENABLE", "1").strip().lower() not in {"1", "true", "yes", "on"}:
+        return False
+    if not is_kite_enabled():
+        return False
+    source = (os.getenv("PRICE_SOURCE", "auto") or "auto").strip().lower()
+    if source not in {"kite", "auto"}:
+        return False
+    start_min = int(os.getenv("KITE_TOKEN_HEALTHCHECK_START_MIN", "525"))  # 08:45 IST
+    end_min = int(os.getenv("KITE_TOKEN_HEALTHCHECK_END_MIN", str(max(start_min, NSE_OPEN_MIN - 1))))  # 09:14 IST
+    minute = _minute_of_day_ist(now_utc)
+    now_ist = now_utc.astimezone(IST)
+    if now_ist.weekday() >= 5:
+        return False
+    if minute < start_min or minute > end_min:
+        return False
+    once_per_day = os.getenv("KITE_TOKEN_HEALTHCHECK_ONCE_PER_DAY", "1").strip().lower() in {"1", "true", "yes", "on"}
+    if not once_per_day:
+        return True
+    marker = str(now_ist.date())
+    return state.get("kite_token_health_done_for") != marker
+
+
 def _should_run_nightly_repair(now_utc: datetime, state: dict) -> bool:
     if os.getenv("NIGHTLY_REPAIR_AFTER_CLOSE", "1").strip().lower() not in {"1", "true", "yes", "on"}:
         return False
@@ -267,6 +327,25 @@ def _handle_maintenance_windows(config: TournamentConfig, now_utc: datetime) -> 
     now_ist = now_utc.astimezone(IST)
     marker = str(now_ist.date())
     changed = False
+
+    if _should_run_kite_token_healthcheck(now_utc, state):
+        health = probe_kite_token_health()
+        state["kite_token_health_done_for"] = marker
+        state["last_kite_token_health_at"] = now_utc.isoformat()
+        state["last_kite_token_health_ok"] = bool(health.get("ok"))
+        state["last_kite_token_health_error"] = health.get("error")
+        state["last_kite_token_health_price"] = health.get("price")
+        changed = True
+        _save_maintenance_state(config, state)
+        if health.get("ok"):
+            print(f"Kite token health check OK at {health.get('checked_at')} | LTP: {health.get('price')}")
+        else:
+            try:
+                login = kite_login_url()
+            except Exception:
+                login = "http://127.0.0.1:8000/kite/login"
+            print(f"Kite token check FAILED ({health.get('error')}). Refresh via: {login}")
+        return True
 
     if _should_run_preopen_refill(now_utc, state):
         days = int(os.getenv("PREOPEN_REFILL_LOOKBACK_DAYS", "7"))

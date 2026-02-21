@@ -7,7 +7,7 @@ let lastFxRate = null;
 let lastFxUpdatedAt = null;
 let lastFxSource = null;
 let lastForcedRefreshAt = 0;
-let runState = { running: false, last_started_at: null, progress: null };
+let runState = { running: false, last_started_at: null, timer_started_at: null, timer_duration_seconds: null, progress: null };
 let lastSummaryRunAt = null;
 
 const APP_ROOT = document.getElementById('app-root');
@@ -126,7 +126,7 @@ function renderRunTimer() {
   if (!el) return;
 
   if (runState.running) {
-    const startIso = runState.last_started_at || localStorage.getItem(RUN_TIMER_START_KEY);
+    const startIso = runState.timer_started_at || runState.last_started_at || localStorage.getItem(RUN_TIMER_START_KEY);
     if (!startIso) {
       el.textContent = 'Timer: --';
       return;
@@ -137,6 +137,11 @@ function renderRunTimer() {
       return;
     }
     el.textContent = `Timer: ${formatElapsed(Date.now() - start)}`;
+    return;
+  }
+
+  if (runState.timer_duration_seconds && Number(runState.timer_duration_seconds) > 0) {
+    el.textContent = `Last time: ${formatElapsed(Number(runState.timer_duration_seconds) * 1000)}`;
     return;
   }
 
@@ -188,13 +193,23 @@ function updateRunState(state) {
   if (!state) return;
   runState.running = !!state.running;
   runState.last_started_at = state.last_started_at || runState.last_started_at;
+  runState.timer_started_at = state.timer_started_at || state.cycle_started_at || runState.timer_started_at;
+  runState.timer_duration_seconds = state.timer_duration_seconds || null;
   runState.progress = state.progress || runState.progress;
 
   if (runState.running) {
-    if (runState.last_started_at) {
-      localStorage.setItem(RUN_TIMER_START_KEY, runState.last_started_at);
+    const timerStart = runState.timer_started_at || runState.last_started_at;
+    if (timerStart) {
+      localStorage.setItem(RUN_TIMER_START_KEY, timerStart);
     }
   } else {
+    if (runState.timer_duration_seconds && Number(runState.timer_duration_seconds) > 0) {
+      localStorage.setItem(RUN_TIMER_LAST_KEY, String(Number(runState.timer_duration_seconds) * 1000));
+      localStorage.removeItem(RUN_TIMER_START_KEY);
+      renderRunTimer();
+      renderProgress(runState);
+      return;
+    }
     const startIso = localStorage.getItem(RUN_TIMER_START_KEY);
     if (startIso) {
       const start = new Date(startIso).getTime();
@@ -631,7 +646,15 @@ async function loadSummary() {
         const src = kite.token_source || '--';
         const upd = kite.updated_at ? fmtDateTime(kite.updated_at) : '--';
         const user = kite.user_id || '--';
-        kiteEl.textContent = `Kite auth: ${token} | source: ${src} | user: ${user} | updated: ${upd}`;
+        const health =
+          kite.health_ok === true ? 'ok' :
+          kite.health_ok === false ? 'invalid' : 'unchecked';
+        const loginUrl = kite.login_url || '/kite/login';
+        if (kite.action_required) {
+          kiteEl.innerHTML = `Kite auth: ${token} | source: ${src} | user: ${user} | updated: ${upd} | health: ${health} | <a href="${loginUrl}" target="_blank" rel="noopener">login required</a>`;
+        } else {
+          kiteEl.textContent = `Kite auth: ${token} | source: ${src} | user: ${user} | updated: ${upd} | health: ${health}`;
+        }
       }
     }
     const byH = data.champions_by_horizon || {};
@@ -757,18 +780,18 @@ async function runNow() {
   const state = document.getElementById('run-state');
   if (!button || !state) return;
   button.disabled = true;
-  state.textContent = 'running...';
+  state.textContent = 'restarting...';
   const localStart = new Date().toISOString();
   updateRunState({ running: true, last_started_at: localStart });
   try {
-    const res = await getJSON(`${API_PREFIX}/tournament/run`, { method: 'POST', body: '{}' });
+    const body = JSON.stringify({ force_restart: true });
+    const res = await getJSON(`${API_PREFIX}/tournament/run`, { method: 'POST', body });
     state.textContent = res.status || 'started';
-    if (!res.running) {
-      button.disabled = false;
-    }
     updateRunState(res);
   } catch (err) {
     state.textContent = 'error';
+  } finally {
+    button.disabled = false;
   }
 }
 
@@ -779,10 +802,10 @@ async function pollRunStatus() {
     const runBtn = document.getElementById('run-now');
     if (state.running) {
       badge.textContent = 'running';
-      if (runBtn) runBtn.disabled = true;
+      if (runBtn) runBtn.textContent = 'Restart Tournament';
     } else {
       badge.textContent = 'idle';
-      if (runBtn) runBtn.disabled = false;
+      if (runBtn) runBtn.textContent = 'Start Tournament';
     }
     updateRunState(state);
   } catch (err) {

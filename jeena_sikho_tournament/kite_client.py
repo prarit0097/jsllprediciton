@@ -45,6 +45,13 @@ def _auth_state_path() -> Path:
     return _data_dir() / "kite_auth.json"
 
 
+def _health_state_path() -> Path:
+    custom = (os.getenv("KITE_HEALTH_FILE", "") or "").strip()
+    if custom:
+        return Path(custom)
+    return _data_dir() / "kite_health.json"
+
+
 def load_kite_auth_state() -> Dict[str, Any]:
     path = _auth_state_path()
     if not path.exists():
@@ -59,7 +66,26 @@ def load_kite_auth_state() -> Dict[str, Any]:
 def save_kite_auth_state(state: Dict[str, Any]) -> None:
     path = _auth_state_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(state, indent=2), encoding="utf-8")
+    # Kite session payload can contain datetime objects (e.g., login_time).
+    # Persist JSON-safe values to avoid callback failures.
+    path.write_text(json.dumps(state, indent=2, default=str), encoding="utf-8")
+
+
+def load_kite_health_state() -> Dict[str, Any]:
+    path = _health_state_path()
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_kite_health_state(state: Dict[str, Any]) -> None:
+    path = _health_state_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(state, indent=2, default=str), encoding="utf-8")
 
 
 def current_kite_access_token() -> str:
@@ -80,7 +106,10 @@ def save_kite_access_token(access_token: str, session_meta: Optional[Dict[str, A
     if session_meta:
         for key in ("public_token", "user_id", "user_name", "login_time"):
             if key in session_meta and session_meta.get(key) is not None:
-                state[key] = session_meta.get(key)
+                val = session_meta.get(key)
+                if hasattr(val, "isoformat"):
+                    val = val.isoformat()
+                state[key] = val
     save_kite_auth_state(state)
     os.environ["KITE_ACCESS_TOKEN"] = token
 
@@ -204,6 +233,27 @@ def fetch_kite_ltp() -> float:
     if price is None:
         raise RuntimeError(f"Kite LTP unavailable for {key}")
     return float(price)
+
+
+def probe_kite_token_health() -> Dict[str, Any]:
+    checked_at = datetime.now(timezone.utc).isoformat()
+    state = load_kite_health_state()
+    out: Dict[str, Any] = {
+        "checked_at": checked_at,
+        "ok": False,
+        "error": None,
+    }
+    try:
+        price = float(fetch_kite_ltp())
+        out["ok"] = True
+        out["price"] = price
+        out["last_ok_at"] = checked_at
+        state.update(out)
+    except Exception as exc:
+        out["error"] = str(exc)
+        state.update(out)
+    save_kite_health_state(state)
+    return out
 
 
 def fetch_kite_ohlcv(start: datetime, end: Optional[datetime] = None, interval: str = "60minute") -> pd.DataFrame:

@@ -2,6 +2,7 @@ import json
 import logging
 import os
 import threading
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -19,6 +20,7 @@ from jeena_sikho_tournament.kite_client import (
     fetch_kite_ltp,
     is_kite_enabled,
     load_kite_auth_state,
+    load_kite_health_state,
 )
 from jeena_sikho_tournament.market_calendar import (
     IST,
@@ -68,7 +70,7 @@ MATCH_EPS = 1e-6
 MATCH_MAX_NONZERO = 99.9999
 
 _RUN_LOCK = threading.Lock()
-_RUN_STATE = {"running": False, "last_started_at": None}
+_RUN_STATE = {"running": False, "last_started_at": None, "cancel_requested": False}
 _RUN_STATE_PATH = Path(os.getenv("APP_DATA_DIR", "data")) / "run_state.json"
 _CALIB_STATE_PATH = Path(os.getenv("APP_DATA_DIR", "data")) / "calibration_state.json"
 _PRICE_CACHE: Dict[str, Any] = {}
@@ -145,13 +147,47 @@ def _run_state_stale_seconds() -> int:
     return max(600, int(os.getenv("RUN_STATE_STALE_SECONDS", "10800")))
 
 
+def _pid_alive_windows(pid: int) -> bool:
+    try:
+        import ctypes
+    except Exception:
+        return False
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    STILL_ACTIVE = 259
+    kernel32 = ctypes.windll.kernel32
+    handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
+    if not handle:
+        err = ctypes.GetLastError()
+        # Access denied means the process exists but cannot be queried.
+        return err == 5
+    try:
+        exit_code = ctypes.c_ulong()
+        if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+            return True
+        return int(exit_code.value) == STILL_ACTIVE
+    finally:
+        try:
+            kernel32.CloseHandle(handle)
+        except Exception:
+            pass
+
+
 def _pid_alive(pid: int) -> bool:
     if pid <= 0:
         return False
+    if os.name == "nt":
+        return _pid_alive_windows(pid)
     try:
         os.kill(pid, 0)
         return True
+    except PermissionError:
+        return True
+    except ProcessLookupError:
+        return False
     except OSError:
+        return False
+    except Exception:
+        # Windows can raise SystemError for stale/invalid PID checks.
         return False
 
 
@@ -189,6 +225,29 @@ def _read_run_state_file() -> Optional[Dict[str, Any]]:
     except Exception:
         return None
     return None
+
+
+def _write_run_state_file(state: Dict[str, Any]) -> None:
+    try:
+        _RUN_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = _RUN_STATE_PATH.with_suffix(".tmp")
+        with tmp.open("w", encoding="utf8") as f:
+            json.dump(state, f)
+        tmp.replace(_RUN_STATE_PATH)
+    except Exception:
+        pass
+
+
+def _set_cancel_requested(value: bool, reason: str = "manual_restart") -> None:
+    state = _read_run_state_file() or {}
+    state["cancel_requested"] = bool(value)
+    if value:
+        state["cancel_reason"] = reason
+        state["cancel_requested_at"] = datetime.now(timezone.utc).isoformat()
+    else:
+        state.pop("cancel_reason", None)
+        state.pop("cancel_requested_at", None)
+    _write_run_state_file(state)
 
 
 def _scheduler_min_gap_seconds() -> int:
@@ -415,6 +474,59 @@ def get_live_price() -> Dict[str, Any]:
             except Exception:
                 pass
         return cached
+
+    # Final fallback: serve latest persisted close from local OHLCV tables
+    # so /price does not hard-fail when all live providers are transiently down.
+    try:
+        cfg = TournamentConfig()
+        for tf in get_timeframes(cfg):
+            tf_min = _timeframe_to_minutes(tf, cfg.candle_minutes)
+            table = "ohlcv" if tf_min == 60 else f"ohlcv_{tf_min}m"
+            try:
+                df = Storage(cfg.db_path, table_name=table).load()
+            except Exception:
+                continue
+            if df.empty or "close" not in df.columns:
+                continue
+            last_close = float(df["close"].iloc[-1])
+            if not np.isfinite(last_close) or last_close <= 0:
+                continue
+            last_ts = df.index[-1]
+            if getattr(last_ts, "tzinfo", None) is None:
+                last_ts = pd.Timestamp(last_ts, tz="UTC")
+            last_iso = last_ts.tz_convert("UTC").isoformat()
+            result: Dict[str, Any] = {
+                "price": last_close,
+                "updated_at": last_iso,
+                "source": f"storage:{table}",
+                "quote_currency": quote_ccy,
+                "stale": True,
+                "price_mode": "last_traded",
+            }
+            result.update(market_state)
+            if quote_ccy == "USD":
+                try:
+                    fx = _get_fx_rate()
+                    if fx.get("rate"):
+                        result["price_inr"] = last_close * float(fx["rate"])
+                        result["fx_rate"] = fx["rate"]
+                        result["fx_updated_at"] = fx["updated_at"]
+                        result["fx_source"] = fx["source"]
+                        result["fx_stale"] = fx["stale"]
+                except Exception:
+                    pass
+            _PRICE_CACHE.update(
+                {
+                    "price": last_close,
+                    "updated_at": last_iso,
+                    "source": result["source"],
+                    "quote_currency": quote_ccy,
+                }
+            )
+            return result
+    except Exception:
+        pass
+
     raise RuntimeError("Price source unavailable")
 
 
@@ -801,9 +913,12 @@ def get_kite_auth_status() -> Dict[str, Any]:
     client_id = (os.getenv("KITE_CLIENT_ID", "") or "").strip()
     instrument_token = (os.getenv("KITE_INSTRUMENT_TOKEN", "") or "").strip()
     auth_state = load_kite_auth_state()
+    health_state = load_kite_health_state()
     token = current_kite_access_token()
     updated_at = auth_state.get("updated_at")
     token_source = "auth_file" if (auth_state.get("access_token") or "").strip() else ("env" if token else "missing")
+    health_ok = health_state.get("ok")
+    action_required = bool(enabled and api_key and api_secret and client_id and (not token or health_ok is False))
     return {
         "enabled": enabled,
         "configured": bool(api_key and api_secret and client_id),
@@ -819,6 +934,11 @@ def get_kite_auth_status() -> Dict[str, Any]:
         "user_id": auth_state.get("user_id"),
         "user_name": auth_state.get("user_name"),
         "login_time": auth_state.get("login_time"),
+        "health_checked_at": health_state.get("checked_at"),
+        "health_ok": (None if health_ok is None else bool(health_ok)),
+        "health_error": health_state.get("error"),
+        "action_required": action_required,
+        "login_url": "/kite/login",
     }
 
 
@@ -2038,7 +2158,10 @@ def latest_prediction(config: TournamentConfig, update_pending: bool = True) -> 
 
 def run_status() -> Dict[str, Any]:
     state = dict(_RUN_STATE)
+    state.setdefault("cancel_requested", False)
     file_state = _read_run_state_file()
+    cycle_started: Optional[str] = None
+    cycle_finished: Optional[str] = None
     if file_state:
         file_running = bool(file_state.get("running"))
         if file_running and not bool(state.get("running")) and _is_stale_file_run_state(file_state):
@@ -2055,12 +2178,37 @@ def run_status() -> Dict[str, Any]:
             state["last_finished_at"] = file_state.get("last_finished_at")
         if file_state.get("progress"):
             state["progress"] = file_state.get("progress")
+        if file_state.get("cycle_started_at"):
+            cycle_started = str(file_state.get("cycle_started_at"))
+            state["cycle_started_at"] = cycle_started
+        if file_state.get("cycle_finished_at"):
+            cycle_finished = str(file_state.get("cycle_finished_at"))
+            state["cycle_finished_at"] = cycle_finished
+        if file_state.get("cycle_total") is not None:
+            state["cycle_total"] = file_state.get("cycle_total")
+        if file_state.get("cycle_index") is not None:
+            state["cycle_index"] = file_state.get("cycle_index")
+        if file_state.get("cancel_requested") is not None:
+            state["cancel_requested"] = bool(file_state.get("cancel_requested"))
 
         started = _parse_iso(state.get("last_started_at"))
         finished = _parse_iso(state.get("last_finished_at"))
         if started and finished:
             duration = max(0.0, (finished - started).total_seconds())
             state["duration_seconds"] = duration
+
+    # Prefer cycle-level timer when present, so UI timer does not reset per task/timeframe.
+    timer_started = cycle_started or state.get("last_started_at")
+    timer_finished = cycle_finished or state.get("last_finished_at")
+    if timer_started:
+        state["timer_started_at"] = timer_started
+    timer_started_dt = _parse_iso(timer_started) if timer_started else None
+    timer_finished_dt = _parse_iso(timer_finished) if timer_finished else None
+    if timer_started_dt and timer_finished_dt:
+        timer_duration = max(0.0, (timer_finished_dt - timer_started_dt).total_seconds())
+        state["timer_duration_seconds"] = timer_duration
+        # Keep legacy field in sync for clients that still read duration_seconds.
+        state["duration_seconds"] = timer_duration
 
     # When idle, prefer latest completed DB run for "last time / last trained"
     # to avoid stale partial progress from aborted/skipped cycles.
@@ -2077,7 +2225,7 @@ def run_status() -> Dict[str, Any]:
                 db_duration = float(latest_run.get("duration_seconds") or 0.0)
             except (TypeError, ValueError):
                 db_duration = 0.0
-            if db_duration > 0:
+            if db_duration > 0 and not state.get("timer_duration_seconds"):
                 state["duration_seconds"] = db_duration
             try:
                 db_count = int(latest_run.get("candidate_count") or 0)
@@ -2101,14 +2249,36 @@ def _run_tournament_thread(config: TournamentConfig) -> None:
     finally:
         with _RUN_LOCK:
             _RUN_STATE["running"] = False
+            _RUN_STATE["cancel_requested"] = False
 
 
-def run_tournament_async(config: TournamentConfig, run_mode: Optional[str]) -> Dict[str, Any]:
+def run_tournament_async(config: TournamentConfig, run_mode: Optional[str], force_restart: bool = False) -> Dict[str, Any]:
+    running_now = False
     with _RUN_LOCK:
-        if _RUN_STATE["running"]:
+        running_now = bool(_RUN_STATE["running"])
+        if running_now and not force_restart:
             return {"status": "already_running", **_RUN_STATE}
+        if running_now and force_restart:
+            _RUN_STATE["cancel_requested"] = True
+            _set_cancel_requested(True, reason="manual_restart")
+
+    if running_now and force_restart:
+        wait_sec = max(5, int(os.getenv("RUN_RESTART_WAIT_SECONDS", "180")))
+        deadline = time.time() + float(wait_sec)
+        while time.time() < deadline:
+            with _RUN_LOCK:
+                if not _RUN_STATE["running"]:
+                    break
+            time.sleep(0.5)
+        with _RUN_LOCK:
+            if _RUN_STATE["running"]:
+                return {"status": "restart_timeout", **_RUN_STATE}
+
+    with _RUN_LOCK:
         if run_mode:
             config.run_mode = run_mode
+        _set_cancel_requested(False)
+        _RUN_STATE["cancel_requested"] = False
         _RUN_STATE["running"] = True
         _RUN_STATE["last_started_at"] = datetime.now(timezone.utc).isoformat()
         t = threading.Thread(target=_run_tournament_thread, args=(config,), daemon=True)

@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
 from .config import TournamentConfig, _timeframe_to_minutes
-from .tournament import run_tournament
+from .tournament import cancel_requested, run_tournament
 
 LOGGER = logging.getLogger("jeena_sikho_tournament")
 
@@ -56,11 +56,25 @@ def resolve_timeframes(base: TournamentConfig) -> List[str]:
 def run_multi_timeframe_tournament(base: TournamentConfig) -> Dict[str, Dict[str, str]]:
     results: Dict[str, Dict[str, str]] = {}
     timeframes = resolve_timeframes(base)
-    for tf in timeframes:
+    cycle_started_at = datetime.now(timezone.utc).isoformat()
+    total = len(timeframes)
+    for idx, tf in enumerate(timeframes, start=1):
+        if cancel_requested():
+            results[tf] = {"status": "cancelled", "stopped_at": datetime.now(timezone.utc).isoformat()}
+            break
         cfg = config_for_timeframe(base, tf)
         try:
             LOGGER.info("Running tournament for %s", tf)
-            run_tournament(cfg)
+            run_result = run_tournament(
+                cfg,
+                cycle_started_at=cycle_started_at,
+                cycle_total=total,
+                cycle_index=idx,
+                cycle_keep_running=(idx < total),
+            )
+            if isinstance(run_result, dict) and run_result.get("status") == "cancelled":
+                results[tf] = {"status": "cancelled", "ran_at": datetime.now(timezone.utc).isoformat()}
+                break
             results[tf] = {"status": "ok", "ran_at": datetime.now(timezone.utc).isoformat()}
         except Exception as exc:
             LOGGER.warning("Tournament failed for %s: %s", tf, exc)

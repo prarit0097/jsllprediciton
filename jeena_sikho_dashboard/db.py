@@ -1,7 +1,8 @@
 import sqlite3
 import os
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 PREDICTIONS_TABLE = "market_predictions"
 LEGACY_PREDICTIONS_TABLE = "btc_predictions"
@@ -19,7 +20,7 @@ def get_db_path() -> Path:
     return legacy
 
 
-def connect() -> sqlite3.Connection:
+def _open_connection() -> sqlite3.Connection:
     con = sqlite3.connect(get_db_path(), timeout=5)
     try:
         con.execute("PRAGMA busy_timeout = 5000")
@@ -27,6 +28,22 @@ def connect() -> sqlite3.Connection:
     except sqlite3.OperationalError:
         pass
     return con
+
+
+@contextmanager
+def connect() -> Iterator[sqlite3.Connection]:
+    con = _open_connection()
+    try:
+        yield con
+        con.commit()
+    except Exception:
+        try:
+            con.rollback()
+        except Exception:
+            pass
+        raise
+    finally:
+        con.close()
 
 
 def ensure_tables() -> None:

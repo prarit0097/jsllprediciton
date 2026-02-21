@@ -59,12 +59,27 @@ LOGGER = logging.getLogger("jeena_sikho_tournament")
 _RUN_STATE_PATH = Path(os.getenv("APP_DATA_DIR", "data")) / "run_state.json"
 
 
+class RunCancelled(Exception):
+    pass
+
+
+def cancel_requested() -> bool:
+    if not _RUN_STATE_PATH.exists():
+        return False
+    try:
+        data = json.loads(_RUN_STATE_PATH.read_text(encoding="utf8"))
+        return bool((data or {}).get("cancel_requested"))
+    except Exception:
+        return False
+
+
 def _write_run_state(
     running: bool,
     started_at: Optional[str],
     finished_at: Optional[str],
     status: str,
     progress: Optional[Dict[str, Any]] = None,
+    extra: Optional[Dict[str, Any]] = None,
 ) -> None:
     payload = {
         "running": bool(running),
@@ -77,6 +92,11 @@ def _write_run_state(
     }
     if progress is not None:
         payload["progress"] = progress
+    if extra:
+        for key, value in extra.items():
+            if value is None:
+                continue
+            payload[key] = value
     _RUN_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
     tmp = _RUN_STATE_PATH.with_suffix(".tmp")
     retries = max(1, int(os.getenv("RUN_STATE_WRITE_RETRIES", "5")))
@@ -544,12 +564,32 @@ def _primary_score_reg_weighted(
     pred_scale = float(np.std(y_pred_arr)) + 1e-9
     cal_component = max(0.0, 1.0 - min(1.0, abs(pred_scale - true_scale) / true_scale))
     minutes = max(1, int(candle_minutes))
-    if minutes <= 60:
-        w_mae, w_dir, w_hit, w_cal = 0.45, 0.20, 0.15, 0.20
+    if minutes <= 120:
+        suffix = "SHORT"
+        defaults = (0.50, 0.15, 0.10, 0.25)  # MAE + calibration heavy
     elif minutes >= 1440:
-        w_mae, w_dir, w_hit, w_cal = 0.25, 0.45, 0.25, 0.05
+        suffix = "LONG"
+        defaults = (0.20, 0.45, 0.30, 0.05)  # direction + hit heavy
     else:
-        w_mae, w_dir, w_hit, w_cal = 0.45, 0.30, 0.20, 0.05
+        suffix = "MID"
+        defaults = (0.35, 0.30, 0.25, 0.10)
+
+    def _w(name: str, default: float) -> float:
+        raw = os.getenv(f"OBJECTIVE_W_{name}_{suffix}", str(default))
+        try:
+            return float(raw)
+        except Exception:
+            return float(default)
+
+    w_mae = _w("MAE", defaults[0])
+    w_dir = _w("DIR", defaults[1])
+    w_hit = _w("HIT", defaults[2])
+    w_cal = _w("CAL", defaults[3])
+    s = w_mae + w_dir + w_hit + w_cal
+    if not np.isfinite(s) or s <= 0:
+        w_mae, w_dir, w_hit, w_cal = defaults
+    else:
+        w_mae, w_dir, w_hit, w_cal = (w_mae / s, w_dir / s, w_hit / s, w_cal / s)
     return float((w_mae * mae_component) + (w_dir * float(dir_acc)) + (w_hit * float(close_hit)) + (w_cal * cal_component))
 
 
@@ -564,11 +604,20 @@ def _final_score(trading: float, primary: float, stability: float, config: Tourn
     return 0.5 * trading + 0.3 * primary + config.stability_weight * (1 - stability)
 
 
+def _suppress_fit_warnings() -> None:
+    warnings.filterwarnings("ignore", category=ConvergenceWarning)
+    warnings.filterwarnings("ignore", category=LinAlgWarning)
+    warnings.filterwarnings(
+        "ignore",
+        category=UserWarning,
+        message=r"Singular matrix in solving dual problem.*",
+    )
+
+
 def _fit_predict_direction(spec: ModelSpec, X_train, y_train, X_val):
     model = spec.model
     with warnings.catch_warnings():
-        warnings.filterwarnings("ignore", category=ConvergenceWarning)
-        warnings.filterwarnings("ignore", category=LinAlgWarning)
+        _suppress_fit_warnings()
         model.fit(X_train, y_train)
     y_pred = model.predict(X_val)
     return model, y_pred
@@ -577,8 +626,7 @@ def _fit_predict_direction(spec: ModelSpec, X_train, y_train, X_val):
 def _fit_predict_reg(spec: ModelSpec, X_train, y_train, X_val):
     model = spec.model
     with warnings.catch_warnings():
-        warnings.filterwarnings("ignore", category=ConvergenceWarning)
-        warnings.filterwarnings("ignore", category=LinAlgWarning)
+        _suppress_fit_warnings()
         model.fit(X_train, y_train)
     y_pred = model.predict(X_val)
     return model, y_pred
@@ -588,8 +636,7 @@ def _fit_predict_range(spec: ModelSpec, X_train, y_train, X_val):
     quantiles = (0.1, 0.5, 0.9)
     model = build_quantile_bundle(spec, quantiles)
     with warnings.catch_warnings():
-        warnings.filterwarnings("ignore", category=ConvergenceWarning)
-        warnings.filterwarnings("ignore", category=LinAlgWarning)
+        _suppress_fit_warnings()
         model.fit(X_train, y_train)
     y_pred = model.predict(X_val)
     return model, y_pred
@@ -919,12 +966,34 @@ def _cap_candidates(
     return [candidates[i] for i in idx]
 
 
-def run_tournament(config: TournamentConfig) -> Dict[str, Any]:
+def run_tournament(
+    config: TournamentConfig,
+    *,
+    cycle_started_at: Optional[str] = None,
+    cycle_total: Optional[int] = None,
+    cycle_index: Optional[int] = None,
+    cycle_keep_running: bool = False,
+) -> Dict[str, Any]:
     _setup_logging(config.log_path)
     LOGGER.info("Starting tournament")
     run_started_at = datetime.now(timezone.utc)
-    _write_run_state(True, run_started_at.isoformat(), None, "running")
+    timer_started_at = cycle_started_at or run_started_at.isoformat()
+    _write_run_state(
+        True,
+        timer_started_at,
+        None,
+        "running",
+        extra={
+            "cancel_requested": False,
+            "run_started_at": run_started_at.isoformat(),
+            "cycle_started_at": timer_started_at,
+            "cycle_total": cycle_total,
+            "cycle_index": cycle_index,
+        },
+    )
     error: Optional[Exception] = None
+    cancelled = False
+    results: Dict[str, Any] = {}
     progress_total: Optional[int] = None
     progress_done = 0
     progress_failed = 0
@@ -935,6 +1004,8 @@ def run_tournament(config: TournamentConfig) -> Dict[str, Any]:
     last_progress_write: Optional[datetime] = None
 
     try:
+        if cancel_requested():
+            raise RunCancelled("cancel requested before data prep")
         df, coverage = _prep_data(config)
         if df.empty:
             raise RuntimeError("No data available")
@@ -1043,7 +1114,7 @@ def run_tournament(config: TournamentConfig) -> Dict[str, Any]:
         val_points_total = int(sum(len(s.val) for s in cv_splits))
         weak_fams = _weak_families(registry)
 
-        results: Dict[str, Any] = {"coverage": coverage}
+        results = {"coverage": coverage}
         run_at = run_started_at.isoformat()
 
         run_mode = _run_mode_for_horizon(config)
@@ -1055,6 +1126,8 @@ def run_tournament(config: TournamentConfig) -> Dict[str, Any]:
         strict_horizon_pool = os.getenv("STRICT_HORIZON_MODEL_POOL", "1").strip().lower() not in {"0", "false", "no", "off"}
         unstable_feats = _unstable_features(sup)
         for task in ["direction", "return", "range"]:
+            if cancel_requested():
+                raise RunCancelled("cancel requested before task loop")
             max_cands_for_task = max_candidates_per_target_eff
             low_sample_enable = os.getenv("LOW_SAMPLE_CANDIDATE_SHRINK_ENABLE", "1").strip().lower() in {"1", "true", "yes", "on"}
             if low_sample_enable:
@@ -1143,6 +1216,8 @@ def run_tournament(config: TournamentConfig) -> Dict[str, Any]:
         scoreboard_rows = []
 
         for task in ["direction", "return", "range"]:
+            if cancel_requested():
+                raise RunCancelled("cancel requested during task loop")
             candidates = per_task_candidates.get(task, [])
             task_feature_cols = per_task_feature_cols.get(task, {})
             LOGGER.info("Task %s candidates %d", task, len(candidates))
@@ -1160,6 +1235,9 @@ def run_tournament(config: TournamentConfig) -> Dict[str, Any]:
                 with ProcessPoolExecutor(max_workers=use_workers) as ex:
                     futures = {ex.submit(_evaluate_candidate, j): j for j in jobs}
                     for fut in futures:
+                        if cancel_requested():
+                            ex.shutdown(wait=False, cancel_futures=True)
+                            raise RunCancelled("cancel requested during parallel evaluation")
                         job = futures[fut]
                         spec = job[0]
                         fs_id = job[2]
@@ -1183,6 +1261,8 @@ def run_tournament(config: TournamentConfig) -> Dict[str, Any]:
                         _emit_progress()
             else:
                 for j in jobs:
+                    if cancel_requested():
+                        raise RunCancelled("cancel requested during sequential evaluation")
                     spec = j[0]
                     fs_id = j[2]
                     try:
@@ -1438,12 +1518,18 @@ def run_tournament(config: TournamentConfig) -> Dict[str, Any]:
         }
         LOGGER.info("Tournament complete")
         return results
+    except RunCancelled as exc:
+        cancelled = True
+        results.setdefault("status", "cancelled")
+        results.setdefault("message", str(exc))
+        LOGGER.info("Tournament cancelled: %s", exc)
+        return results
     except Exception as exc:
         error = exc
         raise
     finally:
         finished_at = datetime.now(timezone.utc).isoformat()
-        status = "error" if error else "ok"
+        status = "cancelled" if cancelled else ("error" if error else "ok")
         progress_payload = None
         if progress_total is not None:
             progress_payload = {
@@ -1454,11 +1540,35 @@ def run_tournament(config: TournamentConfig) -> Dict[str, Any]:
                 "last_model": progress_last_model,
                 "updated_at": finished_at,
             }
-        _write_run_state(
-            False,
-            run_started_at.isoformat(),
-            finished_at,
-            status,
-            progress=progress_payload,
-        )
+        if cycle_keep_running and not cancelled:
+            _write_run_state(
+                True,
+                timer_started_at,
+                None,
+                "running",
+                progress=progress_payload,
+                extra={
+                    "cancel_requested": False,
+                    "run_started_at": run_started_at.isoformat(),
+                    "cycle_started_at": timer_started_at,
+                    "cycle_total": cycle_total,
+                    "cycle_index": cycle_index,
+                },
+            )
+        else:
+            _write_run_state(
+                False,
+                timer_started_at,
+                finished_at,
+                status,
+                progress=progress_payload,
+                extra={
+                    "cancel_requested": False,
+                    "run_started_at": run_started_at.isoformat(),
+                    "cycle_started_at": timer_started_at,
+                    "cycle_total": cycle_total,
+                    "cycle_index": cycle_index,
+                    "cycle_finished_at": finished_at,
+                },
+            )
 
