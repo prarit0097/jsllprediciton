@@ -111,6 +111,25 @@ function fmtTimeOnly(iso) {
   });
 }
 
+function fmtAge(iso) {
+  if (!iso) return '--';
+  const ts = new Date(iso).getTime();
+  if (Number.isNaN(ts)) return '--';
+  let sec = Math.floor((Date.now() - ts) / 1000);
+  if (sec < 0) sec = 0;
+  if (sec < 60) return `${sec}s ago`;
+  const min = Math.floor(sec / 60);
+  if (min < 60) return `${min}m ago`;
+  const hr = Math.floor(min / 60);
+  if (hr < 24) return `${hr}h ago`;
+  const day = Math.floor(hr / 24);
+  if (day < 30) return `${day}d ago`;
+  const mon = Math.floor(day / 30);
+  if (mon < 12) return `${mon}mo ago`;
+  const yr = Math.floor(mon / 12);
+  return `${yr}y ago`;
+}
+
 function formatElapsed(ms) {
   if (!ms || ms < 0) return '--';
   const total = Math.floor(ms / 1000);
@@ -472,7 +491,10 @@ function renderPredList(predictions) {
     let diffActualLine = 'Difference: -- | Actual: --';
     if (pred.last_ready) {
       const lr = pred.last_ready;
-      lastMatchedLine = `Last matched on last predicted price: ${formatDualPrice(lr.predicted_price, lastFxRate)} (${formatMatchPercent(lr)})`;
+      const ageIso = lr.actual_at || lr.predicted_at || null;
+      const ageText = fmtAge(ageIso);
+      const ageSuffix = ageText !== '--' ? ` | ${ageText}` : '';
+      lastMatchedLine = `Last matched on last predicted price: ${formatDualPrice(lr.predicted_price, lastFxRate)} (${formatMatchPercent(lr)})${ageSuffix}`;
       const actualLine = lr.actual_price !== null && lr.actual_price !== undefined
         ? `Actual: ${formatDualPrice(lr.actual_price, lastFxRate)}`
         : 'Actual: --';
@@ -649,11 +671,14 @@ async function loadSummary() {
         const health =
           kite.health_ok === true ? 'ok' :
           kite.health_ok === false ? 'invalid' : 'unchecked';
+        const reasons = Array.isArray(kite.health_reasons) && kite.health_reasons.length
+          ? ` | reason: ${kite.health_reasons.join(', ')}`
+          : '';
         const loginUrl = kite.login_url || '/kite/login';
         if (kite.action_required) {
-          kiteEl.innerHTML = `Kite auth: ${token} | source: ${src} | user: ${user} | updated: ${upd} | health: ${health} | <a href="${loginUrl}" target="_blank" rel="noopener">login required</a>`;
+          kiteEl.innerHTML = `Kite auth: ${token} | source: ${src} | user: ${user} | updated: ${upd} | health: ${health}${reasons} | <a href="${loginUrl}" target="_blank" rel="noopener">login required</a>`;
         } else {
-          kiteEl.textContent = `Kite auth: ${token} | source: ${src} | user: ${user} | updated: ${upd} | health: ${health}`;
+          kiteEl.textContent = `Kite auth: ${token} | source: ${src} | user: ${user} | updated: ${upd} | health: ${health}${reasons}`;
         }
       }
     }

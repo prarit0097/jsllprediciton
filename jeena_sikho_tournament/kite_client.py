@@ -8,6 +8,8 @@ from typing import Any, Dict, Optional
 
 import pandas as pd
 
+IST = timezone(timedelta(hours=5, minutes=30))
+
 
 def _env_flag(name: str, default: str = "0") -> bool:
     return os.getenv(name, default).strip().lower() in {"1", "true", "yes", "on"}
@@ -254,6 +256,90 @@ def probe_kite_token_health() -> Dict[str, Any]:
         state.update(out)
     save_kite_health_state(state)
     return out
+
+
+def _parse_dt(value: Any) -> Optional[datetime]:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        dt = value
+    else:
+        raw = str(value).strip()
+        if not raw:
+            return None
+        if raw.endswith("Z"):
+            raw = raw[:-1] + "+00:00"
+        try:
+            dt = datetime.fromisoformat(raw)
+        except Exception:
+            return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def _is_kite_source_active() -> bool:
+    source = (os.getenv("PRICE_SOURCE", "auto") or "auto").strip().lower()
+    return source in {"kite", "auto"}
+
+
+def get_kite_relogin_status(now_utc: Optional[datetime] = None) -> Dict[str, Any]:
+    now_utc = now_utc or datetime.now(timezone.utc)
+    now_ist = now_utc.astimezone(IST)
+    auth = load_kite_auth_state()
+    health = load_kite_health_state()
+    token = current_kite_access_token()
+    api_key = (os.getenv("KITE_API_KEY", "") or "").strip()
+    api_secret = (os.getenv("KITE_API_SECRET", "") or "").strip()
+    client_id = (os.getenv("KITE_CLIENT_ID", "") or "").strip()
+    configured = bool(api_key and api_secret and client_id)
+    enabled = bool(is_kite_enabled() and _is_kite_source_active())
+
+    health_ok_raw = health.get("ok")
+    health_ok = None if health_ok_raw is None else bool(health_ok_raw)
+    health_checked_at = _parse_dt(health.get("checked_at"))
+    login_time = _parse_dt(auth.get("login_time"))
+
+    max_age_min = max(5, int(os.getenv("KITE_HEALTH_MAX_AGE_MIN", "180")))
+    stale_force = os.getenv("KITE_FORCE_RELOGIN_ON_STALE", "0").strip().lower() in {"1", "true", "yes", "on"}
+    daily_relogin_after_start = os.getenv("KITE_DAILY_RELOGIN_AFTER_START", "1").strip().lower() in {"1", "true", "yes", "on"}
+    start_min = int(os.getenv("KITE_TOKEN_HEALTHCHECK_START_MIN", "525"))
+    minute_now = now_ist.hour * 60 + now_ist.minute
+
+    reasons = []
+    if enabled and configured and not token:
+        reasons.append("token_missing")
+    if enabled and configured and health_ok is False:
+        reasons.append("token_invalid_or_expired")
+    if enabled and configured and health_checked_at is None:
+        reasons.append("health_unchecked")
+    if enabled and configured and health_checked_at is not None:
+        age_min = (now_utc - health_checked_at.astimezone(timezone.utc)).total_seconds() / 60.0
+        if age_min > float(max_age_min):
+            reasons.append("health_stale")
+    if enabled and configured and login_time is not None and daily_relogin_after_start and minute_now >= start_min:
+        if login_time.astimezone(IST).date() < now_ist.date():
+            reasons.append("daily_relogin_required")
+
+    blocking_reasons = {"token_missing", "token_invalid_or_expired", "daily_relogin_required"}
+    if stale_force:
+        blocking_reasons.add("health_stale")
+    action_required = any(r in blocking_reasons for r in reasons)
+    message = "ok"
+    if reasons:
+        message = ", ".join(reasons)
+
+    return {
+        "enabled": enabled,
+        "configured": configured,
+        "action_required": action_required,
+        "reasons": reasons,
+        "message": message,
+        "health_ok": health_ok,
+        "health_checked_at": (health_checked_at.isoformat() if health_checked_at else None),
+        "health_max_age_min": max_age_min,
+        "login_time": (login_time.isoformat() if login_time else None),
+    }
 
 
 def fetch_kite_ohlcv(start: datetime, end: Optional[datetime] = None, interval: str = "60minute") -> pd.DataFrame:

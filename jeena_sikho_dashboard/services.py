@@ -18,6 +18,7 @@ from jeena_sikho_tournament.features import make_supervised, resolve_feature_win
 from jeena_sikho_tournament.kite_client import (
     current_kite_access_token,
     fetch_kite_ltp,
+    get_kite_relogin_status,
     is_kite_enabled,
     load_kite_auth_state,
     load_kite_health_state,
@@ -592,15 +593,19 @@ def _prediction_target_timestamp(pred_at: datetime, horizon_min: int, tf_minutes
         return anchor + timedelta(minutes=horizon)
 
     if horizon >= 1440:
-        # Optional mode for 1d: match next trading-day open (09:15 IST).
-        if horizon == 1440 and _daily_target_point() == "open":
+        # Open-mode for daily horizons: match at trading-day open (09:15 IST).
+        if _daily_target_point() == "open":
             cur_local = pred_at.astimezone(IST)
             day = cur_local.date()
+            steps = int(np.ceil(horizon / 1440.0))
+            advanced = 0
             while True:
                 day = day + timedelta(days=1)
                 probe = datetime(day.year, day.month, day.day, 9, 15, tzinfo=IST)
                 if probe.weekday() < 5 and day not in _NSE_HOLIDAYS:
-                    return probe.astimezone(timezone.utc)
+                    advanced += 1
+                    if advanced >= steps:
+                        return probe.astimezone(timezone.utc)
         # Default: next trading-day close (15:30 IST).
         steps = int(np.ceil(horizon / 1440.0))
         cur_local = pred_at.astimezone(IST)
@@ -917,8 +922,10 @@ def get_kite_auth_status() -> Dict[str, Any]:
     token = current_kite_access_token()
     updated_at = auth_state.get("updated_at")
     token_source = "auth_file" if (auth_state.get("access_token") or "").strip() else ("env" if token else "missing")
-    health_ok = health_state.get("ok")
-    action_required = bool(enabled and api_key and api_secret and client_id and (not token or health_ok is False))
+    relogin = get_kite_relogin_status()
+    health_ok = relogin.get("health_ok")
+    action_required = bool(relogin.get("action_required"))
+    reasons = relogin.get("reasons") or []
     return {
         "enabled": enabled,
         "configured": bool(api_key and api_secret and client_id),
@@ -934,9 +941,11 @@ def get_kite_auth_status() -> Dict[str, Any]:
         "user_id": auth_state.get("user_id"),
         "user_name": auth_state.get("user_name"),
         "login_time": auth_state.get("login_time"),
-        "health_checked_at": health_state.get("checked_at"),
+        "health_checked_at": (relogin.get("health_checked_at") or health_state.get("checked_at")),
         "health_ok": (None if health_ok is None else bool(health_ok)),
-        "health_error": health_state.get("error"),
+        "health_error": (health_state.get("error") or relogin.get("message")),
+        "health_reasons": reasons,
+        "health_max_age_min": relogin.get("health_max_age_min"),
         "action_required": action_required,
         "login_url": "/kite/login",
     }
@@ -1093,9 +1102,9 @@ def _confidence_thresholds_for_horizon(horizon_min: int) -> tuple[float, float]:
 
 
 def _get_ohlcv_target_price(target_iso: str, table: str, horizon_min: int) -> Optional[float]:
-    # 1d open-mode compares against next-day 09:15 open; all other horizons use close.
-    if _is_indian_equity() and int(horizon_min) == 1440 and _daily_target_point() == "open":
-        # Daily table rows are stamped at 15:30; opening tick lives in 1h base table.
+    # Daily open-mode compares against trading-day 09:15 open for all >=1d horizons.
+    if _is_indian_equity() and int(horizon_min) >= 1440 and _daily_target_point() == "open":
+        # Daily/nd tables are stamped at close; opening tick lives in 1h base table.
         px = get_ohlcv_open_at(target_iso, table="ohlcv")
         if px is not None:
             return px
@@ -1953,7 +1962,19 @@ def refresh_prediction(config: TournamentConfig) -> Dict[str, Any]:
         if latest:
             pred_at = _parse_iso_utc(latest["predicted_at"])
             cooldown = _cooldown_minutes(horizon_min)
-            if datetime.now(timezone.utc) - pred_at < timedelta(minutes=cooldown):
+            latest_status = str(latest.get("status") or "").strip().lower()
+            transient_statuses = {
+                "no_signal",
+                "skipped_low_confidence",
+                "blocked_by_backtest_gate",
+                "no_champion",
+                "no_data",
+                "no_price",
+            }
+            # If the last row is policy/availability blocked, bypass cooldown so
+            # a config or data-source fix reflects immediately in UI/API.
+            keep_cooldown = latest_status not in transient_statuses
+            if keep_cooldown and datetime.now(timezone.utc) - pred_at < timedelta(minutes=cooldown):
                 _apply_match_fields(latest)
                 _decorate_pending_target(latest, horizon_min)
                 latest["last_ready"] = _decorate_last_ready(
@@ -2128,9 +2149,23 @@ def latest_prediction(config: TournamentConfig, update_pending: bool = True) -> 
     if update_pending and not _RUN_STATE.get("running"):
         update_pending_predictions(config)
     predictions: List[Dict[str, Any]] = []
+    prod_gate_enable = os.getenv("PRODUCTION_GATE_ENABLE", "1").strip().lower() in {"1", "true", "yes", "on"}
+    prod_ready = _production_ready_map(config) if prod_gate_enable else {}
     for timeframe in get_timeframes(config):
-        latest = get_latest_prediction_for_timeframe(timeframe)
         horizon_min = _timeframe_to_minutes(timeframe, config.candle_minutes)
+        target_label = _horizon_target_label(horizon_min)
+        if prod_gate_enable and (prod_ready.get(timeframe) is False):
+            predictions.append(
+                {
+                    "timeframe": timeframe,
+                    "timeframe_minutes": horizon_min,
+                    "prediction_horizon_min": horizon_min,
+                    "prediction_target": target_label,
+                    "status": "blocked_by_backtest_gate",
+                }
+            )
+            continue
+        latest = get_latest_prediction_for_timeframe(timeframe)
         if latest:
             _apply_match_fields(latest)
             _decorate_pending_target(latest, horizon_min)

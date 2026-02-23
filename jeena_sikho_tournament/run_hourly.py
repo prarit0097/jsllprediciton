@@ -8,7 +8,12 @@ from .config import TournamentConfig
 from .drift import should_retrain_on_drift
 from .market_calendar import IST, NSE_OPEN_MIN, NSE_RUN_CLOSE_MIN, is_nse_run_window, load_nse_holidays
 from .multi_timeframe import config_for_timeframe, run_multi_timeframe_tournament
-from .kite_client import is_kite_enabled, kite_login_url, probe_kite_token_health
+from .kite_client import (
+    get_kite_relogin_status,
+    is_kite_enabled,
+    kite_login_url,
+    probe_kite_token_health,
+)
 from .repair import run_nightly_repair
 from .run_weekly_reopt import run_weekly_reoptimization
 from .tournament import run_tournament
@@ -387,6 +392,29 @@ def _handle_maintenance_windows(config: TournamentConfig, now_utc: datetime) -> 
     return False
 
 
+def _enforce_kite_auth_guard(now_utc: datetime) -> bool:
+    if os.getenv("KITE_TOKEN_HEALTHCHECK_ENABLE", "1").strip().lower() not in {"1", "true", "yes", "on"}:
+        return False
+    block = os.getenv("KITE_BLOCK_RUN_ON_AUTH_FAIL", "1").strip().lower() in {"1", "true", "yes", "on"}
+    if not block:
+        return False
+    status = get_kite_relogin_status(now_utc=now_utc)
+    if not status.get("enabled"):
+        return False
+    if not status.get("configured"):
+        print("Kite auth guard: Kite is enabled but configuration is incomplete (api key/secret/client id).")
+        return True
+    if status.get("action_required"):
+        try:
+            login = kite_login_url()
+        except Exception:
+            login = "http://127.0.0.1:8000/kite/login"
+        reason = status.get("message") or "auth_refresh_required"
+        print(f"Kite auth guard: relogin required ({reason}). Refresh via: {login}")
+        return True
+    return False
+
+
 def main():
     load_env()
     if not _acquire_scheduler_lock():
@@ -413,6 +441,9 @@ def main():
         if _is_indian_equity(config) and not force_run:
             if _handle_maintenance_windows(config, now_utc):
                 print("Maintenance window action executed; tournament skipped this cycle.")
+                return
+            if _enforce_kite_auth_guard(now_utc):
+                print("Kite auth guard blocked this cycle. Set KITE_BLOCK_RUN_ON_AUTH_FAIL=0 to allow fallback run.")
                 return
 
         if _is_indian_equity(config) and not force_run:
