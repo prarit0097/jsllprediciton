@@ -874,7 +874,7 @@ def _champion_detail_from_registry(reg: Dict[str, Any], task: str) -> Dict[str, 
     }
 
 
-def get_price_at_timestamp(config: TournamentConfig, value: str) -> Dict[str, Any]:
+def get_price_at_timestamp(config: TournamentConfig, value: str, point: str = "close") -> Dict[str, Any]:
     ts_utc = _parse_user_timestamp(value)
     primary_tf = get_primary_timeframe(config)
     tf_cfg = _config_for_timeframe(config, primary_tf)
@@ -884,7 +884,13 @@ def get_price_at_timestamp(config: TournamentConfig, value: str) -> Dict[str, An
     else:
         anchor = _align_to_interval(ts_utc, tf_minutes)
     target_iso = anchor.isoformat()
-    price = get_ohlcv_close_at(target_iso, table=tf_cfg.ohlcv_table)
+    point_norm = (point or "close").strip().lower()
+    if point_norm not in {"open", "close"}:
+        point_norm = "close"
+    if point_norm == "open":
+        price = get_ohlcv_open_at(target_iso, table=tf_cfg.ohlcv_table)
+    else:
+        price = get_ohlcv_close_at(target_iso, table=tf_cfg.ohlcv_table)
     if price is None:
         raise LookupError("price not found for timestamp")
     result: Dict[str, Any] = {
@@ -895,6 +901,7 @@ def get_price_at_timestamp(config: TournamentConfig, value: str) -> Dict[str, An
         "quote_currency": _quote_currency(),
         "timeframe": tf_cfg.timeframe,
         "table": tf_cfg.ohlcv_table,
+        "point": point_norm,
         "aligned": True,
     }
     if result["quote_currency"] == "USD":

@@ -576,23 +576,26 @@ function renderPredictionUI() {
 
 async function queryPriceAt() {
   const input = document.getElementById('price-at-input');
+  const pointSel = document.getElementById('price-at-point');
   const result = document.getElementById('price-at-result');
   if (!input || !result) return;
   const value = input.value.trim();
+  const point = (pointSel?.value || 'close').toLowerCase();
   if (!value) {
     result.textContent = 'Price at timestamp: --';
     return;
   }
   result.textContent = 'Price at timestamp: loading...';
   try {
-    const data = await getJSON(`${API_PREFIX}/price_at?ts=${encodeURIComponent(value)}`);
+    const data = await getJSON(`${API_PREFIX}/price_at?ts=${encodeURIComponent(value)}&point=${encodeURIComponent(point)}`);
     const quoteCurrency = data.quote_currency || lastQuoteCurrency;
     const display = formatNowPrice(data.price, data.price_inr, data.fx_rate || lastFxRate, quoteCurrency);
     const ts = data.aligned_at || data.timestamp_utc || data.requested_at;
     const timeLabel = ts ? fmtDateTimeLower(ts) : '--';
     const alignedNote = data.aligned && data.aligned_at ? ' (aligned)' : '';
     const tfLabel = data.timeframe ? ` [${data.timeframe}]` : '';
-    result.textContent = `Price at ${timeLabel}${alignedNote}${tfLabel}: ${display}`;
+    const pointLabel = (data.point || point || 'close').toUpperCase();
+    result.textContent = `Price at ${timeLabel}${alignedNote}${tfLabel} (${pointLabel}): ${display}`;
   } catch (err) {
     result.textContent = 'Price at timestamp: not found';
   }

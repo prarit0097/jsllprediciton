@@ -2,7 +2,7 @@ import json
 import logging
 import os
 
-from django.http import JsonResponse
+from django.http import HttpResponse, JsonResponse
 from django.shortcuts import redirect, render
 from django.views.decorators.csrf import csrf_exempt
 
@@ -43,6 +43,10 @@ def dashboard(request):
             "api_prefix": api_prefix.rstrip("/"),
         },
     )
+
+
+def favicon(request):
+    return HttpResponse(status=204)
 
 
 def kite_login(request):
@@ -101,7 +105,8 @@ def api_price_at(request):
         value = request.GET.get("ts")
         if not value:
             return JsonResponse({"error": "ts required"}, status=400)
-        data = get_price_at_timestamp(_config(), value)
+        point = (request.GET.get("point") or "close").strip().lower()
+        data = get_price_at_timestamp(_config(), value, point=point)
         return JsonResponse(data)
     except ValueError as exc:
         return JsonResponse({"error": str(exc)}, status=400)

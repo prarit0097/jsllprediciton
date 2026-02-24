@@ -5,6 +5,7 @@ from price.views import index, api_price
 
 urlpatterns = [
     path('admin/', admin.site.urls),
+    path('favicon.ico', js_views.favicon, name='favicon'),
     path('', js_views.dashboard, name='index'),
     path('price/', index, name='price_index'),
     path('api/price', api_price, name='api_price'),
