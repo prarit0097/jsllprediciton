@@ -184,21 +184,35 @@ def _load_exogenous_context(index_utc: pd.DatetimeIndex, candle_minutes: int) ->
         out = out[~out.index.duplicated(keep="last")]
         return out.sort_index()
 
+    def _to_float_series(value: object) -> pd.Series:
+        # yfinance can return DataFrame when duplicate columns exist.
+        if isinstance(value, pd.DataFrame):
+            if value.empty:
+                return pd.Series(dtype=float)
+            first_col = value.columns[0]
+            value = value[first_col]
+        if isinstance(value, pd.Series):
+            return pd.to_numeric(value, errors="coerce").dropna()
+        return pd.Series(dtype=float)
+
     for sym in symbols:
         tag = _safe_symbol_tag(sym)
         raw = _download_chunked(sym)
         if raw is None or raw.empty:
             continue
-        if "Close" not in raw.columns:
+        close_col = "Close" if "Close" in raw.columns else ("close" if "close" in raw.columns else None)
+        if not close_col:
             continue
-        s = raw["Close"].astype(float).dropna()
+        s = _to_float_series(raw[close_col])
+        if s.empty:
+            continue
         s.index = pd.to_datetime(s.index, utc=True)
         s = s[~s.index.duplicated(keep="last")].sort_index()
         s = s.reindex(index_utc).ffill(limit=max(1, int(1440 / max(1, candle_minutes))))
-        ret = np.log(s).diff(1)
-        vol = ret.rolling(max(5, _bars_for_hours(24, candle_minutes)), min_periods=5).std(ddof=0)
-        out[f"exo_{tag}_ret"] = ret
-        out[f"exo_{tag}_vol"] = vol
+        ret = np.log(s).diff(1).astype(float)
+        vol = ret.rolling(max(5, _bars_for_hours(24, candle_minutes)), min_periods=5).std(ddof=0).astype(float)
+        out[f"exo_{tag}_ret"] = pd.Series(ret, index=index_utc)
+        out[f"exo_{tag}_vol"] = pd.Series(vol, index=index_utc)
     return out
 
 
