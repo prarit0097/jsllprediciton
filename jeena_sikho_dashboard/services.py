@@ -1064,11 +1064,11 @@ def update_pending_predictions(config: TournamentConfig) -> None:
 
         table = "ohlcv" if int(tf_minutes) == 60 else f"ohlcv_{int(tf_minutes)}m"
         actual = _get_ohlcv_target_price(target_iso, table, int(horizon_min))
+        # Strict matching mode: only mark ready when the aligned OHLCV target
+        # price exists. Do not fallback to live spot, because that can drift
+        # from the intended horizon timestamp and produce misleading matches.
         if actual is None:
-            try:
-                actual = get_live_price()["price"]
-            except Exception:
-                continue
+            continue
         metrics = _compute_match_metrics(p.get("predicted_price"), actual)
         update_prediction(p["id"], actual, metrics["match_percent"], "ready")
 
