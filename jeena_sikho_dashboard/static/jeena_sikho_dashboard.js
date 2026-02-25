@@ -530,8 +530,9 @@ function renderHorizonMetrics(data) {
     const tf = row.timeframe || '--';
     const target = row.target || '--';
     const metrics = row.metrics;
+    const researchTag = row.research_grade ? ` | tier: research-grade (need n>=${row.research_required_samples || '--'})` : '';
     if (!metrics || !metrics.samples) {
-      lines.push(`<div class="metric-row">${tf} (${target}): pending matches</div>`);
+      lines.push(`<div class="metric-row">${tf} (${target}): pending matches${researchTag}</div>`);
       return;
     }
     const mae = fmt(metrics.mae, 4);
@@ -540,13 +541,14 @@ function renderHorizonMetrics(data) {
     const util = metrics.directional_utility === null || metrics.directional_utility === undefined ? '--' : fmt(metrics.directional_utility, 5);
     const calib = metrics.calibration_rmse === null || metrics.calibration_rmse === undefined ? '--' : fmt(metrics.calibration_rmse, 5);
     lines.push(
-      `<div class="metric-row">${tf} (${target}) | n=${metrics.samples} | MAE=${mae} | MAPE=${mape} | Hit=${hit} | Util=${util} | CalRMSE=${calib}</div>`,
+      `<div class="metric-row">${tf} (${target}) | n=${metrics.samples} | MAE=${mae} | MAPE=${mape} | Hit=${hit} | Util=${util} | CalRMSE=${calib}${researchTag}</div>`,
     );
   });
   const report = Array.isArray(data?.backtest_report) ? data.backtest_report : [];
   report.forEach((row) => {
     const ready = row.production_ready ? 'READY' : 'not-ready';
-    lines.push(`<div class="metric-row">${row.timeframe} pack: ${ready}</div>`);
+    const researchTag = row.research_grade ? ` (research-grade; need n>=${row.research_required_samples || '--'})` : '';
+    lines.push(`<div class="metric-row">${row.timeframe} pack: ${ready}${researchTag}</div>`);
   });
   el.innerHTML = lines.join('');
 }

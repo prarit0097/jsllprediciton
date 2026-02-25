@@ -1758,16 +1758,34 @@ def _summarize_ready_metrics(rows: List[Dict[str, Any]]) -> Optional[Dict[str, A
 def _collect_metrics_by_horizon(config: TournamentConfig) -> List[Dict[str, Any]]:
     metrics_limit = max(10, int(os.getenv("PREDICTION_METRICS_LIMIT", "200")))
     rows: List[Dict[str, Any]] = []
+
+    def _research_grade_meta(horizon_minutes: int, samples: int) -> tuple[bool, int]:
+        # Keep 4d+ running but mark as research-grade until enough ready matches accrue.
+        if horizon_minutes < (4 * 1440):
+            return False, 0
+        suffix = {
+            5760: "4D",
+            7200: "5D",
+            8640: "6D",
+            10080: "7D",
+        }.get(int(horizon_minutes))
+        required = int(os.getenv(f"MIN_READY_MATCHES_{suffix}", "6")) if suffix else 6
+        return samples < required, required
+
     for timeframe in get_timeframes(config):
         horizon_min = _timeframe_to_minutes(timeframe, config.candle_minutes)
         ready_rows = get_recent_ready_predictions(timeframe, metrics_limit)
         summary = _summarize_ready_metrics(ready_rows)
+        samples = int((summary or {}).get("samples") or 0)
+        research_grade, required_samples = _research_grade_meta(horizon_min, samples)
         rows.append(
             {
                 "timeframe": timeframe,
                 "target": _horizon_target_label(horizon_min),
                 "horizon_minutes": horizon_min,
                 "metrics": summary,
+                "research_grade": research_grade,
+                "research_required_samples": required_samples,
             }
         )
     return rows
@@ -1789,6 +1807,8 @@ def _build_backtest_report(config: TournamentConfig) -> List[Dict[str, Any]]:
             and float(mape) <= float(os.getenv("PROD_MAX_MAPE", "3.0"))
             and float(hit_rate) >= float(os.getenv("PROD_MIN_HIT_RATE", "52.0"))
         )
+        if row.get("research_grade"):
+            production_ready = False
         out.append(
             {
                 "timeframe": row.get("timeframe"),
@@ -1800,6 +1820,8 @@ def _build_backtest_report(config: TournamentConfig) -> List[Dict[str, Any]]:
                 "directional_utility": util,
                 "calibration_rmse": calibration_rmse,
                 "production_ready": production_ready,
+                "research_grade": bool(row.get("research_grade")),
+                "research_required_samples": row.get("research_required_samples"),
             }
         )
     return out
