@@ -102,6 +102,9 @@ def _sklearn_candidates(task: str, candle_minutes: int) -> List[ModelSpec]:
             Ridge,
             Lasso,
             ElasticNet,
+            HuberRegressor,
+            BayesianRidge,
+            QuantileRegressor,
         )
         from sklearn.neighbors import KNeighborsClassifier, KNeighborsRegressor
         from sklearn.svm import LinearSVR
@@ -129,6 +132,40 @@ def _sklearn_candidates(task: str, candle_minutes: int) -> List[ModelSpec]:
         )
         for c in logreg_cs:
             specs.append(ModelSpec(f"logreg_l2_c{c}", LogisticRegression(max_iter=1000, C=c), task, {"family": "logreg", "group": "fast"}))
+        for c in _pick_by_horizon(
+            candle_minutes,
+            [0.05, 0.1, 0.25, 0.5, 1.0],
+            [0.05, 0.1, 0.25, 0.5, 1.0, 2.0],
+            [0.02, 0.05, 0.1, 0.25, 0.5],
+        ):
+            specs.append(
+                ModelSpec(
+                    f"logreg_l1_c{c}",
+                    LogisticRegression(max_iter=1500, C=c, penalty="l1", solver="liblinear"),
+                    task,
+                    {"family": "logreg", "group": "fast"},
+                )
+            )
+        for c, l1 in _pick_by_horizon(
+            candle_minutes,
+            [(0.1, 0.2), (0.25, 0.4), (0.5, 0.6), (1.0, 0.8)],
+            [(0.1, 0.2), (0.25, 0.4), (0.5, 0.6), (1.0, 0.8), (2.0, 0.9)],
+            [(0.05, 0.2), (0.1, 0.4), (0.25, 0.6), (0.5, 0.8)],
+        ):
+            specs.append(
+                ModelSpec(
+                    f"logreg_en_c{c}_l1{l1}",
+                    LogisticRegression(
+                        max_iter=2000,
+                        C=c,
+                        penalty="elasticnet",
+                        solver="saga",
+                        l1_ratio=l1,
+                    ),
+                    task,
+                    {"family": "logreg", "group": "medium"},
+                )
+            )
         for alpha in _pick_by_horizon(candle_minutes, [0.1, 0.5, 1.0, 2.0], [0.1, 0.5, 1.0, 2.0, 5.0], [0.1, 0.5, 1.0]):
             specs.append(ModelSpec(f"ridge_clf_a{alpha}", RidgeClassifier(alpha=alpha), task, {"family": "ridge", "group": "fast"}))
         for n in _pick_by_horizon(candle_minutes, [3, 5, 9, 15], [3, 5, 9, 15, 21], [3, 5, 9]):
@@ -147,6 +184,15 @@ def _sklearn_candidates(task: str, candle_minutes: int) -> List[ModelSpec]:
             [1e-6, 1e-5, 1e-4, 5e-4, 1e-3],
         ):
             specs.append(ModelSpec(f"sgd_log_a{alpha}", SGDClassifier(loss="log_loss", alpha=alpha), task, {"family": "sgd", "group": "fast"}))
+        for c in _pick_by_horizon(candle_minutes, [0.2, 0.5, 1.0], [0.2, 0.5, 1.0, 2.0], [0.2, 0.5, 1.0]):
+            specs.append(
+                ModelSpec(
+                    f"pa_clf_c{c}",
+                    SGDClassifier(loss="hinge", penalty=None, learning_rate="optimal", alpha=max(1e-6, 1.0 / (1000.0 * c))),
+                    task,
+                    {"family": "pa", "group": "fast"},
+                )
+            )
         for n, d in _pick_by_horizon(
             candle_minutes,
             [
@@ -207,6 +253,9 @@ def _sklearn_candidates(task: str, candle_minutes: int) -> List[ModelSpec]:
             specs.append(ModelSpec(f"sgd_reg_a{alpha}", SGDRegressor(alpha=alpha), task, {"family": "sgd", "group": "fast"}))
         for alpha in _pick_by_horizon(candle_minutes, [0.1, 0.5, 1.0, 2.0], [0.1, 0.5, 1.0, 2.0, 5.0], [0.1, 0.5, 1.0]):
             specs.append(ModelSpec(f"ridge_reg_a{alpha}", Ridge(alpha=alpha), task, {"family": "ridge", "group": "fast"}))
+        for alpha in _pick_by_horizon(candle_minutes, [1e-4, 5e-4, 1e-3], [1e-4, 5e-4, 1e-3, 2e-3], [1e-4, 5e-4, 1e-3]):
+            specs.append(ModelSpec(f"huber_a{alpha}", HuberRegressor(alpha=alpha), task, {"family": "huber", "group": "fast"}))
+        specs.append(ModelSpec("bayes_ridge", BayesianRidge(), task, {"family": "bayes", "group": "fast"}))
         for alpha in _pick_by_horizon(candle_minutes, [1e-4, 5e-4, 1e-3], [1e-4, 5e-4, 1e-3], [1e-5, 1e-4, 5e-4]):
             specs.append(ModelSpec(f"lasso_a{alpha}", Lasso(alpha=alpha, max_iter=2000), task, {"family": "lasso", "group": "fast"}))
         for alpha, l1 in _pick_by_horizon(candle_minutes, [(1e-4, 0.2), (5e-4, 0.5), (1e-3, 0.7)], [(1e-4, 0.2), (5e-4, 0.5), (1e-3, 0.7)], [(1e-5, 0.2), (1e-4, 0.5), (5e-4, 0.7)]):
@@ -254,6 +303,20 @@ def _sklearn_candidates(task: str, candle_minutes: int) -> List[ModelSpec]:
             specs.append(ModelSpec(f"gbr_{n}_{lr}", GradientBoostingRegressor(n_estimators=n, learning_rate=lr), task, {"family": "gb", "group": "fast"}))
         for n in _pick_by_horizon(candle_minutes, [200, 300, 400, 500, 600], [200, 300, 400, 500, 600, 700, 800], [200, 300, 400, 500, 600]):
             specs.append(ModelSpec(f"hgb_{n}", HistGradientBoostingRegressor(max_iter=n), task, {"family": "hgb", "group": "fast"}))
+        for q, alpha in _pick_by_horizon(
+            candle_minutes,
+            [(0.5, 1e-4), (0.5, 5e-4)],
+            [(0.5, 1e-4), (0.5, 5e-4), (0.5, 1e-3)],
+            [(0.5, 1e-4), (0.5, 5e-4), (0.5, 1e-3)],
+        ):
+            specs.append(
+                ModelSpec(
+                    f"qreg_q{q}_a{alpha}",
+                    QuantileRegressor(quantile=q, alpha=alpha, solver="highs"),
+                    task,
+                    {"family": "qreg", "group": "medium"},
+                )
+            )
 
     if task == "range":
         q_iters = _pick_by_horizon(
@@ -279,6 +342,7 @@ def _optional_boosters(task: str) -> List[ModelSpec]:
                 (400, 4, 0.05),
                 (600, 5, 0.05),
                 (800, 6, 0.03),
+                (1000, 7, 0.02),
             ]:
                 specs.append(
                     ModelSpec(
@@ -303,6 +367,7 @@ def _optional_boosters(task: str) -> List[ModelSpec]:
                 (400, 0.05, 31),
                 (600, 0.05, 63),
                 (800, 0.03, 63),
+                (1000, 0.02, 127),
             ]:
                 specs.append(
                     ModelSpec(
@@ -340,6 +405,7 @@ def _optional_boosters(task: str) -> List[ModelSpec]:
                 (400, 4, 0.05),
                 (600, 5, 0.05),
                 (800, 6, 0.03),
+                (1000, 7, 0.02),
             ]:
                 specs.append(
                     ModelSpec(
@@ -364,6 +430,7 @@ def _optional_boosters(task: str) -> List[ModelSpec]:
                 (400, 0.05, 31),
                 (600, 0.05, 63),
                 (800, 0.03, 63),
+                (1000, 0.02, 127),
             ]:
                 specs.append(
                     ModelSpec(
@@ -441,13 +508,13 @@ def _filter_specs_by_horizon(specs: List[ModelSpec], task: str, candle_minutes: 
         return specs
     minutes = max(1, int(candle_minutes))
     if minutes <= 120:
-        allowed_families = {"naive", "ema", "bias", "zero", "logreg", "sgd", "ridge", "lasso", "enet", "ada", "gb", "hgb", "xgb", "lgb", "gbr_q", "hgb_q", "lgb_q"}
+        allowed_families = {"naive", "ema", "bias", "zero", "logreg", "sgd", "ridge", "lasso", "enet", "pa", "huber", "bayes", "qreg", "ada", "gb", "hgb", "xgb", "lgb", "gbr_q", "hgb_q", "lgb_q"}
         allowed_groups = {"fast", "medium"}
     elif minutes >= 1440:
-        allowed_families = {"naive", "ema", "bias", "zero", "ridge", "lasso", "enet", "rf", "et", "gb", "hgb", "xgb", "lgb", "cat", "gbr_q", "hgb_q", "lgb_q"}
+        allowed_families = {"naive", "ema", "bias", "zero", "ridge", "lasso", "enet", "pa", "huber", "bayes", "qreg", "rf", "et", "gb", "hgb", "xgb", "lgb", "cat", "gbr_q", "hgb_q", "lgb_q"}
         allowed_groups = {"fast", "medium", "heavy"}
     else:
-        allowed_families = {"naive", "ema", "bias", "zero", "sgd", "ridge", "lasso", "enet", "rf", "et", "ada", "gb", "hgb", "xgb", "lgb", "cat", "gbr_q", "hgb_q", "lgb_q"}
+        allowed_families = {"naive", "ema", "bias", "zero", "sgd", "ridge", "lasso", "enet", "pa", "huber", "bayes", "qreg", "rf", "et", "ada", "gb", "hgb", "xgb", "lgb", "cat", "gbr_q", "hgb_q", "lgb_q"}
         allowed_groups = {"fast", "medium", "heavy"}
     out: List[ModelSpec] = []
     for spec in specs:
