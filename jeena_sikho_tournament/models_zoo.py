@@ -141,7 +141,7 @@ def _sklearn_candidates(task: str, candle_minutes: int) -> List[ModelSpec]:
             specs.append(
                 ModelSpec(
                     f"logreg_l1_c{c}",
-                    LogisticRegression(max_iter=1500, C=c, penalty="l1", solver="liblinear"),
+                    LogisticRegression(max_iter=1500, C=c, solver="saga", l1_ratio=1.0),
                     task,
                     {"family": "logreg", "group": "fast"},
                 )
@@ -158,7 +158,6 @@ def _sklearn_candidates(task: str, candle_minutes: int) -> List[ModelSpec]:
                     LogisticRegression(
                         max_iter=2000,
                         C=c,
-                        penalty="elasticnet",
                         solver="saga",
                         l1_ratio=l1,
                     ),
