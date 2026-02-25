@@ -34,6 +34,8 @@ from jeena_sikho_tournament.market_calendar import (
 from jeena_sikho_tournament.storage import Storage
 
 from .db import (
+    PREDICTIONS_TABLE,
+    connect,
     ensure_tables,
     get_champions,
     get_latest_prediction_for_timeframe,
@@ -622,8 +624,41 @@ def _prediction_target_timestamp(pred_at: datetime, horizon_min: int, tf_minutes
     full_steps = max(1, int(np.ceil(horizon / step)))
     target = anchor
     for _ in range(full_steps):
-        target = next_nse_slot_at_or_after(target + timedelta(minutes=step), step, _NSE_HOLIDAYS)
+        target = _next_nse_slot_strict(target + timedelta(minutes=step), step)
     return target
+
+
+def _next_nse_slot_strict(ts_utc: datetime, step_min: int) -> datetime:
+    """Return next NSE slot aligned to 09:15 IST + N*step cadence."""
+    step = max(1, int(step_min))
+    cur = ts_utc.astimezone(IST).replace(second=0, microsecond=0)
+    while True:
+        if not is_nse_run_window(cur.astimezone(timezone.utc), _NSE_HOLIDAYS) and not (
+            cur.weekday() < 5 and cur.date() not in _NSE_HOLIDAYS
+        ):
+            cur = next_nse_slot_at_or_after(cur.astimezone(timezone.utc), step, _NSE_HOLIDAYS).astimezone(IST)
+            continue
+        day_open = cur.replace(hour=9, minute=15, second=0, microsecond=0)
+        day_close = cur.replace(hour=15, minute=30, second=0, microsecond=0)
+        probe = max(cur, day_open)
+        if probe > day_close:
+            cur = next_nse_slot_at_or_after(
+                (day_close + timedelta(minutes=1)).astimezone(timezone.utc),
+                step,
+                _NSE_HOLIDAYS,
+            ).astimezone(IST)
+            continue
+        delta = int(np.ceil(max(0.0, (probe - day_open).total_seconds()) / 60.0))
+        slot_delta = int(np.ceil(delta / step) * step)
+        slot = day_open + timedelta(minutes=slot_delta)
+        if slot > day_close:
+            cur = next_nse_slot_at_or_after(
+                (day_close + timedelta(minutes=1)).astimezone(timezone.utc),
+                step,
+                _NSE_HOLIDAYS,
+            ).astimezone(IST)
+            continue
+        return slot.astimezone(timezone.utc)
 
 
 def _market_regime(now_utc: Optional[datetime] = None) -> str:
@@ -1071,6 +1106,76 @@ def update_pending_predictions(config: TournamentConfig) -> None:
             continue
         metrics = _compute_match_metrics(p.get("predicted_price"), actual)
         update_prediction(p["id"], actual, metrics["match_percent"], "ready")
+
+
+def revalidate_recent_matches(config: TournamentConfig, lookback_days: int = 10, limit: int = 5000) -> Dict[str, Any]:
+    """Recompute ready/pending match states using strict target-slot alignment."""
+    ensure_tables()
+    now_utc = datetime.now(timezone.utc)
+    cutoff_iso = (now_utc - timedelta(days=max(1, int(lookback_days)))).isoformat()
+    frames = set(get_timeframes(config))
+    updated_ready = 0
+    updated_pending = 0
+    scanned = 0
+
+    with connect() as con:
+        cur = con.execute(
+            f"""
+            SELECT id, predicted_at, predicted_price, prediction_horizon_min, timeframe_minutes, timeframe, status
+            FROM {PREDICTIONS_TABLE}
+            WHERE predicted_at >= ?
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (cutoff_iso, int(limit)),
+        )
+        rows = cur.fetchall()
+
+        for row in rows:
+            pred_id, pred_at_raw, predicted_price, horizon_raw, tfm_raw, timeframe, status = row
+            if timeframe and timeframe not in frames:
+                continue
+            scanned += 1
+            pred_at = _parse_iso_utc(pred_at_raw)
+            horizon_min = int(horizon_raw or tfm_raw or LEGACY_PREDICTION_HORIZON_MINUTES)
+            tf_minutes = int(tfm_raw or horizon_min)
+            target_ts = _prediction_target_timestamp(pred_at, horizon_min, tf_minutes)
+            target_iso = target_ts.isoformat()
+            table = "ohlcv" if tf_minutes == 60 else f"ohlcv_{tf_minutes}m"
+
+            if now_utc < target_ts:
+                if status != "pending":
+                    con.execute(
+                        f"UPDATE {PREDICTIONS_TABLE} SET actual_price_1h = NULL, match_percent = NULL, status = 'pending' WHERE id = ?",
+                        (pred_id,),
+                    )
+                    updated_pending += 1
+                continue
+
+            actual = _get_ohlcv_target_price(target_iso, table, horizon_min)
+            if actual is None:
+                if status != "pending":
+                    con.execute(
+                        f"UPDATE {PREDICTIONS_TABLE} SET actual_price_1h = NULL, match_percent = NULL, status = 'pending' WHERE id = ?",
+                        (pred_id,),
+                    )
+                    updated_pending += 1
+                continue
+
+            metrics = _compute_match_metrics(predicted_price, actual)
+            con.execute(
+                f"UPDATE {PREDICTIONS_TABLE} SET actual_price_1h = ?, match_percent = ?, status = 'ready' WHERE id = ?",
+                (actual, metrics["match_percent"], pred_id),
+            )
+            updated_ready += 1
+
+    return {
+        "ok": True,
+        "lookback_days": int(lookback_days),
+        "scanned": scanned,
+        "updated_ready": updated_ready,
+        "updated_pending": updated_pending,
+    }
 
 
 def _target_mode() -> str:
