@@ -313,6 +313,114 @@ def _should_run_weekly_reopt(now_utc: datetime, state: dict) -> bool:
     return state.get("weekly_reopt_done_for") != week_marker
 
 
+def _should_run_overdue_pending_repair(now_utc: datetime, state: dict) -> bool:
+    if os.getenv("OVERDUE_PENDING_REPAIR_ENABLE", "1").strip().lower() not in {"1", "true", "yes", "on"}:
+        return False
+    cooldown_min = max(5, int(os.getenv("OVERDUE_PENDING_REPAIR_COOLDOWN_MIN", "60")))
+    last_iso = state.get("last_overdue_pending_repair_at")
+    if not last_iso:
+        return True
+    try:
+        last = datetime.fromisoformat(last_iso)
+        if last.tzinfo is None:
+            last = last.replace(tzinfo=timezone.utc)
+        age_min = (now_utc - last.astimezone(timezone.utc)).total_seconds() / 60.0
+        return age_min >= cooldown_min
+    except Exception:
+        return True
+
+
+def _overdue_pending_report_paths(config: TournamentConfig) -> tuple[Path, Path, Path]:
+    latest = config.data_dir / "overdue_pending_latest.json"
+    history = config.data_dir / "overdue_pending_reports.jsonl"
+    alerts = config.data_dir / "overdue_pending_alerts.jsonl"
+    return latest, history, alerts
+
+
+def _append_jsonl(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+
+
+def _run_overdue_pending_repair_job(config: TournamentConfig, now_utc: datetime, state: dict) -> None:
+    try:
+        from jeena_sikho_dashboard.services import run_overdue_pending_repair
+    except Exception as exc:
+        print(f"Overdue repair job skipped: services import failed ({exc})")
+        return
+
+    lookback_days = max(1, int(os.getenv("OVERDUE_PENDING_REPAIR_LOOKBACK_DAYS", "14")))
+    revalidate_limit = max(100, int(os.getenv("OVERDUE_PENDING_REPAIR_REVALIDATE_LIMIT", "5000")))
+    sample_limit = max(1, int(os.getenv("OVERDUE_PENDING_REPAIR_SAMPLE_LIMIT", "10")))
+    alert_threshold = max(1, int(os.getenv("OVERDUE_PENDING_ALERT_THRESHOLD", "1")))
+    alert_cooldown_min = max(1, int(os.getenv("OVERDUE_PENDING_ALERT_COOLDOWN_MIN", "60")))
+
+    report = run_overdue_pending_repair(
+        config,
+        lookback_days=lookback_days,
+        revalidate_limit=revalidate_limit,
+        sample_limit=sample_limit,
+    )
+    latest_path, history_path, alerts_path = _overdue_pending_report_paths(config)
+    latest_path.parent.mkdir(parents=True, exist_ok=True)
+    latest_path.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
+    _append_jsonl(history_path, report)
+
+    state["last_overdue_pending_repair_at"] = now_utc.isoformat()
+    state["last_overdue_pending_repair_overdue"] = int((report.get("after") or {}).get("overdue_total", 0))
+    state["last_overdue_pending_repair_pending_total"] = int((report.get("after") or {}).get("pending_total", 0))
+    state["last_overdue_pending_repair_report"] = {
+        "ran_at": report.get("ran_at"),
+        "before_overdue": int((report.get("before") or {}).get("overdue_total", 0)),
+        "after_overdue": int((report.get("after") or {}).get("overdue_total", 0)),
+    }
+
+    before_overdue = int((report.get("before") or {}).get("overdue_total", 0))
+    after_overdue = int((report.get("after") or {}).get("overdue_total", 0))
+    print(
+        "Overdue pending repair completed: "
+        f"before={before_overdue} after={after_overdue} "
+        f"updated_ready={int((report.get('revalidate') or {}).get('updated_ready', 0))}"
+    )
+
+    if after_overdue < alert_threshold:
+        return
+
+    can_alert = True
+    last_alert_iso = state.get("last_overdue_pending_alert_at")
+    if last_alert_iso:
+        try:
+            last_alert = datetime.fromisoformat(last_alert_iso)
+            if last_alert.tzinfo is None:
+                last_alert = last_alert.replace(tzinfo=timezone.utc)
+            age_min = (now_utc - last_alert.astimezone(timezone.utc)).total_seconds() / 60.0
+            can_alert = age_min >= alert_cooldown_min
+        except Exception:
+            can_alert = True
+    if not can_alert:
+        return
+
+    alert_payload = {
+        "at": now_utc.isoformat(),
+        "type": "overdue_pending_repair_alert",
+        "severity": "warning",
+        "overdue_total": after_overdue,
+        "pending_total": int((report.get("after") or {}).get("pending_total", 0)),
+        "overdue_by_timeframe": (report.get("after") or {}).get("overdue_by_timeframe") or {},
+        "oldest_overdue_target": (report.get("after") or {}).get("oldest_overdue_target"),
+        "threshold": alert_threshold,
+        "source": "run_hourly",
+    }
+    _append_jsonl(alerts_path, alert_payload)
+    state["last_overdue_pending_alert_at"] = now_utc.isoformat()
+    print(
+        "ALERT overdue pending matches: "
+        f"overdue_total={after_overdue} threshold={alert_threshold} "
+        f"alerts_file={alerts_path}"
+    )
+
+
 def _run_repair_with_profile(config: TournamentConfig, lookback_days: int, label: str) -> None:
     prev = os.getenv("REPAIR_LOOKBACK_DAYS")
     os.environ["REPAIR_LOOKBACK_DAYS"] = str(max(1, lookback_days))
@@ -332,6 +440,11 @@ def _handle_maintenance_windows(config: TournamentConfig, now_utc: datetime) -> 
     now_ist = now_utc.astimezone(IST)
     marker = str(now_ist.date())
     changed = False
+
+    if _should_run_overdue_pending_repair(now_utc, state):
+        _run_overdue_pending_repair_job(config, now_utc, state)
+        changed = True
+        _save_maintenance_state(config, state)
 
     if _should_run_kite_token_healthcheck(now_utc, state):
         health = probe_kite_token_health()
@@ -405,11 +518,21 @@ def _enforce_kite_auth_guard(now_utc: datetime) -> bool:
         print("Kite auth guard: Kite is enabled but configuration is incomplete (api key/secret/client id).")
         return True
     if status.get("action_required"):
+        source = (os.getenv("PRICE_SOURCE", "auto") or "auto").strip().lower()
+        allow_fallback = os.getenv("KITE_ALLOW_YFINANCE_FALLBACK", "1").strip().lower() in {"1", "true", "yes", "on"}
         try:
             login = kite_login_url()
         except Exception:
             login = "http://127.0.0.1:8000/kite/login"
         reason = status.get("message") or "auth_refresh_required"
+        # If fallback data source is allowed, warn but do not block the cycle.
+        if allow_fallback and source in {"auto", "kite"}:
+            print(
+                "Kite auth guard warning: "
+                f"relogin required ({reason}), but yfinance fallback is enabled. Continuing this cycle. "
+                f"Refresh via: {login}"
+            )
+            return False
         print(f"Kite auth guard: relogin required ({reason}). Refresh via: {login}")
         return True
     return False

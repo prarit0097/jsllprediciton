@@ -116,8 +116,15 @@ def _populate_multiday_from_hourly(config: TournamentConfig, lookback_days: int)
     aggregated = aggregated.set_index("timestamp_utc").sort_index()
     target_storage = Storage(config.db_path, config.ohlcv_table)
     target_storage.init_db()
-    with sqlite3.connect(target_storage.db_path) as con:
+    con = sqlite3.connect(target_storage.db_path)
+    try:
         con.execute(f"DELETE FROM {target_storage.table}")
+        con.commit()
+    finally:
+        try:
+            con.close()
+        except Exception:
+            pass
     target_storage.upsert(aggregated)
     return {"inserted": int(len(aggregated)), "fetched_rows": int(len(hourly))}
 

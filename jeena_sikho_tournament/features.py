@@ -663,8 +663,9 @@ def make_supervised(
         default_event_gap, default_event_clip = 0.08, 0.05
     event_gap = float(os.getenv("EVENT_GAP_THRESHOLD", str(default_event_gap)))
     event_clip = float(os.getenv("EVENT_TARGET_CLIP", str(default_event_clip)))
+    event_clip_min_rows = max(1, int(os.getenv("EVENT_CLIP_MIN_ROWS", "50")))
     event_mask = pd.Series(False, index=df.index)
-    if "gap_from_prev_close" in df.columns:
+    if len(df) >= event_clip_min_rows and "gap_from_prev_close" in df.columns:
         event_mask = df["gap_from_prev_close"].abs() >= event_gap
         if event_mask.any():
             df.loc[event_mask, target_label] = df.loc[event_mask, target_label].clip(-event_clip, event_clip)

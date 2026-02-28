@@ -755,3 +755,159 @@ def get_ohlcv_open_at(timestamp_iso: str, table: str = "ohlcv") -> Optional[floa
     if not row:
         return None
     return float(row[0])
+
+
+def get_ohlcv_close_at_or_before(
+    timestamp_iso: str,
+    table: str = "ohlcv",
+    max_lag_minutes: Optional[int] = None,
+) -> Optional[float]:
+    try:
+        target_ts = pd.to_datetime(timestamp_iso, utc=True)
+    except Exception:
+        return None
+    try:
+        with connect() as con:
+            cur = con.execute(
+                f"""
+                SELECT timestamp_utc, close
+                FROM {table}
+                WHERE timestamp_utc <= ?
+                ORDER BY timestamp_utc DESC
+                LIMIT 1
+                """,
+                (target_ts.isoformat(),),
+            )
+            row = cur.fetchone()
+    except sqlite3.OperationalError:
+        return None
+    if not row:
+        return None
+    try:
+        found_ts = pd.to_datetime(row[0], utc=True)
+    except Exception:
+        return None
+    if max_lag_minutes is not None:
+        lag = (target_ts - found_ts).total_seconds() / 60.0
+        if lag < 0:
+            return None
+        if lag > float(max(0, int(max_lag_minutes))):
+            return None
+    return float(row[1])
+
+
+def get_ohlcv_close_at_or_after(
+    timestamp_iso: str,
+    table: str = "ohlcv",
+    max_lag_minutes: Optional[int] = None,
+) -> Optional[float]:
+    try:
+        target_ts = pd.to_datetime(timestamp_iso, utc=True)
+    except Exception:
+        return None
+    try:
+        with connect() as con:
+            cur = con.execute(
+                f"""
+                SELECT timestamp_utc, close
+                FROM {table}
+                WHERE timestamp_utc >= ?
+                ORDER BY timestamp_utc ASC
+                LIMIT 1
+                """,
+                (target_ts.isoformat(),),
+            )
+            row = cur.fetchone()
+    except sqlite3.OperationalError:
+        return None
+    if not row:
+        return None
+    try:
+        found_ts = pd.to_datetime(row[0], utc=True)
+    except Exception:
+        return None
+    if max_lag_minutes is not None:
+        lag = (found_ts - target_ts).total_seconds() / 60.0
+        if lag < 0:
+            return None
+        if lag > float(max(0, int(max_lag_minutes))):
+            return None
+    return float(row[1])
+
+
+def get_ohlcv_open_at_or_before(
+    timestamp_iso: str,
+    table: str = "ohlcv",
+    max_lag_minutes: Optional[int] = None,
+) -> Optional[float]:
+    try:
+        target_ts = pd.to_datetime(timestamp_iso, utc=True)
+    except Exception:
+        return None
+    try:
+        with connect() as con:
+            cur = con.execute(
+                f"""
+                SELECT timestamp_utc, open
+                FROM {table}
+                WHERE timestamp_utc <= ?
+                ORDER BY timestamp_utc DESC
+                LIMIT 1
+                """,
+                (target_ts.isoformat(),),
+            )
+            row = cur.fetchone()
+    except sqlite3.OperationalError:
+        return None
+    if not row:
+        return None
+    try:
+        found_ts = pd.to_datetime(row[0], utc=True)
+    except Exception:
+        return None
+    if max_lag_minutes is not None:
+        lag = (target_ts - found_ts).total_seconds() / 60.0
+        if lag < 0:
+            return None
+        if lag > float(max(0, int(max_lag_minutes))):
+            return None
+    return float(row[1])
+
+
+def get_ohlcv_open_at_or_after(
+    timestamp_iso: str,
+    table: str = "ohlcv",
+    max_lag_minutes: Optional[int] = None,
+) -> Optional[float]:
+    try:
+        target_ts = pd.to_datetime(timestamp_iso, utc=True)
+    except Exception:
+        return None
+    try:
+        with connect() as con:
+            cur = con.execute(
+                f"""
+                SELECT timestamp_utc, open
+                FROM {table}
+                WHERE timestamp_utc >= ?
+                ORDER BY timestamp_utc ASC
+                LIMIT 1
+                """,
+                (target_ts.isoformat(),),
+            )
+            row = cur.fetchone()
+    except sqlite3.OperationalError:
+        return None
+    if not row:
+        return None
+    try:
+        found_ts = pd.to_datetime(row[0], utc=True)
+    except Exception:
+        return None
+    if max_lag_minutes is not None:
+        lag = (found_ts - target_ts).total_seconds() / 60.0
+        if lag < 0:
+            return None
+        if lag > float(max(0, int(max_lag_minutes))):
+            return None
+    return float(row[1])

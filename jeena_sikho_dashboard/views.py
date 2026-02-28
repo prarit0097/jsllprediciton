@@ -7,7 +7,11 @@ from django.shortcuts import redirect, render
 from django.views.decorators.csrf import csrf_exempt
 
 from jeena_sikho_tournament.config import TournamentConfig
-from jeena_sikho_tournament.kite_client import exchange_request_token, kite_login_url
+from jeena_sikho_tournament.kite_client import (
+    exchange_request_token,
+    kite_login_url,
+    probe_kite_token_health,
+)
 
 from .services import (
     get_live_price,
@@ -63,6 +67,7 @@ def kite_callback(request):
         return JsonResponse({"error": "request_token missing"}, status=400)
     try:
         data = exchange_request_token(request_token)
+        health = probe_kite_token_health()
         access_token = (data.get("access_token") or "").strip()
         login_time = data.get("login_time")
         if hasattr(login_time, "isoformat"):
@@ -75,6 +80,9 @@ def kite_callback(request):
                 "user_name": data.get("user_name"),
                 "login_time": login_time,
                 "access_token_tail": (access_token[-6:] if access_token else None),
+                "health_ok": bool(health.get("ok")),
+                "health_error": health.get("error"),
+                "health_checked_at": health.get("checked_at"),
             },
             json_dumps_params={"default": str},
         )

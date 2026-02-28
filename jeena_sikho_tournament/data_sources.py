@@ -136,6 +136,10 @@ def _enforce_nse_slots(df: pd.DataFrame, interval_minutes: int, symbol: str) -> 
         return df
     out = df.copy()
     out.index = pd.to_datetime(out.index, utc=True)
+    # Never keep future-dated bars; they are partial/incomplete and can
+    # contaminate training/matching logic.
+    now_utc = pd.Timestamp.now(tz="UTC") + pd.Timedelta(minutes=1)
+    out = out.loc[out.index <= now_utc]
     holidays = load_nse_holidays(Path(os.getenv("APP_DATA_DIR", "data")))
     idx_local = out.index.tz_convert(IST)
     minute_of_day = idx_local.hour * 60 + idx_local.minute
@@ -173,6 +177,7 @@ def fetch_yfinance(symbol: str, start: dt.datetime, end: dt.datetime, *, auto_ad
                 end=chunk_end,
                 interval="60m",
                 auto_adjust=auto_adjust,
+                threads=False,
                 progress=False,
             )
         except Exception:

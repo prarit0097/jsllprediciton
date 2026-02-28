@@ -11,6 +11,14 @@ import numpy as np
 import pandas as pd
 import requests
 
+try:
+    # Ensure .env is available even when services are imported from ad-hoc scripts.
+    from jeena_sikho.env import load_env as _load_app_env
+
+    _load_app_env(overwrite=False)
+except Exception:
+    pass
+
 from jeena_sikho_tournament.config import TournamentConfig, _timeframe_to_minutes
 from jeena_sikho_tournament.data_sources import fetch_and_stitch
 from jeena_sikho_tournament.data_sources import _expected_nse_slots
@@ -42,7 +50,11 @@ from .db import (
     get_latest_ready_prediction_for_timeframe,
     get_latest_run,
     get_ohlcv_close_at,
+    get_ohlcv_close_at_or_after,
+    get_ohlcv_close_at_or_before,
     get_ohlcv_open_at,
+    get_ohlcv_open_at_or_after,
+    get_ohlcv_open_at_or_before,
     get_recent_ready_predictions,
     get_recent_runs,
     get_scores,
@@ -78,6 +90,7 @@ _RUN_STATE_PATH = Path(os.getenv("APP_DATA_DIR", "data")) / "run_state.json"
 _CALIB_STATE_PATH = Path(os.getenv("APP_DATA_DIR", "data")) / "calibration_state.json"
 _PRICE_CACHE: Dict[str, Any] = {}
 _FX_CACHE: Dict[str, Any] = {}
+_PENDING_SYNC_CACHE: Dict[str, datetime] = {}
 _TOURNAMENT_INTERVAL_MIN = int(os.getenv("TOURNAMENT_INTERVAL_MINUTES", "120"))
 _TOURNAMENT_START_MIN = int(os.getenv("TOURNAMENT_SCHEDULE_MINUTE", "1"))
 _NSE_HOLIDAYS = load_nse_holidays(Path(os.getenv("APP_DATA_DIR", "data")))
@@ -739,8 +752,17 @@ def _ensure_recent_data(config: TournamentConfig, days: int = 14) -> pd.DataFram
         if latest is None:
             need_fetch = True
         elif _is_indian_equity():
-            if latest < (now_utc - timedelta(days=2)):
-                need_fetch = True
+            # Keep intraday candles fresh during market hours so pending matches can close
+            # on time (avoid waiting for separate backfill loops).
+            if int(config.candle_minutes) < 1440:
+                # Intraday matching should close quickly after slot time.
+                # Keep lag budget tighter than full candle size.
+                max_lag_min = max(10, min(60, int(config.candle_minutes) // 2))
+                if latest < (now_utc - timedelta(minutes=max_lag_min)):
+                    need_fetch = True
+            else:
+                if latest < (now_utc - timedelta(days=2)):
+                    need_fetch = True
             if len(df) < 200:
                 need_fetch = True
             if "source" in df.columns:
@@ -754,7 +776,12 @@ def _ensure_recent_data(config: TournamentConfig, days: int = 14) -> pd.DataFram
         return df
     try:
         end = now_utc
-        start = end - timedelta(days=days)
+        fetch_days = days
+        # For intraday freshness, short lookback gets newer Yahoo/Kite bars than
+        # very long-range pulls and is much cheaper.
+        if _is_indian_equity() and int(config.candle_minutes) < 1440 and not df.empty:
+            fetch_days = min(fetch_days, 5)
+        start = end - timedelta(days=fetch_days)
         fetched, _ = fetch_and_stitch(
             config.symbol,
             config.yfinance_symbol,
@@ -1082,6 +1109,22 @@ def get_scoreboard(limit: int = 500) -> List[Dict[str, Any]]:
 
 def update_pending_predictions(config: TournamentConfig) -> None:
     ensure_tables()
+    # Refresh OHLCV per timeframe before closing pending matches, so target-slot
+    # candles are available as soon as source publishes them.
+    now_utc = datetime.now(timezone.utc)
+    for timeframe in get_timeframes(config):
+        tf_cfg = _config_for_timeframe(config, timeframe)
+        key = f"{timeframe}:{tf_cfg.ohlcv_table}"
+        sync_every = max(2, min(15, int(max(1, tf_cfg.candle_minutes) // 8)))
+        last_sync = _PENDING_SYNC_CACHE.get(key)
+        if last_sync and (now_utc - last_sync) < timedelta(minutes=sync_every):
+            continue
+        try:
+            _ensure_recent_data(tf_cfg)
+        except Exception:
+            pass
+        _PENDING_SYNC_CACHE[key] = now_utc
+
     cutoff = datetime.now(timezone.utc) - timedelta(minutes=1)
     cutoff_iso = cutoff.isoformat()
     pending = list_pending_predictions(cutoff_iso)
@@ -1114,6 +1157,7 @@ def revalidate_recent_matches(config: TournamentConfig, lookback_days: int = 10,
     now_utc = datetime.now(timezone.utc)
     cutoff_iso = (now_utc - timedelta(days=max(1, int(lookback_days)))).isoformat()
     frames = set(get_timeframes(config))
+    strict_demote = os.getenv("REVALIDATE_DEMOTE_READY", "0").strip().lower() in {"1", "true", "yes", "on"}
     updated_ready = 0
     updated_pending = 0
     scanned = 0
@@ -1144,7 +1188,7 @@ def revalidate_recent_matches(config: TournamentConfig, lookback_days: int = 10,
             table = "ohlcv" if tf_minutes == 60 else f"ohlcv_{tf_minutes}m"
 
             if now_utc < target_ts:
-                if status != "pending":
+                if strict_demote and status != "pending":
                     con.execute(
                         f"UPDATE {PREDICTIONS_TABLE} SET actual_price_1h = NULL, match_percent = NULL, status = 'pending' WHERE id = ?",
                         (pred_id,),
@@ -1154,7 +1198,7 @@ def revalidate_recent_matches(config: TournamentConfig, lookback_days: int = 10,
 
             actual = _get_ohlcv_target_price(target_iso, table, horizon_min)
             if actual is None:
-                if status != "pending":
+                if strict_demote and status != "pending":
                     con.execute(
                         f"UPDATE {PREDICTIONS_TABLE} SET actual_price_1h = NULL, match_percent = NULL, status = 'pending' WHERE id = ?",
                         (pred_id,),
@@ -1175,6 +1219,73 @@ def revalidate_recent_matches(config: TournamentConfig, lookback_days: int = 10,
         "scanned": scanned,
         "updated_ready": updated_ready,
         "updated_pending": updated_pending,
+    }
+
+
+def pending_overdue_snapshot(config: TournamentConfig, now_utc: Optional[datetime] = None, sample_limit: int = 10) -> Dict[str, Any]:
+    ensure_tables()
+    now = now_utc or datetime.now(timezone.utc)
+    pending = list_pending_predictions(now.isoformat())
+    overdue_total = 0
+    by_timeframe: Dict[str, int] = {}
+    samples: List[Dict[str, Any]] = []
+    oldest_target: Optional[datetime] = None
+
+    for row in pending:
+        pred_at = _parse_iso_utc(row["predicted_at"])
+        horizon_min = int(row.get("prediction_horizon_min") or row.get("timeframe_minutes") or LEGACY_PREDICTION_HORIZON_MINUTES)
+        tf_minutes = int(row.get("timeframe_minutes") or horizon_min)
+        target_ts = _prediction_target_timestamp(pred_at, horizon_min, tf_minutes)
+        if now < target_ts:
+            continue
+        overdue_total += 1
+        tf = str(row.get("timeframe") or f"{tf_minutes}m")
+        by_timeframe[tf] = int(by_timeframe.get(tf, 0)) + 1
+        if oldest_target is None or target_ts < oldest_target:
+            oldest_target = target_ts
+        if len(samples) < max(1, int(sample_limit)):
+            samples.append(
+                {
+                    "id": int(row["id"]),
+                    "timeframe": tf,
+                    "predicted_at": row.get("predicted_at"),
+                    "target_at": target_ts.isoformat(),
+                }
+            )
+
+    return {
+        "now": now.isoformat(),
+        "pending_total": int(len(pending)),
+        "overdue_total": int(overdue_total),
+        "overdue_by_timeframe": by_timeframe,
+        "oldest_overdue_target": oldest_target.isoformat() if oldest_target else None,
+        "samples": samples,
+    }
+
+
+def run_overdue_pending_repair(
+    config: TournamentConfig,
+    lookback_days: int = 14,
+    revalidate_limit: int = 5000,
+    sample_limit: int = 10,
+) -> Dict[str, Any]:
+    now = datetime.now(timezone.utc)
+    before = pending_overdue_snapshot(config, now_utc=now, sample_limit=sample_limit)
+    update_pending_predictions(config)
+    revalidate = revalidate_recent_matches(
+        config,
+        lookback_days=max(1, int(lookback_days)),
+        limit=max(100, int(revalidate_limit)),
+    )
+    after = pending_overdue_snapshot(config, now_utc=datetime.now(timezone.utc), sample_limit=sample_limit)
+    return {
+        "ok": True,
+        "ran_at": datetime.now(timezone.utc).isoformat(),
+        "lookback_days": int(max(1, int(lookback_days))),
+        "revalidate_limit": int(max(100, int(revalidate_limit))),
+        "before": before,
+        "after": after,
+        "revalidate": revalidate,
     }
 
 
@@ -1215,13 +1326,78 @@ def _confidence_thresholds_for_horizon(horizon_min: int) -> tuple[float, float]:
 
 def _get_ohlcv_target_price(target_iso: str, table: str, horizon_min: int) -> Optional[float]:
     # Daily open-mode compares against trading-day 09:15 open for all >=1d horizons.
+    nearest_on = os.getenv("MATCH_NEAREST_CANDLE_FALLBACK", "1").strip().lower() in {"1", "true", "yes", "on"}
+    max_lag_env = os.getenv("MATCH_NEAREST_MAX_LAG_MIN", "").strip()
+    try:
+        max_lag_cfg = int(max_lag_env) if max_lag_env else None
+    except Exception:
+        max_lag_cfg = None
+    default_lag = max(30, int(max(1, horizon_min) * 2))
+    if max_lag_cfg is not None and max_lag_cfg > 0:
+        # Keep env override as minimum floor, but never stricter than horizon-aware default.
+        max_lag = max(int(max_lag_cfg), int(default_lag))
+    else:
+        max_lag = default_lag
+
+    # For NSE intraday horizons, evaluate against base 1h spot close at target slot.
+    # This keeps actual-price matching consistent across 1h/2h/... when target time is same.
+    if _is_indian_equity() and int(horizon_min) < 1440:
+        px = get_ohlcv_close_at(target_iso, table="ohlcv")
+        if px is not None:
+            return px
+        if nearest_on:
+            px = get_ohlcv_close_at_or_after(target_iso, table="ohlcv", max_lag_minutes=max_lag)
+            if px is not None:
+                return px
+            px = get_ohlcv_close_at_or_before(target_iso, table="ohlcv", max_lag_minutes=max_lag)
+            if px is not None:
+                return px
+        # Last-resort fallback to the horizon table so we don't stall indefinitely
+        # if base table is temporarily unavailable.
+        px = get_ohlcv_close_at(target_iso, table=table)
+        if px is not None:
+            return px
+        if nearest_on:
+            px = get_ohlcv_close_at_or_after(target_iso, table=table, max_lag_minutes=max_lag)
+            if px is not None:
+                return px
+            return get_ohlcv_close_at_or_before(target_iso, table=table, max_lag_minutes=max_lag)
+        return None
+
     if _is_indian_equity() and int(horizon_min) >= 1440 and _daily_target_point() == "open":
         # Daily/nd tables are stamped at close; opening tick lives in 1h base table.
         px = get_ohlcv_open_at(target_iso, table="ohlcv")
         if px is not None:
             return px
-        return get_ohlcv_open_at(target_iso, table=table)
-    return get_ohlcv_close_at(target_iso, table=table)
+        px = get_ohlcv_open_at(target_iso, table=table)
+        if px is not None:
+            return px
+        if nearest_on:
+            # Prefer at/after fallback first to avoid pulling stale prior-session opens
+            # when the exact target candle is delayed at source.
+            px = get_ohlcv_open_at_or_after(target_iso, table="ohlcv", max_lag_minutes=max_lag)
+            if px is not None:
+                return px
+            px = get_ohlcv_open_at_or_after(target_iso, table=table, max_lag_minutes=max_lag)
+            if px is not None:
+                return px
+            px = get_ohlcv_open_at_or_before(target_iso, table="ohlcv", max_lag_minutes=max_lag)
+            if px is not None:
+                return px
+            return get_ohlcv_open_at_or_before(target_iso, table=table, max_lag_minutes=max_lag)
+        return None
+
+    px = get_ohlcv_close_at(target_iso, table=table)
+    if px is not None:
+        return px
+    if nearest_on:
+        # Prefer at/after fallback first to avoid stale prior-slot closes when
+        # target slot arrives late from data source.
+        px = get_ohlcv_close_at_or_after(target_iso, table=table, max_lag_minutes=max_lag)
+        if px is not None:
+            return px
+        return get_ohlcv_close_at_or_before(target_iso, table=table, max_lag_minutes=max_lag)
+    return None
 
 
 def _target_scale_from_latest(latest_row: pd.DataFrame) -> float:
@@ -1245,6 +1421,30 @@ def _denorm_return(pred_model: float, latest_row: pd.DataFrame, mode: Optional[s
     return float(pred_model)
 
 
+def _sanitize_model_input(latest_row: pd.DataFrame, feature_cols: List[str]) -> pd.DataFrame:
+    # Keep prediction path resilient: some exogenous/features can be missing for latest bar.
+    X = latest_row.reindex(columns=feature_cols, fill_value=0.0).copy()
+    X = X.replace([np.inf, -np.inf], np.nan)
+    # Force numeric matrix for sklearn and collapse any residual NaN/NA safely.
+    for col in X.columns:
+        X[col] = pd.to_numeric(X[col], errors="coerce")
+    X = X.fillna(0.0)
+    arr = np.nan_to_num(X.to_numpy(dtype=np.float64, copy=False), nan=0.0, posinf=0.0, neginf=0.0)
+    return pd.DataFrame(arr, index=X.index, columns=X.columns)
+
+
+def _safe_predict_scalar(model: Any, X: pd.DataFrame, model_id: str) -> Optional[float]:
+    try:
+        pred = float(model.predict(X)[0])
+    except Exception as exc:
+        LOGGER.warning("Model predict failed (%s): %s", model_id, exc)
+        return None
+    if not np.isfinite(pred):
+        LOGGER.warning("Model predict non-finite (%s)", model_id)
+        return None
+    return pred
+
+
 def _predict_return_from_champion(config: TournamentConfig, latest_row: pd.DataFrame) -> Optional[Dict[str, Any]]:
     reg = _load_registry(config.registry_path)
     champ = reg.get("champions", {}).get("return")
@@ -1259,8 +1459,11 @@ def _predict_return_from_champion(config: TournamentConfig, latest_row: pd.DataF
 
     model = joblib.load(model_path)
     feature_cols = _resolve_feature_cols(model, champ.get("feature_cols", []))
-    X = latest_row.reindex(columns=feature_cols, fill_value=0.0)
-    pred_model = float(model.predict(X)[0])
+    X = _sanitize_model_input(latest_row, feature_cols)
+    model_id = str(champ.get("model_id", "return_champion"))
+    pred_model = _safe_predict_scalar(model, X, model_id)
+    if pred_model is None:
+        return None
     pred = _denorm_return(pred_model, latest_row, champ.get("target_mode"))
     score = float(champ.get("final_score") or 0.0)
     confidence_pct = _champion_confidence(score)
@@ -1304,10 +1507,17 @@ def _predict_return_from_ensemble(config: TournamentConfig, latest_row: pd.DataF
             continue
         if not Path(model_path).exists():
             continue
-        model = joblib.load(model_path)
+        model_id = str(member.get("model_id", "unknown"))
+        try:
+            model = joblib.load(model_path)
+        except Exception as exc:
+            LOGGER.warning("Model load failed (%s): %s", model_id, exc)
+            continue
         feature_cols = _resolve_feature_cols(model, member.get("feature_cols", []))
-        X = latest_row.reindex(columns=feature_cols, fill_value=0.0)
-        pred_model = float(model.predict(X)[0])
+        X = _sanitize_model_input(latest_row, feature_cols)
+        pred_model = _safe_predict_scalar(model, X, model_id)
+        if pred_model is None:
+            continue
         pred_val = _denorm_return(pred_model, latest_row, member.get("target_mode"))
         if not np.isfinite(pred_val):
             continue
@@ -1317,7 +1527,6 @@ def _predict_return_from_ensemble(config: TournamentConfig, latest_row: pd.DataF
         except (TypeError, ValueError):
             weight_val = 1.0
         fs_id = str(member.get("feature_set_id") or "")
-        model_id = member.get("model_id", "unknown")
         err_boost = float(error_weights.get(model_id, 0.0))
         regime_gate = float(regime_weights.get(model_id, 0.0))
         regime_bonus = 0.2 if fs_id in pref else 0.0
@@ -1401,8 +1610,12 @@ def _predict_return_from_direction(config: TournamentConfig, latest_row: pd.Data
 
     model = joblib.load(model_path)
     feature_cols = _resolve_feature_cols(model, champ.get("feature_cols", []))
-    X = latest_row.reindex(columns=feature_cols, fill_value=0.0)
-    direction = int(model.predict(X)[0])
+    X = _sanitize_model_input(latest_row, feature_cols)
+    model_id = str(champ.get("model_id", "direction_champion"))
+    pred_dir = _safe_predict_scalar(model, X, model_id)
+    if pred_dir is None:
+        return None
+    direction = int(round(pred_dir))
 
     recent = df["close"].pct_change().dropna().tail(24)
     avg_move = float(np.abs(recent).mean()) if not recent.empty else 0.002
@@ -2068,9 +2281,13 @@ def _decorate_pending_target(row: Dict[str, Any], horizon_min: int) -> Dict[str,
     return row
 
 
+def _pending_update_while_running_enabled() -> bool:
+    return os.getenv("PENDING_MATCH_UPDATE_WHILE_RUNNING", "1").strip().lower() in {"1", "true", "yes", "on"}
+
+
 def refresh_prediction(config: TournamentConfig) -> Dict[str, Any]:
     if _RUN_STATE.get("running"):
-        return latest_prediction(config, update_pending=False)
+        return latest_prediction(config, update_pending=True)
     ensure_tables()
     update_pending_predictions(config)
     predictions: List[Dict[str, Any]] = []
@@ -2166,8 +2383,22 @@ def refresh_prediction(config: TournamentConfig) -> Dict[str, Any]:
             )
             continue
 
-        df = _ensure_recent_data(tf_cfg)
-        sup = make_supervised(df, candle_minutes=tf_cfg.candle_minutes, feature_windows_hours=tf_cfg.feature_windows)
+        try:
+            df = _ensure_recent_data(tf_cfg)
+            sup = make_supervised(df, candle_minutes=tf_cfg.candle_minutes, feature_windows_hours=tf_cfg.feature_windows)
+        except Exception as exc:
+            LOGGER.exception("feature/supervised build failed (timeframe=%s)", timeframe)
+            predictions.append(
+                {
+                    "timeframe": timeframe,
+                    "timeframe_minutes": horizon_min,
+                    "prediction_horizon_min": horizon_min,
+                    "prediction_target": target_label,
+                    "status": "no_data",
+                    "error": str(exc),
+                }
+            )
+            continue
         if sup.empty:
             predictions.append(
                 {
@@ -2182,12 +2413,22 @@ def refresh_prediction(config: TournamentConfig) -> Dict[str, Any]:
         latest_row = sup.iloc[-1:]
 
         regime = _market_regime()
-        pred = _predict_return_from_ensemble(tf_cfg, latest_row, regime=regime)
+        pred: Optional[Dict[str, Any]] = None
+        try:
+            pred = _predict_return_from_ensemble(tf_cfg, latest_row, regime=regime)
+        except Exception:
+            LOGGER.exception("ensemble prediction failed (timeframe=%s)", timeframe)
         prediction_target = target_label
         if pred is None:
-            pred = _predict_return_from_champion(tf_cfg, latest_row)
+            try:
+                pred = _predict_return_from_champion(tf_cfg, latest_row)
+            except Exception:
+                LOGGER.exception("champion prediction failed (timeframe=%s)", timeframe)
         if pred is None:
-            pred = _predict_return_from_direction(tf_cfg, latest_row, df)
+            try:
+                pred = _predict_return_from_direction(tf_cfg, latest_row, df)
+            except Exception:
+                LOGGER.exception("direction fallback prediction failed (timeframe=%s)", timeframe)
             prediction_target = f"direction_{target_label}"
         if pred is None:
             predictions.append(
@@ -2253,8 +2494,14 @@ def refresh_prediction(config: TournamentConfig) -> Dict[str, Any]:
             "predicted_price_high": high_price,
             "regime": pred.get("regime") or regime,
         }
-        pred_id = insert_prediction(record)
-        record["id"] = pred_id
+        try:
+            pred_id = insert_prediction(record)
+            record["id"] = pred_id
+        except Exception as exc:
+            LOGGER.exception("insert prediction failed (timeframe=%s)", timeframe)
+            record["id"] = None
+            record["status"] = "error"
+            record["error"] = str(exc)
         record["bias_correction"] = bias
         if skipped_low_conf:
             record["note"] = f"skipped due to low confidence < {skip_threshold:.1f}%"
@@ -2280,8 +2527,12 @@ def refresh_prediction(config: TournamentConfig) -> Dict[str, Any]:
 
 
 def latest_prediction(config: TournamentConfig, update_pending: bool = True) -> Optional[Dict[str, Any]]:
-    if update_pending and not _RUN_STATE.get("running"):
-        update_pending_predictions(config)
+    running = bool(_RUN_STATE.get("running"))
+    if update_pending and ((not running) or _pending_update_while_running_enabled()):
+        try:
+            update_pending_predictions(config)
+        except Exception:
+            LOGGER.exception("pending update failed in latest_prediction")
     predictions: List[Dict[str, Any]] = []
     prod_gate_enable = os.getenv("PRODUCTION_GATE_ENABLE", "1").strip().lower() in {"1", "true", "yes", "on"}
     prod_ready = _production_ready_map(config) if prod_gate_enable else {}

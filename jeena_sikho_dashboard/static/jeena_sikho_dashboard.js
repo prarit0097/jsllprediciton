@@ -337,6 +337,17 @@ function statusText(pred) {
   }
   if (pred.status === 'pending') {
     const horizonMin = predictionMinutes(pred);
+    let targetMs = null;
+    if (pred.target_iso) {
+      const parsed = new Date(pred.target_iso).getTime();
+      if (!Number.isNaN(parsed)) targetMs = parsed;
+    } else if (pred.predicted_at && horizonMin) {
+      const start = new Date(pred.predicted_at).getTime();
+      if (!Number.isNaN(start)) targetMs = start + horizonMin * 60 * 1000;
+    }
+    if (targetMs !== null && targetMs <= Date.now()) {
+      return 'awaiting source candle';
+    }
     return formatNextMatchLabel(pred.predicted_at, horizonMin, pred.target_iso || null);
   }
   if (pred.status && pred.status !== 'ready') {

@@ -1,5 +1,6 @@
 ﻿import os
 import sqlite3
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Optional
 
@@ -15,12 +16,30 @@ class Storage:
     def _connect(self) -> sqlite3.Connection:
         return sqlite3.connect(self.db_path)
 
+    @contextmanager
+    def _connect_ctx(self):
+        con = self._connect()
+        try:
+            yield con
+            con.commit()
+        except Exception:
+            try:
+                con.rollback()
+            except Exception:
+                pass
+            raise
+        finally:
+            try:
+                con.close()
+            except Exception:
+                pass
+
     def _table_columns(self, con: sqlite3.Connection) -> set:
         cur = con.execute(f"PRAGMA table_info({self.table})")
         return {row[1] for row in cur.fetchall()}
 
     def init_db(self) -> None:
-        with self._connect() as con:
+        with self._connect_ctx() as con:
             con.execute(
                 f"""
                 CREATE TABLE IF NOT EXISTS {self.table} (
@@ -64,12 +83,14 @@ class Storage:
     def load(self) -> pd.DataFrame:
         if not self.db_path.exists():
             return pd.DataFrame()
-        with self._connect() as con:
-            df = pd.read_sql_query(
-                f"SELECT timestamp_utc, open, high, low, close, volume, source FROM {self.table} ORDER BY timestamp_utc",
-                con,
-                parse_dates=["timestamp_utc"],
+        with self._connect_ctx() as con:
+            cur = con.execute(
+                f"SELECT timestamp_utc, open, high, low, close, volume, source FROM {self.table} ORDER BY timestamp_utc"
             )
+            rows = cur.fetchall()
+            cols = [desc[0] for desc in (cur.description or [])]
+            cur.close()
+        df = pd.DataFrame.from_records(rows, columns=cols)
         if df.empty:
             return df
         df = df.set_index("timestamp_utc")
@@ -98,7 +119,7 @@ class Storage:
             )
             for idx, row in df.iterrows()
         ]
-        with self._connect() as con:
+        with self._connect_ctx() as con:
             con.executemany(
                 f"""
                 INSERT OR REPLACE INTO {self.table} (timestamp_utc, open, high, low, close, volume, source)
@@ -141,7 +162,7 @@ class Storage:
     def trim(self, min_timestamp: pd.Timestamp) -> None:
         if not self.db_path.exists():
             return
-        with self._connect() as con:
+        with self._connect_ctx() as con:
             con.execute(
                 f"DELETE FROM {self.table} WHERE timestamp_utc < ?",
                 (min_timestamp.isoformat(),),
@@ -150,7 +171,7 @@ class Storage:
     def clean_nans(self) -> int:
         if not self.db_path.exists():
             return 0
-        with self._connect() as con:
+        with self._connect_ctx() as con:
             cur = con.execute(
                 f"""
                 DELETE FROM {self.table}
