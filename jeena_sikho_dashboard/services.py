@@ -96,6 +96,28 @@ _TOURNAMENT_START_MIN = int(os.getenv("TOURNAMENT_SCHEDULE_MINUTE", "1"))
 _NSE_HOLIDAYS = load_nse_holidays(Path(os.getenv("APP_DATA_DIR", "data")))
 
 
+def _app_base_prefix() -> str:
+    raw = (os.getenv("APP_BASE_PREFIX", "") or "").strip()
+    if not raw:
+        return ""
+    if not raw.startswith("/"):
+        raw = f"/{raw}"
+    return raw.rstrip("/")
+
+
+def _with_base_prefix(path: str) -> str:
+    base = _app_base_prefix()
+    if not path:
+        return base or "/"
+    if not path.startswith("/"):
+        path = f"/{path}"
+    if not base:
+        return path
+    if path == "/":
+        return f"{base}/"
+    return f"{base}{path}"
+
+
 def _load_calib_state() -> Dict[str, Any]:
     if not _CALIB_STATE_PATH.exists():
         return {}
@@ -1016,7 +1038,7 @@ def get_kite_auth_status() -> Dict[str, Any]:
         "health_reasons": reasons,
         "health_max_age_min": relogin.get("health_max_age_min"),
         "action_required": action_required,
-        "login_url": "/kite/login",
+        "login_url": _with_base_prefix("/kite/login"),
     }
 
 

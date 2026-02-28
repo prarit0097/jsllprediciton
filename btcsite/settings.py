@@ -1,10 +1,23 @@
+import os
 from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
-SECRET_KEY = 'dev-secret-key-change-me'
-DEBUG = True
-ALLOWED_HOSTS = ['localhost', '127.0.0.1']
+
+def _env_list(name: str, default: str = "") -> list[str]:
+    raw = os.getenv(name, default)
+    out: list[str] = []
+    for token in raw.replace(";", ",").split(","):
+        item = token.strip()
+        if item:
+            out.append(item)
+    return out
+
+
+SECRET_KEY = os.getenv("DJANGO_SECRET_KEY", "dev-secret-key-change-me")
+DEBUG = os.getenv("DJANGO_DEBUG", "1").strip().lower() in {"1", "true", "yes", "on"}
+ALLOWED_HOSTS = _env_list("DJANGO_ALLOWED_HOSTS", "localhost,127.0.0.1")
+CSRF_TRUSTED_ORIGINS = _env_list("DJANGO_CSRF_TRUSTED_ORIGINS", "")
 
 INSTALLED_APPS = [
     'django.contrib.admin',
@@ -61,8 +74,12 @@ TIME_ZONE = 'UTC'
 USE_I18N = True
 USE_TZ = True
 
-STATIC_URL = 'static/'
+STATIC_URL = os.getenv("DJANGO_STATIC_URL", "/static/")
 STATICFILES_DIRS = [BASE_DIR / 'static']
+STATIC_ROOT = Path(os.getenv("DJANGO_STATIC_ROOT", str(BASE_DIR / "staticfiles")))
+
+USE_X_FORWARDED_HOST = True
+SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
 
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 

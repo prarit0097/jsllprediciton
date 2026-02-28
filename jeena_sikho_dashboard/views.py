@@ -35,7 +35,16 @@ def _config() -> TournamentConfig:
 def dashboard(request):
     brand_name = os.getenv("APP_BRAND_NAME", "Jeena Sikho")
     market_label = os.getenv("APP_MARKET_LABEL", "Jeena Sikho")
-    api_prefix = os.getenv("APP_API_PREFIX", "/api/jeena-sikho").strip() or "/api/jeena-sikho"
+    base_prefix = (os.getenv("APP_BASE_PREFIX", "") or "").strip()
+    if base_prefix and not base_prefix.startswith("/"):
+        base_prefix = f"/{base_prefix}"
+    base_prefix = base_prefix.rstrip("/")
+
+    api_prefix_env = (os.getenv("APP_API_PREFIX", "") or "").strip()
+    if api_prefix_env:
+        api_prefix = api_prefix_env
+    else:
+        api_prefix = f"{base_prefix}/api/jeena-sikho" if base_prefix else "/api/jeena-sikho"
     if not api_prefix.startswith("/"):
         api_prefix = f"/{api_prefix}"
     return render(
