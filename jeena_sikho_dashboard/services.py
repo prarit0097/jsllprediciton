@@ -26,6 +26,7 @@ from .db import (
     ensure_tables,
     get_champions,
     get_latest_prediction_for_timeframe,
+    get_latest_ready_prediction_fallback,
     get_latest_ready_prediction_for_timeframe,
     get_latest_run,
     get_ohlcv_close_at,
@@ -1367,6 +1368,16 @@ def _decorate_last_ready(last_ready: Optional[Dict[str, Any]], horizon_min: int)
     return last_ready
 
 
+def _resolve_last_ready(timeframe: str, horizon_min: int) -> Optional[Dict[str, Any]]:
+    exact = get_latest_ready_prediction_for_timeframe(timeframe)
+    if exact:
+        return _decorate_last_ready(exact, horizon_min)
+    fallback = get_latest_ready_prediction_fallback(timeframe, horizon_min)
+    if fallback:
+        return _decorate_last_ready(fallback, horizon_min)
+    return None
+
+
 def _decorate_pending_target(row: Dict[str, Any], horizon_min: int) -> Dict[str, Any]:
     try:
         pred_at = _parse_iso_utc(row["predicted_at"])
@@ -1410,20 +1421,14 @@ def refresh_prediction(config: TournamentConfig) -> Dict[str, Any]:
             if datetime.now(timezone.utc) - pred_at < timedelta(minutes=cooldown):
                 _apply_match_fields(latest)
                 _decorate_pending_target(latest, horizon_min)
-                latest["last_ready"] = _decorate_last_ready(
-                    get_latest_ready_prediction_for_timeframe(timeframe),
-                    horizon_min,
-                )
+                latest["last_ready"] = _resolve_last_ready(timeframe, horizon_min)
                 predictions.append(latest)
                 continue
 
         if _is_indian_equity() and market_open is False and latest:
             _apply_match_fields(latest)
             latest["status"] = latest.get("status") or "market_closed"
-            latest["last_ready"] = _decorate_last_ready(
-                get_latest_ready_prediction_for_timeframe(timeframe),
-                horizon_min,
-            )
+            latest["last_ready"] = _resolve_last_ready(timeframe, horizon_min)
             predictions.append(latest)
             continue
 
@@ -1567,10 +1572,7 @@ def latest_prediction(config: TournamentConfig, update_pending: bool = True) -> 
         if latest:
             _apply_match_fields(latest)
             _decorate_pending_target(latest, horizon_min)
-            latest["last_ready"] = _decorate_last_ready(
-                get_latest_ready_prediction_for_timeframe(timeframe),
-                horizon_min,
-            )
+            latest["last_ready"] = _resolve_last_ready(timeframe, horizon_min)
             predictions.append(latest)
         else:
             predictions.append(

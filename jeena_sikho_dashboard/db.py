@@ -653,6 +653,76 @@ def get_latest_ready_prediction_for_timeframe(timeframe: str) -> Optional[Dict[s
     }
 
 
+def get_latest_ready_prediction_fallback(timeframe: str, horizon_minutes: int) -> Optional[Dict[str, Any]]:
+    ensure_tables()
+    hm = max(1, int(horizon_minutes or 0))
+    with connect() as con:
+        cur = con.execute(
+            """
+            SELECT id, predicted_at, current_price, predicted_return, predicted_price,
+                   predicted_price_low, predicted_price_high, actual_price_1h, match_percent, status, model_name,
+                   feature_set, run_id, prediction_target, prediction_horizon_min, timeframe, timeframe_minutes,
+                   confidence_pct, low_confidence, regime
+            FROM btc_predictions
+            WHERE status = 'ready'
+              AND (
+                    timeframe = ?
+                 OR prediction_horizon_min = ?
+                 OR timeframe_minutes = ?
+              )
+            ORDER BY
+                CASE
+                    WHEN timeframe = ? THEN 0
+                    WHEN prediction_horizon_min = ? THEN 1
+                    WHEN timeframe_minutes = ? THEN 2
+                    ELSE 3
+                END,
+                id DESC
+            LIMIT 1
+            """,
+            (timeframe, hm, hm, timeframe, hm, hm),
+        )
+        row = cur.fetchone()
+        if not row:
+            cur = con.execute(
+                """
+                SELECT id, predicted_at, current_price, predicted_return, predicted_price,
+                       predicted_price_low, predicted_price_high, actual_price_1h, match_percent, status, model_name,
+                       feature_set, run_id, prediction_target, prediction_horizon_min, timeframe, timeframe_minutes,
+                       confidence_pct, low_confidence, regime
+                FROM btc_predictions
+                WHERE status = 'ready'
+                ORDER BY id DESC
+                LIMIT 1
+                """
+            )
+            row = cur.fetchone()
+    if not row:
+        return None
+    return {
+        "id": row[0],
+        "predicted_at": row[1],
+        "current_price": row[2],
+        "predicted_return": row[3],
+        "predicted_price": row[4],
+        "predicted_price_low": row[5],
+        "predicted_price_high": row[6],
+        "actual_price_1h": row[7],
+        "match_percent": row[8],
+        "status": row[9],
+        "model_name": row[10],
+        "feature_set": row[11],
+        "run_id": row[12],
+        "prediction_target": row[13],
+        "prediction_horizon_min": row[14],
+        "timeframe": row[15],
+        "timeframe_minutes": row[16],
+        "confidence_pct": row[17],
+        "low_confidence": bool(row[18]) if row[18] is not None else None,
+        "regime": row[19],
+    }
+
+
 def get_recent_ready_predictions(timeframe: str, limit: int) -> List[Dict[str, Any]]:
     ensure_tables()
     with connect() as con:
