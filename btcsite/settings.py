@@ -109,8 +109,10 @@ TIME_ZONE = 'UTC'
 USE_I18N = True
 USE_TZ = True
 
-STATIC_URL = 'static/'
+STATIC_URL = _env_first(["STATIC_URL", "DJANGO_STATIC_URL"], "static/")
 STATICFILES_DIRS = [BASE_DIR / 'static']
+_static_root = _env_first(["STATIC_ROOT", "DJANGO_STATIC_ROOT"], "")
+STATIC_ROOT = Path(_static_root) if _static_root else (BASE_DIR / "staticfiles")
 
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 
