@@ -1,10 +1,32 @@
+import os
 from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
-SECRET_KEY = 'dev-secret-key-change-me'
-DEBUG = True
-ALLOWED_HOSTS = ['localhost', '127.0.0.1']
+
+def _env_flag(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_list(name: str, default: list[str]) -> list[str]:
+    raw = os.getenv(name, "")
+    if not raw.strip():
+        return default
+    items = [part.strip() for part in raw.split(",")]
+    return [item for item in items if item]
+
+
+SECRET_KEY = os.getenv("SECRET_KEY", "dev-secret-key-change-me")
+DEBUG = _env_flag("DEBUG", True)
+ALLOWED_HOSTS = _env_list("ALLOWED_HOSTS", ["localhost", "127.0.0.1", "api.seestox.com"])
+CSRF_TRUSTED_ORIGINS = _env_list(
+    "CSRF_TRUSTED_ORIGINS",
+    ["https://api.seestox.com"],
+)
+SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
 
 INSTALLED_APPS = [
     'django.contrib.admin',
