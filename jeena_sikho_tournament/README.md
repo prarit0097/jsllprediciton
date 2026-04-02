@@ -1,106 +1,68 @@
-# BTC Tournament
+# JSLL Tournament Package
 
-Personal Bitcoin model tournament that trains many models on 10-minute candles and selects champions.
+This package contains the training, prediction, data-quality, and repair logic used by the JSLL web app.
 
-## Quick Start
+## Responsibilities
 
-1) Install deps:
+- fetch and stitch OHLCV data
+- align data to NSE market sessions and holidays
+- engineer horizon-aware features
+- build supervised targets
+- run candidate tournaments
+- pick champions by task/horizon
+- generate predictions and evaluation artifacts
+- detect drift and trigger retrain recommendations
+- repair/backfill missing data windows
 
-```
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-pip install -r requirements.txt
-```
+## Main Entry Commands
 
-2) Backfill from 2015 (auto on first run):
+Run scheduled tournament flow:
 
-```
+```powershell
 python -m jeena_sikho_tournament.run_hourly
 ```
 
-Alias (same behavior, clearer name for 10m setup):
+Equivalent wrapper used elsewhere in the repo:
 
-```
-python -m jeena_sikho_tournament.run_10m
-```
-
-If you use a CryptoCompare API key, put it in `.env`:
-
-```
-CRYPTOCOMPARE_API_KEY=YOUR_KEY
+```powershell
+python -m jeena_sikho.run_hourly
 ```
 
-3) View champion status:
+Run repair flow:
 
-Open `data/registry.json`.
-
-4) Run prediction:
-
-```
-python -m jeena_sikho_tournament.predict
+```powershell
+python -m jeena_sikho_tournament.run_repair
 ```
 
-5) Run doctor (self-check + smoke test):
+Wrapper alias:
 
+```powershell
+python -m jeena_sikho.run_repair
 ```
+
+Run doctor:
+
+```powershell
 python -m jeena_sikho_tournament.doctor
 ```
 
-## Data backfill and sources
+## Main Modules
 
-- Data starts at **2015-01-01 00:00:00 UTC** by default.
-- Multi-source stitching order: Binance (ccxt) > CryptoCompare (if available) > yfinance.
-- For 10m candles, Binance may not support the interval; CryptoCompare histoMinute (aggregate=10) is used.
-- The system merges by timestamp, keeps highest-priority source, and reports coverage (earliest, total, missing-interval gaps).
+- `config.py`: configuration model and env-driven knobs
+- `data_sources.py`: source stitching and priority handling
+- `features.py`: feature engineering and supervised-frame creation
+- `predict.py`: prediction helpers
+- `tournament.py`: candidate evaluation and champion selection
+- `registry.py`: registry/champion structures
+- `validator.py`: leakage/data-quality validation helpers
+- `repair.py`: repair/backfill logic
+- `market_calendar.py`: NSE session calendar logic
+- `run_hourly.py`: orchestration entrypoint
+- `run_repair.py`: repair orchestration entrypoint
+- `doctor.py`: diagnostics/self-check
 
-## Config knobs
+## Notes
 
-Edit `jeena_sikho_tournament/config.py`:
-
-- `start_date_utc`: earliest timestamp (default 2015-01-01)
-- `timeframe`: candle interval (default `10m`)
-- `candle_minutes`: derived from timeframe
-- `ohlcv_table`: storage table derived from timeframe (e.g., `ohlcv_10m`)
-- `max_candidates_total`: total cap across all tournaments
-- `max_candidates_per_target`: per-target cap
-- `max_workers`: parallel workers
-- `model_timeout_sec`: per-model timeout
-- `run_mode`: `hourly|six_hourly|daily|all`
-- `enable_dl`: enable heavy MLP candidates (daily only)
-
-## Candidate counts
-
-Default model specs count is ~92. With 5 feature sets, that yields ~460 raw candidates.
-Default caps reduce this to:
-- `max_candidates_total=240`
-- `max_candidates_per_target=100`
-
-To reduce load, lower those caps. To increase, raise caps and install optional boosters:
-- `xgboost`
-- `lightgbm`
-- `catboost`
-
-## Scheduler
-
-You can run hourly with any scheduler (Task Scheduler, cron) using:
-
-```
-python -m jeena_sikho_tournament.run_hourly
-```
-
-Override run mode via env var:
-
-```
-set RUN_MODE=hourly
-python -m jeena_sikho_tournament.run_hourly
-```
-
-## Doctor checks and common fixes
-
-The doctor command validates structure, dependencies, storage, data coverage, feature leakage guards, model zoo size, a dry-run tournament, registry/champion, and prediction output.
-
-Common fixes:
-- Missing deps: `pip install -r requirements.txt`
-- Stale data: run `python -m jeena_sikho_tournament.run_hourly` to refresh cache
-- Too few candidates: increase `max_candidates_total` / `max_candidates_per_target`
-
+- The package is now JSLL/NSE-oriented, not the older BTC-focused setup.
+- Runtime behavior depends heavily on `.env` values such as `MARKET_TIMEFRAMES`, `RUN_MODE`, `STRICT_DATA_QUALITY`, and holiday settings.
+- Production dashboard consumers read the outputs of this package through `jeena_sikho_dashboard.services`.
