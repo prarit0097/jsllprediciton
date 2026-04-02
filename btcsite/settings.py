@@ -19,11 +19,37 @@ def _env_list(name: str, default: list[str]) -> list[str]:
     return [item for item in items if item]
 
 
-SECRET_KEY = os.getenv("SECRET_KEY", "dev-secret-key-change-me")
-DEBUG = _env_flag("DEBUG", True)
-ALLOWED_HOSTS = _env_list("ALLOWED_HOSTS", ["localhost", "127.0.0.1", "api.seestox.com"])
-CSRF_TRUSTED_ORIGINS = _env_list(
-    "CSRF_TRUSTED_ORIGINS",
+def _env_first(names: list[str], default: str) -> str:
+    for name in names:
+        value = os.getenv(name)
+        if value is not None and value != "":
+            return value
+    return default
+
+
+def _env_flag_alias(names: list[str], default: bool) -> bool:
+    for name in names:
+        if os.getenv(name) is not None:
+            return _env_flag(name, default)
+    return default
+
+
+def _env_list_alias(names: list[str], default: list[str]) -> list[str]:
+    for name in names:
+        raw = os.getenv(name)
+        if raw is not None and raw.strip():
+            return _env_list(name, default)
+    return default
+
+
+SECRET_KEY = _env_first(["SECRET_KEY", "DJANGO_SECRET_KEY"], "dev-secret-key-change-me")
+DEBUG = _env_flag_alias(["DEBUG", "DJANGO_DEBUG"], True)
+ALLOWED_HOSTS = _env_list_alias(
+    ["ALLOWED_HOSTS", "DJANGO_ALLOWED_HOSTS"],
+    ["localhost", "127.0.0.1", "api.seestox.com"],
+)
+CSRF_TRUSTED_ORIGINS = _env_list_alias(
+    ["CSRF_TRUSTED_ORIGINS", "DJANGO_CSRF_TRUSTED_ORIGINS"],
     ["https://api.seestox.com"],
 )
 SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
