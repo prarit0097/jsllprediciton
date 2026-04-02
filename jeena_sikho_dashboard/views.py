@@ -30,6 +30,10 @@ def dashboard(request):
     brand_name = os.getenv("APP_BRAND_NAME", "Jeena Sikho")
     market_label = os.getenv("APP_MARKET_LABEL", "Jeena Sikho")
     api_prefix = os.getenv("APP_API_PREFIX", "/api/jeena-sikho").strip() or "/api/jeena-sikho"
+    base_prefix = os.getenv("APP_BASE_PREFIX", "").strip()
+    if base_prefix and not base_prefix.startswith("/"):
+        base_prefix = f"/{base_prefix}"
+    base_prefix = base_prefix.rstrip("/")
     if not api_prefix.startswith("/"):
         api_prefix = f"/{api_prefix}"
     return render(
@@ -38,6 +42,7 @@ def dashboard(request):
         {
             "brand_name": brand_name,
             "market_label": market_label,
+            "base_prefix": base_prefix,
             "api_prefix": api_prefix.rstrip("/"),
         },
     )
