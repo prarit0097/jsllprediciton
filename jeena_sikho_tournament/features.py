@@ -9,6 +9,18 @@ def _ema(series: pd.Series, span: int) -> pd.Series:
     return series.ewm(span=span, adjust=False, min_periods=span).mean()
 
 
+def _wilder_rsi(series: pd.Series, bars: int) -> pd.Series:
+    delta = series.diff()
+    gain = delta.clip(lower=0.0)
+    loss = -delta.clip(upper=0.0)
+    avg_gain = gain.ewm(alpha=1 / max(1, bars), adjust=False, min_periods=bars).mean()
+    avg_loss = loss.ewm(alpha=1 / max(1, bars), adjust=False, min_periods=bars).mean()
+    rs = avg_gain / avg_loss.replace(0.0, np.nan)
+    rsi = 100 - (100 / (1 + rs))
+    rsi = rsi.where(avg_loss > 0, np.where(avg_gain > 0, 100.0, 50.0))
+    return pd.Series(rsi, index=series.index, dtype=float)
+
+
 def _bars_for_hours(hours: int, candle_minutes: int) -> int:
     if candle_minutes <= 0:
         return max(1, hours)
@@ -98,15 +110,9 @@ def compute_features(
     vol_window = _bars_for_hours(24, candle_minutes)
     df["vol_24"] = df["ret_1c"].rolling(vol_window, min_periods=vol_window).std(ddof=0)
 
-    delta = close.diff()
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
     for w in [14, 21]:
         bars = _bars_for_hours(w, candle_minutes)
-        avg_gain = gain.rolling(bars, min_periods=bars).mean()
-        avg_loss = loss.rolling(bars, min_periods=bars).mean()
-        rs = avg_gain / (avg_loss + 1e-9)
-        df[f"rsi_{w}"] = 100 - (100 / (1 + rs))
+        df[f"rsi_{w}"] = _wilder_rsi(close, bars)
 
     ema12 = _ema(close, _bars_for_hours(12, candle_minutes))
     ema26 = _ema(close, _bars_for_hours(26, candle_minutes))
@@ -400,6 +406,11 @@ def make_supervised(
     drop_event_rows = os.getenv("EVENT_DAY_DROP_FROM_TRAIN", "1").strip().lower() in {"1", "true", "yes", "on"}
     if drop_event_rows and "is_event_day" in df.columns:
         df = df.loc[df["is_event_day"] == 0]
+
+    # Synthetic repair/gap-fill rows can carry zero volume. Keep them available for
+    # storage continuity, but exclude them from supervised training samples.
+    if "volume" in df.columns:
+        df = df.loc[df["volume"] > 0]
 
     df = df.dropna()
     return df
