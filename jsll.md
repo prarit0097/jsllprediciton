@@ -414,3 +414,88 @@ This repository is a JSLL-specific market intelligence application with:
 - deployment-ready service structure
 
 It is materially more than a basic Django CRUD or price app. The core value is operational prediction monitoring for one market instrument with scheduled retraining and production-facing summaries.
+
+## 18. Production Incident Notes
+
+During live VPS deployment/debugging, the following production issues were identified and fixed:
+
+1. `DisallowedHost` because settings did not correctly read the VPS env shape.
+2. Duplicate `Host` header from nginx because `proxy_params` already set `Host` and the site config added another `proxy_set_header Host $host;`.
+3. `DJANGO_*` env aliases were present in `.env`, but settings originally only read plain `DEBUG` / `ALLOWED_HOSTS` style keys.
+4. `collectstatic` failed because `STATIC_ROOT` env support was missing.
+5. Dashboard JS asset path was hardcoded root-relative and did not respect the `/jsll/` path prefix.
+6. Scheduler failed because `timedelta` import was missing in tournament code.
+7. Historical `last_ready` dashboard rendering was too strict and could hide legacy matched rows.
+
+## 19. Recommended VPS Runbook
+
+### Safe Deploy / Update
+
+```bash
+cd /opt/jsll/app
+source /opt/jsll/venv/bin/activate
+git fetch origin
+git reset --hard origin/main
+python manage.py collectstatic --noinput
+python manage.py check
+sudo systemctl restart jsll-gunicorn
+sudo systemctl restart jsll-scheduler
+```
+
+### Full Data Refresh
+
+```bash
+cd /opt/jsll/app
+source /opt/jsll/venv/bin/activate
+
+python -m jeena_sikho_tournament.run_repair
+
+curl -X POST https://api.seestox.com/jsll/api/jeena-sikho/tournament/run \
+  -H "Content-Type: application/json" \
+  -d '{}'
+
+sleep 10
+
+curl https://api.seestox.com/jsll/api/jeena-sikho/tournament/run/status
+curl -X POST https://api.seestox.com/jsll/api/jeena-sikho/prediction/refresh
+curl https://api.seestox.com/jsll/api/jeena-sikho/prediction/latest
+curl https://api.seestox.com/jsll/api/jeena-sikho/tournament/summary
+```
+
+### Health / Logs
+
+```bash
+sudo systemctl status jsll-gunicorn --no-pager
+sudo systemctl status jsll-scheduler --no-pager
+sudo journalctl -u jsll-gunicorn -n 50 --no-pager -l
+sudo journalctl -u jsll-scheduler -n 80 --no-pager -l
+sudo journalctl -u jsll-scheduler --since "10 minutes ago" --no-pager -l
+```
+
+### Browser Refresh
+
+After deploy or static changes:
+
+- use `Ctrl+Shift+R`
+- or open a new incognito tab
+
+### Important `.env` Values
+
+```env
+APP_BASE_PREFIX=/jsll
+APP_API_PREFIX=/jsll/api/jeena-sikho
+DJANGO_DEBUG=0
+DJANGO_ALLOWED_HOSTS=api.seestox.com,seestox.com,www.seestox.com
+DJANGO_CSRF_TRUSTED_ORIGINS=https://api.seestox.com,https://seestox.com,https://www.seestox.com
+DJANGO_STATIC_URL=/jsll/static/
+DJANGO_STATIC_ROOT=/opt/jsll/app/staticfiles
+MAX_MISSING_RATIO=0.08
+COMPLETENESS_MIN_PCT=90
+AUTO_REPAIR_ON_DQ_FAIL=1
+```
+
+### Current Long-Horizon Reality
+
+- `2d` to `7d` rows can still show pending/insufficient-sample states until enough true matched actuals exist
+- this is not always a deploy failure
+- it can simply mean those horizons do not yet have enough completed outcomes in the runtime DB

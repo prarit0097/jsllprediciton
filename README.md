@@ -113,6 +113,96 @@ As currently deployed by the maintainer, this app is served behind a path prefix
 
 The live VPS deployment uses nginx path rewriting in front of Gunicorn, so backend routes still run as root Django paths while users access them under `/jsll/`.
 
+## VPS Runbook
+
+Live production facts:
+
+- code path: `/opt/jsll/app`
+- venv path: `/opt/jsll/venv`
+- public URL: `https://api.seestox.com/jsll/`
+- static URL: `https://api.seestox.com/jsll/static/`
+- Gunicorn service: `jsll-gunicorn.service`
+- scheduler service: `jsll-scheduler.service`
+- socket: `/run/jsll/jsll.sock`
+
+Safe deploy / update:
+
+```bash
+cd /opt/jsll/app
+source /opt/jsll/venv/bin/activate
+git fetch origin
+git reset --hard origin/main
+python manage.py collectstatic --noinput
+python manage.py check
+sudo systemctl restart jsll-gunicorn
+sudo systemctl restart jsll-scheduler
+```
+
+Full data refresh:
+
+```bash
+cd /opt/jsll/app
+source /opt/jsll/venv/bin/activate
+
+python -m jeena_sikho_tournament.run_repair
+
+curl -X POST https://api.seestox.com/jsll/api/jeena-sikho/tournament/run \
+  -H "Content-Type: application/json" \
+  -d '{}'
+
+sleep 10
+
+curl https://api.seestox.com/jsll/api/jeena-sikho/tournament/run/status
+curl -X POST https://api.seestox.com/jsll/api/jeena-sikho/prediction/refresh
+curl https://api.seestox.com/jsll/api/jeena-sikho/prediction/latest
+curl https://api.seestox.com/jsll/api/jeena-sikho/tournament/summary
+```
+
+Health checks:
+
+```bash
+sudo systemctl status jsll-gunicorn --no-pager
+sudo systemctl status jsll-scheduler --no-pager
+curl https://api.seestox.com/jsll/api/jeena-sikho/price
+curl https://api.seestox.com/jsll/api/jeena-sikho/prediction/latest
+curl https://api.seestox.com/jsll/api/jeena-sikho/tournament/summary
+```
+
+Logs:
+
+```bash
+sudo journalctl -u jsll-gunicorn -n 50 --no-pager -l
+sudo journalctl -u jsll-scheduler -n 80 --no-pager -l
+sudo journalctl -u jsll-scheduler --since "10 minutes ago" --no-pager -l
+```
+
+Important `.env` notes:
+
+```env
+APP_BASE_PREFIX=/jsll
+APP_API_PREFIX=/jsll/api/jeena-sikho
+DJANGO_DEBUG=0
+DJANGO_ALLOWED_HOSTS=api.seestox.com,seestox.com,www.seestox.com
+DJANGO_CSRF_TRUSTED_ORIGINS=https://api.seestox.com,https://seestox.com,https://www.seestox.com
+DJANGO_STATIC_URL=/jsll/static/
+DJANGO_STATIC_ROOT=/opt/jsll/app/staticfiles
+MAX_MISSING_RATIO=0.08
+COMPLETENESS_MIN_PCT=90
+AUTO_REPAIR_ON_DQ_FAIL=1
+```
+
+nginx gotcha:
+
+- `/etc/nginx/proxy_params` already sets `proxy_set_header Host $http_host;`
+- do not duplicate `proxy_set_header Host $host;` in the JSLL location block
+- otherwise Django can receive a duplicated host header and throw `DisallowedHost`
+
+Long-horizon note:
+
+- `2d` to `7d` predictions can appear before true matched actuals exist
+- in that case the dashboard can still show pending/insufficient-sample states
+- that is a data maturity issue, not always a deployment bug
+
 ## Deep Project Notes
 
 For the detailed project analysis, deployment notes, file-by-file explanation, and command reference, see [`jsll.md`](./jsll.md).
