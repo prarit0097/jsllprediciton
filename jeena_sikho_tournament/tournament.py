@@ -23,7 +23,7 @@ from .registry import (
     stability_penalty,
     update_champion,
 )
-from .splits import walk_forward_cv_splits
+from .splits import walk_forward_cv_splits, walk_forward_split
 from .storage import Storage
 from .validator import validate_ohlcv_quality
 from .market_calendar import load_nse_holidays
@@ -152,6 +152,66 @@ def _vol_scale(series: pd.Series) -> np.ndarray:
     return np.where(np.isfinite(arr), arr, max(1e-6, floor))
 
 
+def _target_clip_quantiles(candle_minutes: int) -> tuple[float, float]:
+    if candle_minutes <= 120:
+        default_low_q, default_high_q = 0.02, 0.98
+    elif candle_minutes >= 1440:
+        default_low_q, default_high_q = 0.005, 0.995
+    else:
+        default_low_q, default_high_q = 0.01, 0.99
+    low_q = float(os.getenv("TARGET_WINSOR_LOWER", str(default_low_q)))
+    high_q = float(os.getenv("TARGET_WINSOR_UPPER", str(default_high_q)))
+    low_q = min(max(low_q, 0.0), 0.49)
+    high_q = min(max(high_q, 0.51), 1.0)
+    return low_q, high_q
+
+
+def _event_target_clip(candle_minutes: int) -> float:
+    if candle_minutes <= 120:
+        default_clip = 0.035
+    elif candle_minutes >= 1440:
+        default_clip = 0.07
+    else:
+        default_clip = 0.05
+    return float(os.getenv("EVENT_TARGET_CLIP", str(default_clip)))
+
+
+def _fit_target_clip_bounds(y_train: pd.Series, candle_minutes: int) -> tuple[float, float]:
+    clean = pd.Series(y_train).astype(float).replace([np.inf, -np.inf], np.nan).dropna()
+    if clean.empty:
+        return float("-inf"), float("inf")
+    low_q, high_q = _target_clip_quantiles(candle_minutes)
+    return float(clean.quantile(low_q)), float(clean.quantile(high_q))
+
+
+def _prepare_training_frame(train_df: pd.DataFrame, config: TournamentConfig) -> pd.DataFrame:
+    prepared = train_df.copy()
+    drop_event_rows = os.getenv("EVENT_DAY_DROP_FROM_TRAIN", "1").strip().lower() in {"1", "true", "yes", "on"}
+    if drop_event_rows and "is_event_day" in prepared.columns:
+        prepared = prepared.loc[prepared["is_event_day"] == 0].copy()
+    if prepared.empty:
+        return prepared
+
+    y_train = pd.Series(prepared["y_ret_raw"], index=prepared.index, dtype=float)
+    lo, hi = _fit_target_clip_bounds(y_train, config.candle_minutes)
+    y_train = y_train.clip(lower=lo, upper=hi)
+
+    if not drop_event_rows and "is_event_day" in prepared.columns:
+        mask = prepared["is_event_day"].astype(bool)
+        if mask.any():
+            event_clip = _event_target_clip(config.candle_minutes)
+            y_train.loc[mask] = y_train.loc[mask].clip(-event_clip, event_clip)
+
+    prepared["y_ret_train"] = y_train
+    prepared["y_dir_train"] = (prepared["y_ret_train"] > 0).astype(int)
+    ret_mode = _target_mode(config)
+    if ret_mode in {"volnorm", "volnorm_logret", "normalized"}:
+        prepared["y_ret_model_train"] = prepared["y_ret_train"] / (_vol_scale(prepared["target_scale"]) + 1e-12)
+    else:
+        prepared["y_ret_model_train"] = prepared["y_ret_train"]
+    return prepared
+
+
 def _primary_score_direction(acc: float) -> float:
     return float(acc)
 
@@ -207,6 +267,36 @@ def _fit_predict_range(spec: ModelSpec, X_train, y_train, X_val):
     model.fit(X_train, y_train)
     y_pred = model.predict(X_val)
     return model, y_pred
+
+
+def _fit_final_model(
+    spec: ModelSpec,
+    task: str,
+    feature_cols: List[str],
+    train_df: pd.DataFrame,
+    config: TournamentConfig,
+):
+    prepared_train = _prepare_training_frame(train_df, config)
+    if prepared_train.empty:
+        raise RuntimeError("No rows available for final refit")
+
+    X_train = prepared_train[feature_cols]
+    spec_local = ModelSpec(spec.name, _clone_model(spec), spec.task, spec.meta)
+
+    if task == "direction":
+        model = spec_local.model
+        model.fit(X_train, prepared_train["y_dir_train"].values)
+        return model
+
+    if task == "return":
+        model = spec_local.model
+        model.fit(X_train, prepared_train["y_ret_model_train"].values)
+        return model
+
+    model = build_quantile_bundle(spec_local, (0.1, 0.5, 0.9))
+    y_train = prepared_train["y_ret_model_train"].values if _target_mode(config) in {"volnorm", "volnorm_logret", "normalized"} else prepared_train["y_ret_train"].values
+    model.fit(X_train, y_train)
+    return model
 
 
 def _clone_model(spec: ModelSpec):
@@ -295,92 +385,125 @@ def _feature_drop_set(registry: Dict[str, Any], task: str) -> set:
     return merged
 
 
-def _evaluate_candidate(args: Tuple[ModelSpec, str, str, List[Tuple[pd.DataFrame, pd.DataFrame]], List[str], TournamentConfig]):
-    spec, task, feature_set_id, split_pairs, feature_cols, config = args
+def _score_candidate_once(
+    spec: ModelSpec,
+    task: str,
+    feature_cols: List[str],
+    train_df: pd.DataFrame,
+    eval_df: pd.DataFrame,
+    config: TournamentConfig,
+) -> Dict[str, Any]:
+    prepared_train = _prepare_training_frame(train_df, config)
+    if prepared_train.empty or eval_df.empty:
+        raise RuntimeError("No valid train/eval rows")
+
+    X_train = prepared_train[feature_cols]
+    X_eval = eval_df[feature_cols]
+    spec_local = ModelSpec(spec.name, _clone_model(spec), spec.task, spec.meta)
+    ret_mode = _target_mode(config)
+    use_volnorm = ret_mode in {"volnorm", "volnorm_logret", "normalized"}
+
+    if task == "direction":
+        y_train = prepared_train["y_dir_train"].values
+        y_eval = eval_df["y_dir"].values
+        model, y_pred = _fit_predict_direction(spec_local, X_train, y_train, X_eval)
+        acc = accuracy(y_eval, y_pred)
+        f1 = f1_score(y_eval, y_pred)
+        log_ret = eval_df["y_ret_raw"].values
+        positions = (y_pred > 0).astype(int)
+        net, mdd, trading = trading_score(positions, log_ret, config.fee_slippage)
+        primary = _primary_score_direction(acc)
+        return {
+            "metrics": {"accuracy": acc, "f1": f1, "net": net, "mdd": mdd},
+            "primary": primary,
+            "trading": trading,
+            "y_pred": np.asarray(y_pred),
+            "y_true": np.asarray(y_eval),
+            "model": model,
+            "target_mode": "raw_logret",
+        }
+
+    if task == "return":
+        y_train_model = prepared_train["y_ret_model_train"].values
+        model, y_pred_model = _fit_predict_reg(spec_local, X_train, y_train_model, X_eval)
+        if use_volnorm and "target_scale" in eval_df.columns:
+            y_pred = y_pred_model * _vol_scale(eval_df["target_scale"])
+        else:
+            y_pred = y_pred_model
+        y_eval = eval_df["y_ret_raw"].values
+        mae_val = mae(y_eval, y_pred)
+        dir_acc = accuracy((y_eval > 0).astype(int), (y_pred > 0).astype(int))
+        close_hit = _close_hit_rate(y_eval, y_pred, config.close_hit_bps)
+        positions = (y_pred > 0).astype(int)
+        net, mdd, trading = trading_score(positions, y_eval, config.fee_slippage)
+        primary = _primary_score_reg_weighted(mae_val, y_eval, dir_acc, close_hit)
+        return {
+            "metrics": {"mae": mae_val, "dir_acc": dir_acc, "close_hit": close_hit, "net": net, "mdd": mdd},
+            "primary": primary,
+            "trading": trading,
+            "y_pred": np.asarray(y_pred),
+            "y_true": np.asarray(y_eval),
+            "model": model,
+            "target_mode": ret_mode,
+        }
+
+    y_train_model = prepared_train["y_ret_model_train"].values if use_volnorm else prepared_train["y_ret_train"].values
+    model, y_pred_model = _fit_predict_range(spec_local, X_train, y_train_model, X_eval)
+    if use_volnorm and "target_scale" in eval_df.columns:
+        scale = _vol_scale(eval_df["target_scale"]).reshape(-1, 1)
+        y_pred = y_pred_model * scale
+    else:
+        y_pred = y_pred_model
+    y_eval = eval_df["y_ret_raw"].values
+    p10, p50, p90 = y_pred[:, 0], y_pred[:, 1], y_pred[:, 2]
+    cov = coverage(y_eval, p10, p90)
+    pin = (
+        pinball_loss(y_eval, p10, 0.1)
+        + pinball_loss(y_eval, p50, 0.5)
+        + pinball_loss(y_eval, p90, 0.9)
+    ) / 3.0
+    positions = (p50 > 0).astype(int)
+    net, mdd, trading = trading_score(positions, y_eval, config.fee_slippage)
+    primary = _primary_score_range(pin, y_eval, cov)
+    return {
+        "metrics": {"coverage": cov, "pinball": pin, "net": net, "mdd": mdd},
+        "primary": primary,
+        "trading": trading,
+        "y_pred": np.asarray(p50),
+        "y_true": np.asarray(y_eval),
+        "model": model,
+        "target_mode": ret_mode,
+    }
+
+
+def _evaluate_candidate(
+    args: Tuple[
+        ModelSpec,
+        str,
+        str,
+        List[Tuple[pd.DataFrame, pd.DataFrame]],
+        List[str],
+        TournamentConfig,
+        Optional[pd.DataFrame],
+        Optional[pd.DataFrame],
+    ]
+):
+    spec, task, feature_set_id, split_pairs, feature_cols, config, holdout_train_df, holdout_eval_df = args
     fold_metrics: List[Dict[str, float]] = []
     fold_primary: List[float] = []
     fold_trading: List[float] = []
     preds_collect: List[np.ndarray] = []
     truth_collect: List[np.ndarray] = []
     last_model: Any = None
-    ret_mode = _target_mode(config)
-    use_volnorm = ret_mode in {"volnorm", "volnorm_logret", "normalized"}
 
     for train_df, val_df in split_pairs:
-        if train_df.empty or val_df.empty:
-            continue
-        X_train = train_df[feature_cols]
-        X_val = val_df[feature_cols]
-        spec_local = ModelSpec(spec.name, _clone_model(spec), spec.task, spec.meta)
-
-        if task == "direction":
-            y_train = train_df["y_dir"].values
-            y_val = val_df["y_dir"].values
-            model, y_pred = _fit_predict_direction(spec_local, X_train, y_train, X_val)
-            acc = accuracy(y_val, y_pred)
-            f1 = f1_score(y_val, y_pred)
-            log_ret = val_df["y_ret"].values
-            positions = (y_pred > 0).astype(int)
-            net, mdd, trading = trading_score(positions, log_ret, config.fee_slippage)
-            primary = _primary_score_direction(acc)
-            fold_metrics.append({"accuracy": acc, "f1": f1, "net": net, "mdd": mdd})
-            fold_primary.append(primary)
-            fold_trading.append(trading)
-            preds_collect.append(np.asarray(y_pred))
-            truth_collect.append(np.asarray(y_val))
-            last_model = model
-            continue
-
-        if task == "return":
-            y_train_raw = train_df["y_ret"].values
-            y_val_raw = val_df["y_ret"].values
-            y_train_model = train_df["y_ret_model"].values if use_volnorm and "y_ret_model" in train_df.columns else y_train_raw
-            model, y_pred_model = _fit_predict_reg(spec_local, X_train, y_train_model, X_val)
-            if use_volnorm and "target_scale" in val_df.columns:
-                y_pred = y_pred_model * _vol_scale(val_df["target_scale"])
-            else:
-                y_pred = y_pred_model
-            y_val = y_val_raw
-            mae_val = mae(y_val, y_pred)
-            dir_acc = accuracy((y_val > 0).astype(int), (y_pred > 0).astype(int))
-            close_hit = _close_hit_rate(y_val, y_pred, config.close_hit_bps)
-            log_ret = y_val
-            positions = (y_pred > 0).astype(int)
-            net, mdd, trading = trading_score(positions, log_ret, config.fee_slippage)
-            primary = _primary_score_reg_weighted(mae_val, y_val, dir_acc, close_hit)
-            fold_metrics.append({"mae": mae_val, "dir_acc": dir_acc, "close_hit": close_hit, "net": net, "mdd": mdd})
-            fold_primary.append(primary)
-            fold_trading.append(trading)
-            preds_collect.append(np.asarray(y_pred))
-            truth_collect.append(np.asarray(y_val))
-            last_model = model
-            continue
-
-        y_train = train_df["y_ret"].values
-        y_val = val_df["y_ret"].values
-        y_train_model = train_df["y_ret_model"].values if use_volnorm and "y_ret_model" in train_df.columns else y_train
-        model, y_pred_model = _fit_predict_range(spec_local, X_train, y_train_model, X_val)
-        if use_volnorm and "target_scale" in val_df.columns:
-            scale = _vol_scale(val_df["target_scale"]).reshape(-1, 1)
-            y_pred = y_pred_model * scale
-        else:
-            y_pred = y_pred_model
-        p10, p50, p90 = y_pred[:, 0], y_pred[:, 1], y_pred[:, 2]
-        cov = coverage(y_val, p10, p90)
-        pin = (
-            pinball_loss(y_val, p10, 0.1)
-            + pinball_loss(y_val, p50, 0.5)
-            + pinball_loss(y_val, p90, 0.9)
-        ) / 3.0
-        positions = (p50 > 0).astype(int)
-        net, mdd, trading = trading_score(positions, y_val, config.fee_slippage)
-        primary = _primary_score_range(pin, y_val, cov)
-        fold_metrics.append({"coverage": cov, "pinball": pin, "net": net, "mdd": mdd})
-        fold_primary.append(primary)
-        fold_trading.append(trading)
-        preds_collect.append(np.asarray(p50))
-        truth_collect.append(np.asarray(y_val))
-        last_model = model
+        fold = _score_candidate_once(spec, task, feature_cols, train_df, val_df, config)
+        fold_metrics.append(fold["metrics"])
+        fold_primary.append(float(fold["primary"]))
+        fold_trading.append(float(fold["trading"]))
+        preds_collect.append(np.asarray(fold["y_pred"]))
+        truth_collect.append(np.asarray(fold["y_true"]))
+        last_model = fold["model"]
 
     if not fold_metrics or last_model is None:
         raise RuntimeError("No valid folds")
@@ -392,7 +515,7 @@ def _evaluate_candidate(args: Tuple[ModelSpec, str, str, List[Tuple[pd.DataFrame
 
     y_pred_full = np.concatenate(preds_collect) if preds_collect else np.array([])
     y_true_full = np.concatenate(truth_collect) if truth_collect else np.array([])
-    return {
+    result = {
         "spec": spec,
         "feature_set_id": feature_set_id,
         "metrics": avg_metrics,
@@ -401,8 +524,14 @@ def _evaluate_candidate(args: Tuple[ModelSpec, str, str, List[Tuple[pd.DataFrame
         "y_pred": y_pred_full,
         "y_true": y_true_full,
         "model": last_model,
-        "target_mode": ret_mode if task in {"return", "range"} else "raw_logret",
+        "target_mode": fold.get("target_mode", "raw_logret"),
     }
+    if holdout_train_df is not None and holdout_eval_df is not None and not holdout_eval_df.empty:
+        holdout = _score_candidate_once(spec, task, feature_cols, holdout_train_df, holdout_eval_df, config)
+        result["holdout_metrics"] = holdout["metrics"]
+        result["holdout_primary"] = float(holdout["primary"])
+        result["holdout_trading"] = float(holdout["trading"])
+    return result
 
 
 def _model_id(spec: ModelSpec, feature_set_id: str) -> str:
@@ -492,11 +621,85 @@ def _cap_candidates(
     max_total: int,
     seed: int,
 ) -> List[Tuple[ModelSpec, str, List[str]]]:
-    rng = np.random.default_rng(seed)
     if len(candidates) <= max_total:
         return candidates
-    idx = rng.choice(len(candidates), size=max_total, replace=False)
-    return [candidates[i] for i in idx]
+    tasks = {cand[0].task for cand in candidates}
+    bucketed: Dict[Tuple[str, str, str], List[Tuple[ModelSpec, str, List[str]]]] = {}
+    for candidate in candidates:
+        spec, fs_id, _ = candidate
+        family = str(spec.meta.get("family", spec.name))
+        task_key = spec.task if len(tasks) > 1 else "_"
+        bucketed.setdefault((task_key, family, fs_id), []).append(candidate)
+
+    selected: List[Tuple[ModelSpec, str, List[str]]] = []
+    keys = sorted(bucketed.keys())
+    while len(selected) < max_total:
+        progressed = False
+        for key in keys:
+            bucket = bucketed[key]
+            if not bucket:
+                continue
+            selected.append(bucket.pop(0))
+            progressed = True
+            if len(selected) >= max_total:
+                break
+        if not progressed:
+            break
+    return selected
+
+
+def _cap_candidates_by_task_budget(
+    candidates: List[Tuple[ModelSpec, str, List[str]]],
+    max_total: int,
+    seed: int,
+) -> List[Tuple[ModelSpec, str, List[str]]]:
+    if len(candidates) <= max_total:
+        return candidates
+    task_order = ["return", "direction", "range"]
+    weights = {"return": 0.5, "direction": 0.3, "range": 0.2}
+    by_task: Dict[str, List[Tuple[ModelSpec, str, List[str]]]] = {task: [] for task in task_order}
+    for candidate in candidates:
+        by_task.setdefault(candidate[0].task, []).append(candidate)
+
+    active_tasks = [task for task in task_order if by_task.get(task)]
+    if not active_tasks:
+        return _cap_candidates(candidates, max_total, seed)
+
+    total_weight = sum(weights[task] for task in active_tasks)
+    budgets: Dict[str, int] = {}
+    remaining = max_total
+    for task in active_tasks:
+        raw_budget = int(round(max_total * (weights[task] / total_weight)))
+        budget = min(len(by_task[task]), max(1, raw_budget))
+        budgets[task] = budget
+        remaining -= budget
+
+    while remaining > 0:
+        progressed = False
+        for task in active_tasks:
+            if budgets[task] < len(by_task[task]):
+                budgets[task] += 1
+                remaining -= 1
+                progressed = True
+                if remaining == 0:
+                    break
+        if not progressed:
+            break
+
+    selected: List[Tuple[ModelSpec, str, List[str]]] = []
+    for task in active_tasks:
+        selected.extend(_cap_candidates(by_task[task], budgets[task], seed))
+    return selected[:max_total]
+
+
+def _activate_served_ensemble(
+    registry: Dict[str, Any],
+    task: str,
+    ensemble_record: Dict[str, Any],
+    replaced: bool,
+) -> None:
+    if replaced:
+        registry.setdefault("ensembles", {})[task] = ensemble_record
 
 
 def run_tournament(config: TournamentConfig) -> Dict[str, Any]:
@@ -560,12 +763,27 @@ def run_tournament(config: TournamentConfig) -> Dict[str, Any]:
 
         sup, feature_sets_map = _build_dataset(df, config)
         registry = load_registry(config.registry_path)
+        holdout_train_df: Optional[pd.DataFrame] = None
+        holdout_eval_df: Optional[pd.DataFrame] = None
+        cv_source = sup
+        if config.use_test and config.test_hours > 0:
+            outer_split = walk_forward_split(sup, config.train_days, config.val_hours, config.test_hours, True)
+            if outer_split.test is not None and not outer_split.test.empty:
+                holdout_eval_df = outer_split.test.copy()
+                holdout_start = holdout_eval_df.index.min()
+                holdout_train_df = sup.loc[sup.index < holdout_start].copy()
+                if not holdout_train_df.empty:
+                    cv_source = holdout_train_df
+                else:
+                    holdout_eval_df = None
+                    holdout_train_df = None
+
         cv_splits = walk_forward_cv_splits(
-            sup,
+            cv_source,
             config.train_days,
             config.val_hours,
-            config.test_hours,
-            config.use_test,
+            0,
+            False,
             folds=config.cv_folds,
         )
         if not cv_splits:
@@ -621,7 +839,7 @@ def run_tournament(config: TournamentConfig) -> Dict[str, Any]:
 
         all_candidates = [c for task in per_task_candidates for c in per_task_candidates[task]]
         if len(all_candidates) > config.max_candidates_total:
-            capped = _cap_candidates(all_candidates, config.max_candidates_total, config.random_seed)
+            capped = _cap_candidates_by_task_budget(all_candidates, config.max_candidates_total, config.random_seed)
             per_task_candidates = {"direction": [], "return": [], "range": []}
             for spec, fs_id, cols in capped:
                 per_task_candidates[spec.task].append((spec, fs_id, cols))
@@ -655,6 +873,7 @@ def run_tournament(config: TournamentConfig) -> Dict[str, Any]:
 
         _emit_progress(force=True)
         scoreboard_rows = []
+        full_fit_source = sup
 
         for task in ["direction", "return", "range"]:
             candidates = per_task_candidates.get(task, [])
@@ -663,7 +882,10 @@ def run_tournament(config: TournamentConfig) -> Dict[str, Any]:
             progress_task = task
             _emit_progress(force=True)
 
-            jobs = [(spec, task, fs_id, split_pairs, cols, config) for spec, fs_id, cols in candidates]
+            jobs = [
+                (spec, task, fs_id, split_pairs, cols, config, holdout_train_df, holdout_eval_df)
+                for spec, fs_id, cols in candidates
+            ]
             task_results = []
 
             use_workers = config.max_workers
@@ -711,10 +933,14 @@ def run_tournament(config: TournamentConfig) -> Dict[str, Any]:
                 spec = r["spec"]
                 family = spec.meta.get("family", spec.name)
                 stab = stability_penalty(registry, family)
-                final = _final_score(r["trading"], r["primary"], stab, config)
+                selection_primary = float(r.get("holdout_primary", r["primary"]))
+                selection_trading = float(r.get("holdout_trading", r["trading"]))
+                final = _final_score(selection_trading, selection_primary, stab, config)
                 r["final_score"] = final
                 r["stability"] = stab
                 r["family"] = family
+                r["selection_primary"] = selection_primary
+                r["selection_trading"] = selection_trading
 
             task_results.sort(key=lambda x: x["final_score"], reverse=True)
             artifacts_dir = config.data_dir / "models" / task
@@ -723,6 +949,7 @@ def run_tournament(config: TournamentConfig) -> Dict[str, Any]:
             top_k = max(1, min(config.ensemble_top_k, len(task_results)))
             ensemble_members: List[Dict[str, Any]] = []
             best_member: Optional[Dict[str, Any]] = None
+            best_saved_model: Any = None
 
             for rank, r in enumerate(task_results[:top_k], start=1):
                 spec = r["spec"]
@@ -730,15 +957,23 @@ def run_tournament(config: TournamentConfig) -> Dict[str, Any]:
                 model_id = _model_id(spec, fs_id)
                 model_path = None
                 meta_path = None
+                model_to_save = r["model"]
                 try:
+                    model_to_save = _fit_final_model(
+                        spec,
+                        task,
+                        task_feature_cols.get(fs_id, []),
+                        full_fit_source,
+                        config,
+                    )
                     model_path, meta_path = _save_model_artifacts(
                         artifacts_dir,
                         model_id,
-                        r["model"],
+                        model_to_save,
                         task,
                         fs_id,
                         task_feature_cols.get(fs_id, []),
-                        r["metrics"],
+                        r.get("holdout_metrics") or r["metrics"],
                         r["final_score"],
                         ts,
                         rank,
@@ -761,6 +996,7 @@ def run_tournament(config: TournamentConfig) -> Dict[str, Any]:
                     ensemble_members.append(member)
                 if rank == 1:
                     best_member = member
+                    best_saved_model = model_to_save
 
             stacking_info = None
             if task == "return" and len(ensemble_members) >= 2:
@@ -800,7 +1036,9 @@ def run_tournament(config: TournamentConfig) -> Dict[str, Any]:
                 "model_id": best_model_id,
                 "timestamp": datetime.now(timezone.utc).isoformat(),
                 "final_score": best["final_score"],
-                "metrics": best["metrics"],
+                "metrics": best.get("holdout_metrics") or best["metrics"],
+                "cv_metrics": best["metrics"],
+                "holdout_metrics": best.get("holdout_metrics"),
                 "val_points": val_points_total,
                 "model_path": best_model_path,
                 "feature_cols": task_feature_cols.get(best_fs_id, []),
@@ -808,7 +1046,8 @@ def run_tournament(config: TournamentConfig) -> Dict[str, Any]:
                 "family": best["family"],
                 "target_mode": best.get("target_mode"),
             }
-            top_features = _extract_feature_importance(best.get("model"), task_feature_cols.get(best_fs_id, []), top_k=10)
+            feature_model = best_saved_model if best_saved_model is not None else best.get("model")
+            top_features = _extract_feature_importance(feature_model, task_feature_cols.get(best_fs_id, []), top_k=10)
             registry.setdefault("feature_importance", {}).setdefault(task, []).append(
                 {
                     "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -827,7 +1066,6 @@ def run_tournament(config: TournamentConfig) -> Dict[str, Any]:
             }
             if stacking_info:
                 ensemble_record["stacking"] = stacking_info
-            registry.setdefault("ensembles", {})[task] = ensemble_record
 
             decision = update_champion(
                 registry,
@@ -838,6 +1076,7 @@ def run_tournament(config: TournamentConfig) -> Dict[str, Any]:
                 config.champion_margin_override,
                 config.champion_cooldown_hours,
             )
+            _activate_served_ensemble(registry, task, ensemble_record, decision.replaced)
 
             registry["history"][task].append({
                 "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -851,6 +1090,7 @@ def run_tournament(config: TournamentConfig) -> Dict[str, Any]:
             results[task] = {
                 "best": challenger,
                 "decision": decision.reason,
+                "served_ensemble_updated": decision.replaced,
                 "top_scores": [
                     {"model_id": _model_id(r["spec"], r["feature_set_id"]), "final_score": r["final_score"]}
                     for r in task_results[:5]
@@ -858,8 +1098,17 @@ def run_tournament(config: TournamentConfig) -> Dict[str, Any]:
             }
 
             for idx, r in enumerate(task_results, start=1):
+                metrics_for_board = r.get("holdout_metrics") or r["metrics"]
                 metric_name = "accuracy" if task == "direction" else "weighted_obj" if task == "return" else "pinball"
-                metric_value = r["metrics"].get("accuracy") if task == "direction" else r.get("primary") if task == "return" else r["metrics"].get("pinball")
+                if r.get("holdout_metrics") is not None:
+                    metric_name = f"holdout_{metric_name}"
+                metric_value = (
+                    metrics_for_board.get("accuracy")
+                    if task == "direction"
+                    else r.get("selection_primary")
+                    if task == "return"
+                    else metrics_for_board.get("pinball")
+                )
                 model_name = r["spec"].model.__class__.__name__ if hasattr(r["spec"], "model") else r["spec"].name
                 scoreboard_rows.append(
                     {
@@ -871,7 +1120,7 @@ def run_tournament(config: TournamentConfig) -> Dict[str, Any]:
                         "final_score": r.get("final_score"),
                         "primary_metric_name": metric_name,
                         "primary_metric_value": metric_value,
-                        "trading_score": r.get("trading"),
+                        "trading_score": r.get("selection_trading", r.get("trading")),
                         "stability_penalty": r.get("stability"),
                         "is_champion": idx == 1,
                         "run_at": run_at,

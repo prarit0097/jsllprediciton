@@ -76,6 +76,8 @@ def _sklearn_candidates(task: str) -> List[ModelSpec]:
             Ridge,
             Lasso,
             ElasticNet,
+            HuberRegressor,
+            QuantileRegressor,
         )
         from sklearn.neighbors import KNeighborsClassifier, KNeighborsRegressor
         from sklearn.svm import LinearSVR
@@ -142,6 +144,10 @@ def _sklearn_candidates(task: str) -> List[ModelSpec]:
             specs.append(ModelSpec(f"lasso_a{alpha}", Lasso(alpha=alpha, max_iter=2000), task, {"family": "lasso", "group": "fast"}))
         for alpha, l1 in [(1e-4, 0.2), (5e-4, 0.5), (1e-3, 0.7)]:
             specs.append(ModelSpec(f"enet_a{alpha}_l1{l1}", ElasticNet(alpha=alpha, l1_ratio=l1, max_iter=2000), task, {"family": "enet", "group": "fast"}))
+        for alpha, epsilon in [(1e-5, 1.1), (1e-4, 1.2), (1e-3, 1.35)]:
+            specs.append(ModelSpec(f"huber_a{alpha}_e{epsilon}", HuberRegressor(alpha=alpha, epsilon=epsilon), task, {"family": "huber", "group": "fast"}))
+        for quantile, alpha in [(0.5, 1e-4), (0.5, 1e-3)]:
+            specs.append(ModelSpec(f"qreg_q{quantile}_a{alpha}", QuantileRegressor(quantile=quantile, alpha=alpha, solver="highs"), task, {"family": "qreg", "group": "fast"}))
         for n in [3, 5, 9, 15, 21, 31]:
             specs.append(ModelSpec(f"knn_reg_{n}", KNeighborsRegressor(n_neighbors=n, weights="distance"), task, {"family": "knn", "group": "fast"}))
         for c in [0.5, 1.0, 2.0]:
@@ -340,13 +346,13 @@ def _filter_specs_by_horizon(specs: List[ModelSpec], task: str, candle_minutes: 
         return specs
     minutes = max(1, int(candle_minutes))
     if minutes <= 120:
-        allowed_families = {"naive", "ema", "bias", "zero", "logreg", "sgd", "ridge", "lasso", "enet", "ada", "gb", "hgb", "xgb", "lgb", "gbr_q", "hgb_q", "lgb_q"}
+        allowed_families = {"naive", "ema", "bias", "zero", "logreg", "sgd", "ridge", "lasso", "enet", "huber", "qreg", "ada", "gb", "hgb", "xgb", "lgb", "gbr_q", "hgb_q", "lgb_q"}
         allowed_groups = {"fast", "medium"}
     elif minutes >= 1440:
-        allowed_families = {"naive", "ema", "bias", "zero", "ridge", "lasso", "enet", "rf", "et", "gb", "hgb", "xgb", "lgb", "cat", "gbr_q", "hgb_q", "lgb_q"}
+        allowed_families = {"naive", "ema", "bias", "zero", "ridge", "lasso", "enet", "huber", "qreg", "rf", "et", "gb", "hgb", "xgb", "lgb", "cat", "gbr_q", "hgb_q", "lgb_q"}
         allowed_groups = {"fast", "medium", "heavy"}
     else:
-        allowed_families = {"naive", "ema", "bias", "zero", "sgd", "ridge", "lasso", "enet", "rf", "et", "ada", "gb", "hgb", "xgb", "lgb", "cat", "gbr_q", "hgb_q", "lgb_q"}
+        allowed_families = {"naive", "ema", "bias", "zero", "sgd", "ridge", "lasso", "enet", "huber", "qreg", "rf", "et", "ada", "gb", "hgb", "xgb", "lgb", "cat", "gbr_q", "hgb_q", "lgb_q"}
         allowed_groups = {"fast", "medium", "heavy"}
     out: List[ModelSpec] = []
     for spec in specs:

@@ -12,7 +12,7 @@ import requests
 
 from jeena_sikho_tournament.config import TournamentConfig, _timeframe_to_minutes
 from jeena_sikho_tournament.data_sources import fetch_and_stitch
-from jeena_sikho_tournament.features import make_supervised, resolve_feature_windows_for_horizon
+from jeena_sikho_tournament.features import make_inference_frame, make_supervised, resolve_feature_windows_for_horizon
 from jeena_sikho_tournament.market_calendar import (
     IST,
     align_to_nse_interval_floor,
@@ -477,6 +477,31 @@ def _ensure_recent_data(config: TournamentConfig, days: int = 14) -> pd.DataFram
         return _load_latest_dataset(config)
     except Exception:
         return df
+
+
+def _latest_feature_snapshot(config: TournamentConfig) -> Optional[Dict[str, Any]]:
+    df = _ensure_recent_data(config)
+    if df.empty:
+        return None
+    feature_df = make_inference_frame(
+        df,
+        candle_minutes=config.candle_minutes,
+        feature_windows_hours=config.feature_windows,
+    )
+    if feature_df.empty:
+        return None
+    latest_row = feature_df.iloc[-1:].copy()
+    anchor_ts = latest_row.index[-1].to_pydatetime()
+    if anchor_ts.tzinfo is None:
+        anchor_ts = anchor_ts.replace(tzinfo=timezone.utc)
+    anchor_price = float(latest_row.iloc[-1]["close"])
+    return {
+        "source_df": df,
+        "feature_df": feature_df,
+        "latest_row": latest_row,
+        "anchor_ts": anchor_ts,
+        "anchor_price": anchor_price,
+    }
 
 
 def _parse_timeframes(value: Optional[str]) -> List[str]:
@@ -988,9 +1013,19 @@ def _compute_match_metrics(predicted: Optional[float], actual: Optional[float]) 
     return {"abs_diff": abs_diff, "pct_error": pct_error, "match_percent": match}
 
 
-def _get_recent_bias(config: TournamentConfig, timeframe: str) -> float:
+def _rows_for_regime(rows: List[Dict[str, Any]], regime: Optional[str], min_samples: int) -> List[Dict[str, Any]]:
+    if not regime:
+        return rows
+    filtered = [row for row in rows if row.get("regime") == regime]
+    if len(filtered) >= min_samples:
+        return filtered
+    return rows
+
+
+def _get_recent_bias(config: TournamentConfig, timeframe: str, regime: Optional[str] = None) -> float:
     limit = max(1, int(config.bias_window))
     rows = get_recent_ready_predictions(timeframe, limit)
+    rows = _rows_for_regime(rows, regime, min_samples=max(5, min(20, limit // 3)))
     if not rows:
         return 0.0
     errors: List[float] = []
@@ -1035,10 +1070,11 @@ def _get_recent_bias(config: TournamentConfig, timeframe: str) -> float:
     return bias
 
 
-def _fit_return_calibrator(config: TournamentConfig, timeframe: str) -> Dict[str, Any]:
+def _fit_return_calibrator(config: TournamentConfig, timeframe: str, regime: Optional[str] = None) -> Dict[str, Any]:
     min_samples = max(5, int(os.getenv("CALIBRATION_MIN_SAMPLES", "20")))
     limit = max(min_samples, int(os.getenv("CALIBRATION_LOOKBACK", "200")))
     rows = get_recent_ready_predictions(timeframe, limit)
+    rows = _rows_for_regime(rows, regime, min_samples=min_samples)
     xs: List[float] = []
     ys: List[float] = []
     for row in rows:
@@ -1060,7 +1096,7 @@ def _fit_return_calibrator(config: TournamentConfig, timeframe: str) -> Dict[str
             xs.append(x)
             ys.append(y)
     if len(xs) < min_samples:
-        return {"alpha": 0.0, "beta": 1.0, "samples": len(xs), "active": False}
+        return {"alpha": 0.0, "beta": 1.0, "samples": len(xs), "active": False, "regime": regime}
 
     X = np.column_stack([np.ones(len(xs)), np.asarray(xs)])
     y_arr = np.asarray(ys)
@@ -1069,11 +1105,11 @@ def _fit_return_calibrator(config: TournamentConfig, timeframe: str) -> Dict[str
         alpha = float(coeff[0])
         beta = float(coeff[1])
     except Exception:
-        return {"alpha": 0.0, "beta": 1.0, "samples": len(xs), "active": False}
+        return {"alpha": 0.0, "beta": 1.0, "samples": len(xs), "active": False, "regime": regime}
 
     alpha = max(-0.05, min(0.05, alpha))
     beta = max(-2.0, min(2.0, beta))
-    return {"alpha": alpha, "beta": beta, "samples": len(xs), "active": True}
+    return {"alpha": alpha, "beta": beta, "samples": len(xs), "active": True, "regime": regime}
 
 
 def _apply_return_calibrator(predicted_return: float, calibrator: Dict[str, Any]) -> float:
@@ -1400,12 +1436,6 @@ def refresh_prediction(config: TournamentConfig) -> Dict[str, Any]:
     update_pending_predictions(config)
     predictions: List[Dict[str, Any]] = []
 
-    try:
-        price_info = get_live_price()
-        live_price = price_info["price"]
-    except Exception:
-        live_price = None
-
     latest_run = get_latest_run()
     run_id = latest_run["id"] if latest_run else None
     market_open = _market_state(datetime.now(timezone.utc)).get("market_open")
@@ -1415,33 +1445,6 @@ def refresh_prediction(config: TournamentConfig) -> Dict[str, Any]:
         horizon_min = max(1, tf_cfg.candle_minutes)
         target_label = _horizon_target_label(horizon_min)
         latest = get_latest_prediction_for_timeframe(timeframe)
-        if latest:
-            pred_at = _parse_iso_utc(latest["predicted_at"])
-            cooldown = _cooldown_minutes(horizon_min)
-            if datetime.now(timezone.utc) - pred_at < timedelta(minutes=cooldown):
-                _apply_match_fields(latest)
-                _decorate_pending_target(latest, horizon_min)
-                latest["last_ready"] = _resolve_last_ready(timeframe, horizon_min)
-                predictions.append(latest)
-                continue
-
-        if _is_indian_equity() and market_open is False and latest:
-            _apply_match_fields(latest)
-            latest["status"] = latest.get("status") or "market_closed"
-            latest["last_ready"] = _resolve_last_ready(timeframe, horizon_min)
-            predictions.append(latest)
-            continue
-
-        if live_price is None:
-            predictions.append(
-                {
-                    "timeframe": timeframe,
-                    "timeframe_minutes": horizon_min,
-                    "prediction_horizon_min": horizon_min,
-                    "status": "no_price",
-                }
-            )
-            continue
 
         tf_reg = _load_registry(tf_cfg.registry_path)
         has_tf_models = bool((tf_reg.get("champions") if isinstance(tf_reg, dict) else None) or (tf_reg.get("ensembles") if isinstance(tf_reg, dict) else None))
@@ -1457,9 +1460,8 @@ def refresh_prediction(config: TournamentConfig) -> Dict[str, Any]:
             )
             continue
 
-        df = _ensure_recent_data(tf_cfg)
-        sup = make_supervised(df, candle_minutes=tf_cfg.candle_minutes, feature_windows_hours=tf_cfg.feature_windows)
-        if sup.empty:
+        snapshot = _latest_feature_snapshot(tf_cfg)
+        if not snapshot:
             predictions.append(
                 {
                     "timeframe": timeframe,
@@ -1470,7 +1472,28 @@ def refresh_prediction(config: TournamentConfig) -> Dict[str, Any]:
                 }
             )
             continue
-        latest_row = sup.iloc[-1:]
+        latest_row = snapshot["latest_row"]
+        anchor_ts = snapshot["anchor_ts"]
+        anchor_price = snapshot["anchor_price"]
+        source_df = snapshot["source_df"]
+
+        if latest:
+            pred_at = _parse_iso_utc(latest["predicted_at"])
+            if pred_at >= anchor_ts:
+                _apply_match_fields(latest)
+                _decorate_pending_target(latest, horizon_min)
+                latest["last_ready"] = _resolve_last_ready(timeframe, horizon_min)
+                predictions.append(latest)
+                continue
+
+        if _is_indian_equity() and market_open is False and latest:
+            pred_at = _parse_iso_utc(latest["predicted_at"])
+            if pred_at >= anchor_ts:
+                _apply_match_fields(latest)
+                latest["status"] = latest.get("status") or "market_closed"
+                latest["last_ready"] = _resolve_last_ready(timeframe, horizon_min)
+                predictions.append(latest)
+                continue
 
         regime = _market_regime()
         pred = _predict_return_from_ensemble(tf_cfg, latest_row, regime=regime)
@@ -1478,7 +1501,7 @@ def refresh_prediction(config: TournamentConfig) -> Dict[str, Any]:
         if pred is None:
             pred = _predict_return_from_champion(tf_cfg, latest_row)
         if pred is None:
-            pred = _predict_return_from_direction(tf_cfg, latest_row, df)
+            pred = _predict_return_from_direction(tf_cfg, latest_row, source_df)
             prediction_target = f"direction_{target_label}"
         if pred is None:
             predictions.append(
@@ -1493,9 +1516,9 @@ def refresh_prediction(config: TournamentConfig) -> Dict[str, Any]:
             continue
 
         predicted_return = float(pred["predicted_return"])
-        bias = _get_recent_bias(tf_cfg, timeframe)
+        bias = _get_recent_bias(tf_cfg, timeframe, regime=regime)
         predicted_return = float(predicted_return + bias)
-        calibrator = _fit_return_calibrator(tf_cfg, timeframe)
+        calibrator = _fit_return_calibrator(tf_cfg, timeframe, regime=regime)
         predicted_return = _apply_return_calibrator(predicted_return, calibrator)
         confidence_pct = float(pred.get("confidence_pct") or 55.0)
         low_conf_threshold = float(os.getenv("LOW_CONFIDENCE_PCT", "45"))
@@ -1514,14 +1537,14 @@ def refresh_prediction(config: TournamentConfig) -> Dict[str, Any]:
             ret_std_val = max(0.0005, abs(predicted_return) * 0.5)
         max_band_std = float(os.getenv("MAX_RETURN_STD", "0.12"))
         ret_std_val = max(0.0001, min(max_band_std, ret_std_val))
-        predicted_price = _price_from_log_return(float(live_price), predicted_return)
+        predicted_price = _price_from_log_return(float(anchor_price), predicted_return)
         band_z = float(os.getenv("PRED_BAND_Z", "1.64"))
-        low_price = _price_from_log_return(float(live_price), predicted_return - (band_z * ret_std_val))
-        high_price = _price_from_log_return(float(live_price), predicted_return + (band_z * ret_std_val))
+        low_price = _price_from_log_return(float(anchor_price), predicted_return - (band_z * ret_std_val))
+        high_price = _price_from_log_return(float(anchor_price), predicted_return + (band_z * ret_std_val))
 
         record = {
-            "predicted_at": datetime.now(timezone.utc).isoformat(),
-            "current_price": live_price,
+            "predicted_at": anchor_ts.isoformat(),
+            "current_price": anchor_price,
             "predicted_return": predicted_return,
             "predicted_price": predicted_price,
             "actual_price_1h": None,

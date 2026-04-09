@@ -15,7 +15,7 @@ class TestSplits(unittest.TestCase):
         self.assertTrue(len(split.val) > 0)
         self.assertTrue(len(split.test) > 0)
         self.assertTrue(split.train.index.max() < split.val.index.min())
-        self.assertTrue(split.val.index.max() <= split.test.index.max())
+        self.assertTrue(split.val.index.max() < split.test.index.min())
 
 
 if __name__ == "__main__":

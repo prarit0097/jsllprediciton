@@ -728,7 +728,7 @@ def get_recent_ready_predictions(timeframe: str, limit: int) -> List[Dict[str, A
     with connect() as con:
         cur = con.execute(
             """
-            SELECT predicted_return, current_price, actual_price_1h, predicted_price, match_percent
+            SELECT predicted_return, current_price, actual_price_1h, predicted_price, match_percent, regime
             FROM btc_predictions
             WHERE status = 'ready' AND timeframe = ?
             ORDER BY id DESC LIMIT ?
@@ -743,6 +743,7 @@ def get_recent_ready_predictions(timeframe: str, limit: int) -> List[Dict[str, A
             "actual_price_1h": r[2],
             "predicted_price": r[3],
             "match_percent": r[4],
+            "regime": r[5],
         }
         for r in rows
     ]

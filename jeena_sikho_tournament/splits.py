@@ -42,6 +42,8 @@ def walk_forward_split(df: pd.DataFrame, train_days: int, val_hours: int, test_h
     val = df.loc[val_start:val_end].copy()
     if not train.empty:
         train = train.loc[train.index < val_start].copy()
+    if test is not None and not val.empty:
+        val = val.loc[val.index < test.index.min()].copy()
 
     return Split(train=train, val=val, test=test)
 
