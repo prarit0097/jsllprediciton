@@ -145,6 +145,9 @@ Notable behaviors:
 - cached stale result fallback exists if fresh fetch fails
 - run-state JSON file helps async tournament status
 - prediction target timestamps respect NSE interval alignment
+- prediction generation now uses a dedicated inference frame built from the latest completed feature row
+- predicted price is anchored to that feature-row close instead of mixing a lagged model row with arbitrary current live price
+- recent bias and linear calibration can now prefer same-regime history when enough matched samples exist
 
 ## 8. Tournament / ML Layer
 
@@ -163,6 +166,9 @@ This package is responsible for:
 - diagnostics
 - drift-based retrain decisions
 - repair/backfill flows
+- holdout-aware tournament selection
+- full-data refit of selected artifacts before saving
+- served-ensemble governance and candidate-budget control
 
 Important modules:
 
@@ -176,6 +182,14 @@ Important modules:
 - `run_hourly.py`: scheduled orchestrator
 - `run_repair.py`: repair entry flow
 - `doctor.py`: self-check/smoke diagnostics
+
+Accuracy hardening now implemented in this layer:
+
+- optional `test` window is now treated as a real outer holdout for selection instead of being discarded
+- target clipping for tournament scoring is learned from training folds, not from the full dataset
+- selected top models are refit on the full pre-live dataset before model artifacts are saved
+- random global candidate truncation has been replaced by a stratified budget across tasks/families/feature sets
+- the served ensemble only updates when champion replacement actually happens
 
 ## 9. Feature Engineering Shape
 
@@ -194,8 +208,20 @@ Observed feature families include:
 - trend/range/high-vol/low-vol flags
 - gap from previous close
 - NSE session-aware time features
+- candle body/range/wick structure
+- close-location-in-bar context
+- distance from session open
+- previous-day high/low break flags
+- multi-lag candle returns (`ret_2c`, `ret_3c`)
+- realized-volatility ratio context (`vol_24` vs `vol_168`)
 
-Targets are also controlled, clipped, and normalized for more stable training.
+Targets are also controlled and normalized for more stable training.
+
+Important current nuance:
+
+- `make_supervised()` still builds the generic supervised frame for storage/research convenience
+- tournament evaluation now applies fold-local target shaping inside `tournament.py`, which removes the prior full-dataset leakage path
+- inference uses `make_inference_frame()` so serving no longer depends on the lagged labeled row
 
 ## 10. Prediction Behavior
 
@@ -212,6 +238,41 @@ Predictions are not just one raw number. The app tracks:
 
 The service layer also stores and updates pending predictions once target time passes.
 
+Implemented prediction-path improvements:
+
+- latest predictions now use the latest completed feature snapshot and its own anchor close price
+- holdout-aware selection metrics now influence champion scoring and scoreboard rows
+- regime-aware bias correction and regime-aware linear calibration are applied when enough matched history exists
+- context-rich feature sets are now available to the point-forecast path
+- return-model search now includes more robust regression families when sklearn is installed
+
+### Implemented Accuracy Program
+
+Phase 1:
+
+- disjoint holdout support
+- leakage reduction in tournament scoring
+- train/serve alignment
+- regression tests for split integrity and serving anchor behavior
+
+Phase 2:
+
+- full-data refit before artifact save
+- served-ensemble governance
+- stratified candidate budgeting
+- regression tests around tournament-selection helpers
+
+Phase 3:
+
+- richer context features
+- regime-specific bias and calibration
+- regression tests for context columns and regime-bucket correction
+
+Phase 4:
+
+- robust return-family expansion in the model zoo
+- regression tests for horizon-filter/model-zoo exposure
+
 ## 11. Runtime Storage
 
 There are two storage styles here:
@@ -224,6 +285,8 @@ There are two storage styles here:
 - registry JSON
 - log files
 - run-state JSON
+- saved model artifacts (`data/models/...`)
+- optional stacking artifacts for return ensembles
 
 Dashboard-specific runtime tables are managed by [`jeena_sikho_dashboard/db.py`](./jeena_sikho_dashboard/db.py).
 
@@ -235,6 +298,7 @@ Stored data includes:
 - match metadata
 - confidence flags
 - regime info
+- ensemble/run metadata used for accuracy tracking and selection
 
 ## 12. Environment and Configuration
 
@@ -273,6 +337,14 @@ Prediction quality / production gates:
 - `PRED_BAND_Z`
 - `PROD_MAX_MAPE`
 - `PROD_MIN_HIT_RATE`
+- `USE_TEST`
+- `TEST_HOURS`
+- `TARGET_WINSOR_LOWER`
+- `TARGET_WINSOR_UPPER`
+- `EVENT_DAY_DROP_FROM_TRAIN`
+- `BIAS_WINDOW`
+- `CALIBRATION_MIN_SAMPLES`
+- `CALIBRATION_LOOKBACK`
 
 Data quality / repair:
 
@@ -342,6 +414,18 @@ Tests:
 python -m pytest tests -q
 ```
 
+Targeted built-in regression suites can also be run without pytest:
+
+```powershell
+.\.venv\Scripts\python.exe -m unittest discover -s tests -p "test_splits.py"
+.\.venv\Scripts\python.exe -m unittest discover -s tests -p "test_leakage.py"
+.\.venv\Scripts\python.exe -m unittest discover -s tests -p "test_feature_quality.py"
+.\.venv\Scripts\python.exe -m unittest discover -s tests -p "test_phase1_alignment.py"
+.\.venv\Scripts\python.exe -m unittest discover -s tests -p "test_phase2_tournament.py"
+.\.venv\Scripts\python.exe -m unittest discover -s tests -p "test_phase3_context_and_calibration.py"
+.\.venv\Scripts\python.exe -m unittest discover -s tests -p "test_phase4_model_zoo.py"
+```
+
 Important note:
 
 - `manage.py test` does not discover the standalone `tests/` suite in this repo
@@ -384,13 +468,21 @@ Only use `git reset --hard` after taking a backup if the VPS folder contains loc
 - [`btcsite/urls.py`](./btcsite/urls.py): project URL entrypoint
 - [`price/views.py`](./price/views.py): simple/legacy quote page + JSON response
 - [`jeena_sikho_dashboard/views.py`](./jeena_sikho_dashboard/views.py): dashboard page and API view functions
-- [`jeena_sikho_dashboard/services.py`](./jeena_sikho_dashboard/services.py): core aggregation/business logic
-- [`jeena_sikho_dashboard/db.py`](./jeena_sikho_dashboard/db.py): runtime SQLite schema and accessors
+- [`jeena_sikho_dashboard/services.py`](./jeena_sikho_dashboard/services.py): core aggregation/business logic, inference alignment, regime-aware bias/calibration
+- [`jeena_sikho_dashboard/db.py`](./jeena_sikho_dashboard/db.py): runtime SQLite schema and accessors, recent ready-prediction retrieval with regime support
 - [`jeena_sikho_dashboard/templates/jeena_sikho_dashboard.html`](./jeena_sikho_dashboard/templates/jeena_sikho_dashboard.html): main dashboard HTML
 - [`jeena_sikho_dashboard/static/jeena_sikho_dashboard.js`](./jeena_sikho_dashboard/static/jeena_sikho_dashboard.js): dashboard client logic
+- [`jeena_sikho_tournament/features.py`](./jeena_sikho_tournament/features.py): features, supervised-frame generation, inference-frame generation, context features
+- [`jeena_sikho_tournament/models_zoo.py`](./jeena_sikho_tournament/models_zoo.py): candidate families including robust return models
+- [`jeena_sikho_tournament/tournament.py`](./jeena_sikho_tournament/tournament.py): holdout-aware scoring, full-data refit, candidate budgeting, ensemble governance
 - [`jeena_sikho_tournament/run_hourly.py`](./jeena_sikho_tournament/run_hourly.py): periodic orchestration
 - [`jeena_sikho_tournament/run_repair.py`](./jeena_sikho_tournament/run_repair.py): repair orchestration
 - [`jeena_sikho_tournament/doctor.py`](./jeena_sikho_tournament/doctor.py): health/smoke checks
+- [`plans/accuracy-improvement-phases.md`](./plans/accuracy-improvement-phases.md): phased implementation notes for the accuracy program
+- [`tests/test_phase1_alignment.py`](./tests/test_phase1_alignment.py): holdout/leakage/serving-alignment regression tests
+- [`tests/test_phase2_tournament.py`](./tests/test_phase2_tournament.py): refit/governance/budgeting regression tests
+- [`tests/test_phase3_context_and_calibration.py`](./tests/test_phase3_context_and_calibration.py): context-feature and regime-calibration tests
+- [`tests/test_phase4_model_zoo.py`](./tests/test_phase4_model_zoo.py): robust model-zoo exposure tests
 - [`scripts/run_hourly_task.cmd`](./scripts/run_hourly_task.cmd): helper launcher
 - [`scripts/run_nightly_repair.cmd`](./scripts/run_nightly_repair.cmd): helper launcher
 
@@ -398,9 +490,11 @@ Only use `git reset --hard` after taking a backup if the VPS folder contains loc
 
 Current repo risks visible from inspection:
 
-- root `btcsite/settings.py` is still dev-oriented (`DEBUG=True`, permissive/basic local settings)
 - `pytest` test runner is implied by repo layout but not pinned in `requirements.txt`
-- some docs were stale and BTC-oriented before this update
+- the checked-in local runtime snapshot is still too thin to prove real JSLL accuracy gains end-to-end
+- full tournament validation still depends on having populated JSLL data plus the full sklearn/booster dependency set available in the runtime
+- `doctor` is still a partial smoke-check surface and not a complete production-certification gate
+- `scripts/run_hourly_task.cmd` is still stale and BTC-era path specific
 - deployment is path-prefixed in production, so any future hardcoded root-relative frontend links must be checked carefully
 
 ## 17. Bottom Line
@@ -410,10 +504,13 @@ This repository is a JSLL-specific market intelligence application with:
 - live dashboard UX
 - NSE-aware tournament ML pipeline
 - prediction confidence/banding
+- holdout-aware evaluation and improved train/serve consistency
+- full-data model refit and better candidate-selection discipline
+- richer context features and regime-aware post-processing
 - drift and data-quality controls
 - deployment-ready service structure
 
-It is materially more than a basic Django CRUD or price app. The core value is operational prediction monitoring for one market instrument with scheduled retraining and production-facing summaries.
+It is materially more than a basic Django CRUD or price app. The core value is operational prediction monitoring for one market instrument with scheduled retraining, production-facing summaries, and now a materially stronger accuracy-improvement framework in the tournament and serving path.
 
 ## 18. Production Incident Notes
 

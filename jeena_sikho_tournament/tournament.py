@@ -28,7 +28,7 @@ from .storage import Storage
 from .validator import validate_ohlcv_quality
 from .market_calendar import load_nse_holidays
 from .repair import repair_timeframe_data
-from jeena_sikho_dashboard.db import insert_run, insert_scores
+from jeena_sikho_dashboard.db import get_recent_ready_predictions, insert_run, insert_scores
 
 def _update_predictions_safe(config) -> None:
     try:
@@ -247,6 +247,41 @@ def _final_score(trading: float, primary: float, stability: float, config: Tourn
     return 0.5 * trading + 0.3 * primary + config.stability_weight * (1 - stability)
 
 
+def _final_score_for_task(task: str, primary: float, trading: float, stability: float, config: TournamentConfig) -> float:
+    if task == "return":
+        return float((0.95 * primary) + (0.05 * (1 - stability)))
+    return _final_score(trading, primary, stability, config)
+
+
+def _price_metrics_from_returns(eval_df: pd.DataFrame, y_pred: np.ndarray, y_true: np.ndarray) -> Dict[str, float]:
+    base_price = eval_df["close"].to_numpy(dtype=float)
+    pred_price = base_price * np.exp(np.asarray(y_pred, dtype=float))
+    actual_price = base_price * np.exp(np.asarray(y_true, dtype=float))
+    abs_diff = np.abs(pred_price - actual_price)
+    pct_err = np.where(actual_price != 0.0, (abs_diff / np.abs(actual_price)) * 100.0, np.nan)
+    direction_hit = (np.sign(y_pred) == np.sign(y_true)).astype(float)
+    return {
+        "price_mae": float(np.mean(abs_diff)) if len(abs_diff) else 0.0,
+        "price_mape": float(np.nanmean(pct_err)) if len(pct_err) else 0.0,
+        "return_mae": float(mae(y_true, y_pred)),
+        "direction_hit_rate": float(np.mean(direction_hit) * 100.0) if len(direction_hit) else 0.0,
+        "avg_actual_price": float(np.mean(np.abs(actual_price))) if len(actual_price) else 1.0,
+    }
+
+
+def _selection_score_return(metrics: Dict[str, float]) -> float:
+    mean_price = float(metrics.get("avg_actual_price", 1.0)) + 1e-9
+    price_mae = float(metrics.get("price_mae", 0.0))
+    price_mape = float(metrics.get("price_mape", 100.0))
+    return_mae = float(metrics.get("return_mae", 0.0))
+    hit_rate = float(metrics.get("direction_hit_rate", 0.0)) / 100.0
+
+    price_mae_score = max(0.0, 1.0 - (price_mae / max(1.0, mean_price)))
+    price_mape_score = max(0.0, 1.0 - (price_mape / 100.0))
+    return_mae_score = _primary_score_reg(return_mae, y_true)
+    return float((0.7 * price_mae_score) + (0.15 * price_mape_score) + (0.1 * return_mae_score) + (0.05 * hit_rate))
+
+
 def _fit_predict_direction(spec: ModelSpec, X_train, y_train, X_val):
     model = spec.model
     model.fit(X_train, y_train)
@@ -431,14 +466,23 @@ def _score_candidate_once(
         else:
             y_pred = y_pred_model
         y_eval = eval_df["y_ret_raw"].values
-        mae_val = mae(y_eval, y_pred)
-        dir_acc = accuracy((y_eval > 0).astype(int), (y_pred > 0).astype(int))
+        price_metrics = _price_metrics_from_returns(eval_df, y_pred, y_eval)
+        mae_val = float(price_metrics["return_mae"])
+        dir_acc = float(price_metrics["direction_hit_rate"] / 100.0)
         close_hit = _close_hit_rate(y_eval, y_pred, config.close_hit_bps)
         positions = (y_pred > 0).astype(int)
         net, mdd, trading = trading_score(positions, y_eval, config.fee_slippage)
-        primary = _primary_score_reg_weighted(mae_val, y_eval, dir_acc, close_hit)
+        primary = _selection_score_return(price_metrics)
         return {
-            "metrics": {"mae": mae_val, "dir_acc": dir_acc, "close_hit": close_hit, "net": net, "mdd": mdd},
+            "metrics": {
+                "price_mae": price_metrics["price_mae"],
+                "price_mape": price_metrics["price_mape"],
+                "return_mae": mae_val,
+                "direction_hit_rate": price_metrics["direction_hit_rate"],
+                "close_hit": close_hit,
+                "net": net,
+                "mdd": mdd,
+            },
             "primary": primary,
             "trading": trading,
             "y_pred": np.asarray(y_pred),
@@ -702,6 +746,153 @@ def _activate_served_ensemble(
         registry.setdefault("ensembles", {})[task] = ensemble_record
 
 
+def _prediction_correlation(a: np.ndarray, b: np.ndarray) -> float:
+    left = np.asarray(a, dtype=float)
+    right = np.asarray(b, dtype=float)
+    if left.size == 0 or right.size == 0 or left.size != right.size:
+        return 0.0
+    if np.allclose(left, left[0]) or np.allclose(right, right[0]):
+        return 1.0 if np.allclose(left, right) else 0.0
+    corr = np.corrcoef(left, right)[0, 1]
+    if not np.isfinite(corr):
+        return 0.0
+    return float(corr)
+
+
+def _select_diverse_ensemble_candidates(task_results: List[Dict[str, Any]], top_k: int) -> List[Dict[str, Any]]:
+    if top_k <= 1 or len(task_results) <= 1:
+        return task_results[:top_k]
+    max_corr = float(os.getenv("ENSEMBLE_MAX_CORR", "0.985"))
+    selected: List[Dict[str, Any]] = []
+    selected_ids: set[str] = set()
+    for candidate in task_results:
+        preds_raw = candidate.get("y_pred")
+        preds = np.asarray(preds_raw if preds_raw is not None else [], dtype=float)
+        if not selected:
+            selected.append(candidate)
+            selected_ids.add(_model_id(candidate["spec"], candidate["feature_set_id"]))
+            continue
+        too_similar = False
+        for existing in selected:
+            existing_preds_raw = existing.get("y_pred")
+            existing_preds = np.asarray(existing_preds_raw if existing_preds_raw is not None else [], dtype=float)
+            corr = abs(_prediction_correlation(preds, existing_preds))
+            if corr >= max_corr:
+                too_similar = True
+                break
+        if not too_similar:
+            selected.append(candidate)
+            selected_ids.add(_model_id(candidate["spec"], candidate["feature_set_id"]))
+        if len(selected) >= top_k:
+            break
+    if not selected:
+        return task_results[:top_k]
+    if len(selected) < min(top_k, len(task_results)):
+        for candidate in task_results:
+            model_id = _model_id(candidate["spec"], candidate["feature_set_id"])
+            if model_id in selected_ids:
+                continue
+            selected.append(candidate)
+            selected_ids.add(model_id)
+            if len(selected) >= top_k:
+                break
+    return selected
+
+
+def _learn_member_weights(results: List[Dict[str, Any]]) -> Dict[str, float]:
+    weights: Dict[str, float] = {}
+    raw_weights: Dict[str, float] = {}
+    for result in results:
+        metrics = result.get("holdout_metrics") or result.get("metrics") or {}
+        error = metrics.get("price_mae")
+        if error is None:
+            error = metrics.get("return_mae")
+        if error is None:
+            error = metrics.get("pinball")
+        try:
+            err_val = max(1e-9, float(error))
+        except (TypeError, ValueError):
+            err_val = 1.0
+        model_id = _model_id(result["spec"], result["feature_set_id"])
+        raw_weights[model_id] = 1.0 / err_val
+    total = sum(raw_weights.values()) or 1.0
+    for model_id, raw in raw_weights.items():
+        weights[model_id] = float(raw / total)
+    return weights
+
+
+def _calibration_bucket_summary(timeframe: str, limit: int = 200) -> List[Dict[str, Any]]:
+    rows = get_recent_ready_predictions(timeframe, limit)
+    buckets: Dict[str, List[Tuple[float, float]]] = {}
+    for row in rows:
+        predicted = row.get("predicted_return")
+        cur = row.get("current_price")
+        actual = row.get("actual_price_1h")
+        if predicted is None or cur is None or actual is None:
+            continue
+        try:
+            predicted_ret = float(predicted)
+            cur_v = float(cur)
+            act_v = float(actual)
+        except (TypeError, ValueError):
+            continue
+        if cur_v <= 0 or act_v <= 0:
+            continue
+        actual_ret = float(np.log(act_v / cur_v))
+        regime = str(row.get("regime") or "unknown")
+        buckets.setdefault(regime, []).append((predicted_ret, actual_ret))
+
+    out: List[Dict[str, Any]] = []
+    for regime, vals in sorted(buckets.items()):
+        preds = np.asarray([v[0] for v in vals], dtype=float)
+        actuals = np.asarray([v[1] for v in vals], dtype=float)
+        rmse = float(np.sqrt(np.mean((actuals - preds) ** 2))) if len(vals) else None
+        out.append({"regime": regime, "samples": len(vals), "calibration_rmse": rmse})
+    return out
+
+
+def _run_artifact_payload(
+    config: TournamentConfig,
+    task_results_by_task: Dict[str, Dict[str, Any]],
+    *,
+    holdout_train_df: Optional[pd.DataFrame],
+    holdout_eval_df: Optional[pd.DataFrame],
+    run_at: str,
+) -> Dict[str, Any]:
+    train_start = str(holdout_train_df.index.min()) if holdout_train_df is not None and not holdout_train_df.empty else None
+    train_end = str(holdout_train_df.index.max()) if holdout_train_df is not None and not holdout_train_df.empty else None
+    holdout_start = str(holdout_eval_df.index.min()) if holdout_eval_df is not None and not holdout_eval_df.empty else None
+    holdout_end = str(holdout_eval_df.index.max()) if holdout_eval_df is not None and not holdout_eval_df.empty else None
+    served = task_results_by_task.get("return") or {}
+    served_artifact = {
+        "task": "return",
+        "artifact_type": "ensemble" if served.get("ensemble", {}).get("members") else "champion",
+        "artifact_id": served.get("served_artifact_id"),
+        "holdout_metrics": served.get("best", {}).get("holdout_metrics") or served.get("best", {}).get("metrics"),
+        "selection_basis": "holdout",
+    }
+    return {
+        "run_at": run_at,
+        "timeframe": config.timeframe,
+        "candle_minutes": config.candle_minutes,
+        "selection_basis": "holdout",
+        "train_window": {"start": train_start, "end": train_end},
+        "holdout_window": {"start": holdout_start, "end": holdout_end},
+        "tasks": task_results_by_task,
+        "served_artifact": served_artifact,
+        "calibration_buckets": _calibration_bucket_summary(config.timeframe),
+    }
+
+
+def _save_run_artifact(config: TournamentConfig, payload: Dict[str, Any]) -> None:
+    path = config.data_dir / f"run_artifact_{config.candle_minutes}m.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    with tmp.open("w", encoding="utf8") as fh:
+        json.dump(payload, fh, indent=2)
+    tmp.replace(path)
+
+
 def run_tournament(config: TournamentConfig) -> Dict[str, Any]:
     _setup_logging(config.log_path)
     LOGGER.info("Starting tournament")
@@ -935,7 +1126,7 @@ def run_tournament(config: TournamentConfig) -> Dict[str, Any]:
                 stab = stability_penalty(registry, family)
                 selection_primary = float(r.get("holdout_primary", r["primary"]))
                 selection_trading = float(r.get("holdout_trading", r["trading"]))
-                final = _final_score(selection_trading, selection_primary, stab, config)
+                final = _final_score_for_task(task, selection_primary, selection_trading, stab, config)
                 r["final_score"] = final
                 r["stability"] = stab
                 r["family"] = family
@@ -947,11 +1138,13 @@ def run_tournament(config: TournamentConfig) -> Dict[str, Any]:
             artifacts_dir.mkdir(parents=True, exist_ok=True)
             ts = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
             top_k = max(1, min(config.ensemble_top_k, len(task_results)))
+            selected_for_ensemble = _select_diverse_ensemble_candidates(task_results, top_k) if task == "return" else task_results[:top_k]
+            ensemble_weights = _learn_member_weights(selected_for_ensemble) if task == "return" else {}
             ensemble_members: List[Dict[str, Any]] = []
             best_member: Optional[Dict[str, Any]] = None
             best_saved_model: Any = None
 
-            for rank, r in enumerate(task_results[:top_k], start=1):
+            for rank, r in enumerate(selected_for_ensemble, start=1):
                 spec = r["spec"]
                 fs_id = r["feature_set_id"]
                 model_id = _model_id(spec, fs_id)
@@ -991,6 +1184,7 @@ def run_tournament(config: TournamentConfig) -> Dict[str, Any]:
                     "final_score": r["final_score"],
                     "family": r["family"],
                     "target_mode": r.get("target_mode"),
+                    "ensemble_weight": ensemble_weights.get(model_id),
                 }
                 if model_path:
                     ensemble_members.append(member)
@@ -1007,13 +1201,13 @@ def run_tournament(config: TournamentConfig) -> Dict[str, Any]:
                     member_ids = [m["model_id"] for m in ensemble_members]
                     preds_map = {
                         _model_id(r["spec"], r["feature_set_id"]): r["y_pred"]
-                        for r in task_results
+                        for r in selected_for_ensemble
                     }
                     if all(mid in preds_map for mid in member_ids):
                         X_meta = np.column_stack([preds_map[mid] for mid in member_ids])
-                        y_true = task_results[0].get("y_true")
+                        y_true = selected_for_ensemble[0].get("y_true")
                         if isinstance(y_true, np.ndarray) and len(y_true) == X_meta.shape[0]:
-                            meta = Ridge(alpha=1.0)
+                            meta = Ridge(alpha=1.0, positive=True)
                             meta.fit(X_meta, y_true)
                             meta_path = artifacts_dir / f"stacking_{ts}.pkl"
                             joblib.dump(meta, meta_path)
@@ -1087,10 +1281,20 @@ def run_tournament(config: TournamentConfig) -> Dict[str, Any]:
             })
             registry["history"][task] = registry["history"][task][-config.history_keep:]
 
+            served_artifact_id = None
+            current_served_ensemble = registry.get("ensembles", {}).get(task) or {}
+            if current_served_ensemble.get("members"):
+                served_artifact_id = f"ensemble::{task}::{config.timeframe}"
+            else:
+                current_champ = registry.get("champions", {}).get(task) or {}
+                served_artifact_id = current_champ.get("model_id")
+
             results[task] = {
                 "best": challenger,
                 "decision": decision.reason,
                 "served_ensemble_updated": decision.replaced,
+                "served_artifact_id": served_artifact_id,
+                "ensemble": current_served_ensemble,
                 "top_scores": [
                     {"model_id": _model_id(r["spec"], r["feature_set_id"]), "final_score": r["final_score"]}
                     for r in task_results[:5]
@@ -1099,13 +1303,13 @@ def run_tournament(config: TournamentConfig) -> Dict[str, Any]:
 
             for idx, r in enumerate(task_results, start=1):
                 metrics_for_board = r.get("holdout_metrics") or r["metrics"]
-                metric_name = "accuracy" if task == "direction" else "weighted_obj" if task == "return" else "pinball"
+                metric_name = "accuracy" if task == "direction" else "price_mae" if task == "return" else "pinball"
                 if r.get("holdout_metrics") is not None:
                     metric_name = f"holdout_{metric_name}"
                 metric_value = (
                     metrics_for_board.get("accuracy")
                     if task == "direction"
-                    else r.get("selection_primary")
+                    else metrics_for_board.get("price_mae")
                     if task == "return"
                     else metrics_for_board.get("pinball")
                 )
@@ -1136,6 +1340,17 @@ def run_tournament(config: TournamentConfig) -> Dict[str, Any]:
         for row in scoreboard_rows:
             row["run_at"] = run_at
         save_registry(config.registry_path, registry)
+        try:
+            artifact_payload = _run_artifact_payload(
+                config,
+                {k: v for k, v in results.items() if k != "coverage"},
+                holdout_train_df=holdout_train_df if holdout_train_df is not None and not holdout_train_df.empty else cv_source,
+                holdout_eval_df=holdout_eval_df,
+                run_at=run_at,
+            )
+            _save_run_artifact(config, artifact_payload)
+        except Exception as exc:
+            LOGGER.warning("Failed to save run artifact: %s", exc)
         try:
             duration_seconds = (run_finished_at - run_started_at).total_seconds()
             run_id = insert_run(

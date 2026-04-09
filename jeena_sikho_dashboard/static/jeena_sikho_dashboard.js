@@ -327,6 +327,19 @@ function formatConfidence(pred) {
   return `${fmt(c, 1)}%`;
 }
 
+function formatPredictionProvenance(pred) {
+  if (!pred) return '';
+  const anchorAt = pred.forecast_anchor_at || pred.predicted_at;
+  const targetAt = pred.target_iso || null;
+  const anchorPrice = pred.forecast_anchor_price;
+  const anchorLabel = anchorAt ? `Anchor: ${fmtDateTimeLower(anchorAt)}` : 'Anchor: --';
+  const anchorPriceLabel = anchorPrice !== null && anchorPrice !== undefined
+    ? ` @ ${formatDualPrice(anchorPrice, lastFxRate)}`
+    : '';
+  const targetLabel = targetAt ? ` | Target: ${fmtDateTimeLower(targetAt)}` : '';
+  return `${anchorLabel}${anchorPriceLabel}${targetLabel}`;
+}
+
 function formatDiffHtml(pred, lineBreak = false) {
   if (!pred) return '';
   const predicted = pred.predicted_price;
@@ -377,6 +390,7 @@ function renderPriceRow(primary, nowPriceUsd, nowPriceInr) {
   const conf = formatConfidence(primary);
   const match = statusText(primary);
   const isSingle = Array.isArray(lastPrediction?.predictions) && lastPrediction.predictions.length <= 1;
+  const provenance = formatPredictionProvenance(primary);
 
   const lastReady = primary.last_ready;
 
@@ -385,7 +399,7 @@ function renderPriceRow(primary, nowPriceUsd, nowPriceInr) {
     if (priceRow) {
       priceRow.style.display = '';
       priceRow.innerHTML = `
-        <span class="price-left">Predicted (${label || `${horizonMin}m`}): ${predDisplay}${band} | Conf: ${conf}${primary.low_confidence ? ' low' : ''} | Match: ${match}</span>
+        <span class="price-left">Predicted (${label || `${horizonMin}m`}): ${predDisplay}${band} | Conf: ${conf}${primary.low_confidence ? ' low' : ''} | Match: ${match}<br><span class="muted">${provenance}</span></span>
         <span class="price-right"></span>
       `;
     }
@@ -452,6 +466,7 @@ function renderPredList(predictions) {
       : '';
     const conf = formatConfidence(pred);
     const match = statusText(pred);
+    const provenance = formatPredictionProvenance(pred);
 
     let lastMatchedLine = 'Last matched on last predicted price: --';
     let diffActualLine = 'Difference: -- | Actual: --';
@@ -469,7 +484,7 @@ function renderPredList(predictions) {
       diffActualLine = `${diffOnly} | ${actualLine}${actualTime ? ' ' + actualTime : ''}`;
     }
 
-    const line = `Predicted (${label}): ${predPrice}${band} | Conf: ${conf}${pred.low_confidence ? ' low' : ''} | Match: ${match}<br>${lastMatchedLine}<br>${diffActualLine}`;
+    const line = `Predicted (${label}): ${predPrice}${band} | Conf: ${conf}${pred.low_confidence ? ' low' : ''} | Match: ${match}<br>${provenance}<br>${lastMatchedLine}<br>${diffActualLine}`;
 
     const item = document.createElement('div');
     item.className = 'pred-item';

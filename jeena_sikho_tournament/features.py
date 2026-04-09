@@ -211,10 +211,21 @@ def _event_target_defaults(candle_minutes: int) -> tuple[float, float]:
     return 0.08, 0.05
 
 
-def _target_scale_series(df: pd.DataFrame) -> pd.Series:
+def _target_scale_series(df: pd.DataFrame, candle_minutes: int) -> pd.Series:
     vol_floor = float(os.getenv("TARGET_VOL_FLOOR", "0.001"))
     vol_cap = float(os.getenv("TARGET_VOL_CAP", "0.08"))
-    target_scale = df.get("vol_24", pd.Series(1.0, index=df.index))
+    if candle_minutes <= 120:
+        span = 12
+    elif candle_minutes >= 1440:
+        span = 30
+    else:
+        span = 20
+    base = df.get("ret_1c", pd.Series(0.0, index=df.index)).astype(float)
+    target_scale = base.ewm(span=span, adjust=False, min_periods=min(span, 5)).std(bias=False)
+    if target_scale is None or target_scale.empty:
+        target_scale = df.get("vol_24", pd.Series(1.0, index=df.index))
+    fallback = df.get("vol_24", pd.Series(1.0, index=df.index))
+    target_scale = target_scale.fillna(fallback).fillna(1.0)
     return target_scale.clip(lower=max(1e-6, vol_floor), upper=max(vol_floor, vol_cap))
 
 
@@ -226,7 +237,7 @@ def _annotate_model_context(df: pd.DataFrame, candle_minutes: int) -> pd.DataFra
     if "gap_from_prev_close" in out.columns:
         event_mask = out["gap_from_prev_close"].abs() >= event_gap
     out["is_event_day"] = event_mask.astype(int)
-    out["target_scale"] = _target_scale_series(out)
+    out["target_scale"] = _target_scale_series(out, candle_minutes)
     return out
 
 

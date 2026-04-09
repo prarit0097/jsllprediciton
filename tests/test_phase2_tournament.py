@@ -10,6 +10,7 @@ from jeena_sikho_tournament.tournament import (
     _activate_served_ensemble,
     _cap_candidates_by_task_budget,
     _fit_final_model,
+    _select_diverse_ensemble_candidates,
 )
 
 
@@ -65,6 +66,31 @@ class Phase2TournamentTests(unittest.TestCase):
 
         _activate_served_ensemble(registry, "return", candidate, replaced=True)
         self.assertEqual(registry["ensembles"]["return"]["members"][0]["model_id"], "new")
+
+    def test_diverse_selection_filters_near_duplicate_predictions(self):
+        rows = [
+            {
+                "spec": ModelSpec("m1", ZeroRegressor(), "return", {"family": "zero", "group": "fast"}),
+                "feature_set_id": "a",
+                "y_pred": np.array([0.1, 0.2, 0.3, 0.4]),
+            },
+            {
+                "spec": ModelSpec("m2", ZeroRegressor(), "return", {"family": "zero", "group": "fast"}),
+                "feature_set_id": "b",
+                "y_pred": np.array([0.1, 0.2, 0.3, 0.4]),
+            },
+            {
+                "spec": ModelSpec("m3", ZeroRegressor(), "return", {"family": "zero", "group": "fast"}),
+                "feature_set_id": "c",
+                "y_pred": np.array([-0.2, 0.1, -0.3, 0.5]),
+            },
+        ]
+
+        selected = _select_diverse_ensemble_candidates(rows, top_k=2)
+        ids = {(row["spec"].name, row["feature_set_id"]) for row in selected}
+        self.assertEqual(len(selected), 2)
+        self.assertIn(("m1", "a"), ids)
+        self.assertIn(("m3", "c"), ids)
 
 
 if __name__ == "__main__":

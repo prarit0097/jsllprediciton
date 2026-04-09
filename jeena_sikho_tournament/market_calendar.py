@@ -102,11 +102,21 @@ def next_nse_trading_day_start(ts_ist: datetime, holidays: Set[date]) -> datetim
     return cur
 
 
+def last_nse_slot_minute(minutes: int) -> int:
+    step = max(1, int(minutes))
+    if step >= 1440:
+        return NSE_CLOSE_MIN
+    slots = (NSE_CLOSE_MIN - NSE_OPEN_MIN) // step
+    return NSE_OPEN_MIN + (slots * step)
+
+
 def align_to_nse_interval_floor(ts_utc: datetime, minutes: int, holidays: Set[date]) -> datetime:
     step = max(1, int(minutes))
     ts_ist = ts_utc.astimezone(IST).replace(second=0, microsecond=0)
     day_open = ts_ist.replace(hour=9, minute=15, second=0, microsecond=0)
-    day_close = ts_ist.replace(hour=15, minute=30, second=0, microsecond=0)
+    last_slot_min = last_nse_slot_minute(step)
+    close_hh, close_mm = divmod(last_slot_min, 60)
+    day_close = ts_ist.replace(hour=close_hh, minute=close_mm, second=0, microsecond=0)
 
     if not is_nse_trading_day(ts_ist, holidays):
         prev = (ts_ist - timedelta(days=1)).replace(hour=15, minute=30, second=0, microsecond=0)
@@ -136,12 +146,14 @@ def next_nse_slot_at_or_after(ts_utc: datetime, minutes: int, holidays: Set[date
             cur = next_nse_trading_day_start(cur + timedelta(days=1), holidays)
             continue
         day_open = cur.replace(hour=9, minute=15, second=0, microsecond=0)
-        day_close = cur.replace(hour=15, minute=30, second=0, microsecond=0)
+        last_slot_min = last_nse_slot_minute(step)
+        close_hh, close_mm = divmod(last_slot_min, 60)
+        day_close = cur.replace(hour=close_hh, minute=close_mm, second=0, microsecond=0)
         cur_min = cur.hour * 60 + cur.minute
         if cur_min < NSE_OPEN_MIN:
             cur = day_open
             continue
-        if cur_min > NSE_CLOSE_MIN:
+        if cur_min > last_slot_min:
             cur = next_nse_trading_day_start(cur + timedelta(days=1), holidays)
             continue
         delta = int((cur - day_open).total_seconds() // 60)

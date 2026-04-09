@@ -21,6 +21,7 @@ from jeena_sikho_tournament.market_calendar import (
     nse_market_state,
 )
 from jeena_sikho_tournament.storage import Storage
+from jeena_sikho_tournament.validator import assess_freshness
 
 from .db import (
     ensure_tables,
@@ -447,17 +448,24 @@ def _ensure_recent_data(config: TournamentConfig, days: int = 14) -> pd.DataFram
         latest = df.index.max()
         if latest is None:
             need_fetch = True
-        elif _is_indian_equity():
-            if latest < (now_utc - timedelta(days=2)):
+        else:
+            holidays = _NSE_HOLIDAYS if _is_indian_equity() else set()
+            freshness = assess_freshness(
+                df,
+                config.candle_minutes,
+                nse_mode=_is_indian_equity(),
+                holidays=holidays,
+                now_utc=now_utc,
+            )
+            if freshness.get("stale"):
                 need_fetch = True
-            if len(df) < 200:
+            if _is_indian_equity() and len(df) < 200:
                 need_fetch = True
             if "source" in df.columns:
                 uniq = set(str(v).lower() for v in df["source"].dropna().unique())
                 if uniq and uniq.issubset({"doctor"}):
                     need_fetch = True
-        else:
-            if latest < (now_utc - timedelta(days=2)):
+            if not _is_indian_equity() and latest < (now_utc - timedelta(days=2)):
                 need_fetch = True
     if not need_fetch:
         return df
@@ -479,10 +487,33 @@ def _ensure_recent_data(config: TournamentConfig, days: int = 14) -> pd.DataFram
         return df
 
 
+def _run_artifact_path(config: TournamentConfig) -> Path:
+    return config.data_dir / f"run_artifact_{config.candle_minutes}m.json"
+
+
+def _load_run_artifact(config: TournamentConfig) -> Dict[str, Any]:
+    path = _run_artifact_path(config)
+    if not path.exists():
+        return {}
+    try:
+        with path.open("r", encoding="utf8") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
 def _latest_feature_snapshot(config: TournamentConfig) -> Optional[Dict[str, Any]]:
     df = _ensure_recent_data(config)
     if df.empty:
         return None
+    freshness = assess_freshness(
+        df,
+        config.candle_minutes,
+        nse_mode=_is_indian_equity(),
+        holidays=_NSE_HOLIDAYS if _is_indian_equity() else set(),
+        now_utc=datetime.now(timezone.utc),
+    )
     feature_df = make_inference_frame(
         df,
         candle_minutes=config.candle_minutes,
@@ -501,6 +532,7 @@ def _latest_feature_snapshot(config: TournamentConfig) -> Optional[Dict[str, Any
         "latest_row": latest_row,
         "anchor_ts": anchor_ts,
         "anchor_price": anchor_price,
+        "freshness": freshness,
     }
 
 
@@ -731,6 +763,8 @@ def get_tournament_summary(config: TournamentConfig) -> Dict[str, Any]:
         reg = _load_registry(tf_cfg.registry_path)
         champions = reg.get("champions", {}) if isinstance(reg, dict) else {}
     champions_by_horizon: Dict[str, Any] = {}
+    run_artifacts_by_horizon: Dict[str, Any] = {}
+    freshness_by_horizon: Dict[str, Any] = {}
     for tf in get_timeframes(config):
         cfg_tf = _config_for_timeframe(config, tf)
         reg_tf = _load_registry(cfg_tf.registry_path)
@@ -742,6 +776,9 @@ def get_tournament_summary(config: TournamentConfig) -> Dict[str, Any]:
             "range": _champion_detail_from_registry(reg_tf, "range"),
         }
         champions_by_horizon[tf] = champs_tf
+        run_artifacts_by_horizon[tf] = _load_run_artifact(cfg_tf)
+        snapshot = _latest_feature_snapshot(cfg_tf)
+        freshness_by_horizon[tf] = snapshot.get("freshness") if snapshot else None
 
     drift_status = _compute_drift_status(config)
     backtest_report = _build_backtest_report(config)
@@ -752,6 +789,8 @@ def get_tournament_summary(config: TournamentConfig) -> Dict[str, Any]:
         "last_run_started_at": run_started_at,
         "last_run_finished_at": run_finished_at,
         "run_mode": latest_run["run_mode"] if latest_run else None,
+        "selection_basis": "holdout",
+        "forecast_generation_basis": "completed_bar",
         "candidate_count": candidate_count,
         "champions": champions,
         "champions_by_horizon": champions_by_horizon,
@@ -761,6 +800,8 @@ def get_tournament_summary(config: TournamentConfig) -> Dict[str, Any]:
         "backtest_report": backtest_report,
         "completeness_by_horizon": completeness_rows,
         "auto_retrain_recommended": auto_retrain,
+        "run_artifacts_by_horizon": run_artifacts_by_horizon,
+        "freshness_by_horizon": freshness_by_horizon,
     }
 
 
@@ -791,10 +832,7 @@ def update_pending_predictions(config: TournamentConfig) -> None:
         table = "ohlcv" if int(tf_minutes) == 60 else f"ohlcv_{int(tf_minutes)}m"
         actual = get_ohlcv_close_at(target_iso, table=table)
         if actual is None:
-            try:
-                actual = get_live_price()["price"]
-            except Exception:
-                continue
+            continue
         metrics = _compute_match_metrics(p.get("predicted_price"), actual)
         update_prediction(p["id"], actual, metrics["match_percent"], "ready")
 
@@ -806,12 +844,18 @@ def _target_mode() -> str:
 def _target_scale_from_latest(latest_row: pd.DataFrame) -> float:
     if latest_row is None or latest_row.empty:
         return 1.0
+    if "target_scale" in latest_row.columns:
+        try:
+            raw = float(latest_row.iloc[-1].get("target_scale", 1.0))
+        except Exception:
+            raw = 1.0
+    else:
+        try:
+            raw = float(latest_row.iloc[-1].get("vol_24", 1.0))
+        except Exception:
+            raw = 1.0
     floor = float(os.getenv("TARGET_VOL_FLOOR", "0.001"))
     cap = float(os.getenv("TARGET_VOL_CAP", "0.08"))
-    try:
-        raw = float(latest_row.iloc[-1].get("vol_24", 1.0))
-    except Exception:
-        raw = 1.0
     if not np.isfinite(raw):
         raw = 1.0
     return float(max(max(1e-6, floor), min(max(floor, cap), raw)))
@@ -866,14 +910,6 @@ def _predict_return_from_ensemble(config: TournamentConfig, latest_row: pd.DataF
     candidates: List[Dict[str, Any]] = []
     pred_map: Dict[str, float] = {}
     regime_name = regime or _market_regime()
-    regime_pref = {
-        "opening": {"micro_momentum", "momentum", "session", "vwap_flow"},
-        "mid_session": {"trend", "trend_longer", "signal", "base"},
-        "closing": {"trend_longer", "volatility", "session", "trend"},
-        "off_session": {"trend_longer", "long", "base"},
-        "always": {"base", "trend", "signal"},
-    }
-    pref = regime_pref.get(regime_name, set())
     for member in members:
         model_path = member.get("model_path")
         if not model_path:
@@ -887,14 +923,13 @@ def _predict_return_from_ensemble(config: TournamentConfig, latest_row: pd.DataF
         pred_val = _denorm_return(pred_model, latest_row, member.get("target_mode"))
         if not np.isfinite(pred_val):
             continue
-        weight = member.get("final_score")
+        weight = member.get("ensemble_weight", member.get("final_score"))
         try:
             weight_val = float(weight) if weight is not None else 1.0
         except (TypeError, ValueError):
             weight_val = 1.0
         fs_id = str(member.get("feature_set_id") or "")
-        regime_bonus = 0.2 if fs_id in pref else 0.0
-        routed_weight = max(0.0, weight_val + regime_bonus)
+        routed_weight = max(0.0, weight_val)
         model_id = member.get("model_id", "unknown")
         pred_map[model_id] = pred_val
         candidates.append(
@@ -1118,6 +1153,22 @@ def _apply_return_calibrator(predicted_return: float, calibrator: Dict[str, Any]
     alpha = float(calibrator.get("alpha", 0.0))
     beta = float(calibrator.get("beta", 1.0))
     return float(alpha + (beta * float(predicted_return)))
+
+
+def _decorate_prediction_provenance(
+    row: Dict[str, Any],
+    *,
+    holdout_metric: Optional[float] = None,
+    calibration_regime: Optional[str] = None,
+    selection_basis: str = "holdout",
+) -> Dict[str, Any]:
+    row["forecast_anchor_at"] = row.get("predicted_at")
+    row["forecast_anchor_price"] = row.get("current_price")
+    row["generated_from_completed_bar"] = True
+    row["selection_basis"] = selection_basis
+    row["holdout_primary_metric"] = holdout_metric
+    row["calibration_regime"] = calibration_regime or row.get("regime")
+    return row
 
 
 def _summarize_ready_metrics(rows: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
@@ -1476,6 +1527,13 @@ def refresh_prediction(config: TournamentConfig) -> Dict[str, Any]:
         anchor_ts = snapshot["anchor_ts"]
         anchor_price = snapshot["anchor_price"]
         source_df = snapshot["source_df"]
+        freshness = snapshot.get("freshness") or {}
+        run_artifact = _load_run_artifact(tf_cfg)
+        holdout_metric = None
+        try:
+            holdout_metric = float((((run_artifact.get("served_artifact") or {}).get("holdout_metrics") or {}).get("price_mae")))
+        except Exception:
+            holdout_metric = None
 
         if latest:
             pred_at = _parse_iso_utc(latest["predicted_at"])
@@ -1483,6 +1541,12 @@ def refresh_prediction(config: TournamentConfig) -> Dict[str, Any]:
                 _apply_match_fields(latest)
                 _decorate_pending_target(latest, horizon_min)
                 latest["last_ready"] = _resolve_last_ready(timeframe, horizon_min)
+                latest["data_freshness"] = freshness
+                _decorate_prediction_provenance(
+                    latest,
+                    holdout_metric=holdout_metric,
+                    calibration_regime=latest.get("regime"),
+                )
                 predictions.append(latest)
                 continue
 
@@ -1492,8 +1556,39 @@ def refresh_prediction(config: TournamentConfig) -> Dict[str, Any]:
                 _apply_match_fields(latest)
                 latest["status"] = latest.get("status") or "market_closed"
                 latest["last_ready"] = _resolve_last_ready(timeframe, horizon_min)
+                latest["data_freshness"] = freshness
+                _decorate_prediction_provenance(
+                    latest,
+                    holdout_metric=holdout_metric,
+                    calibration_regime=latest.get("regime"),
+                )
                 predictions.append(latest)
                 continue
+
+        if freshness.get("stale"):
+            if latest:
+                _apply_match_fields(latest)
+                latest["status"] = "stale_data"
+                latest["last_ready"] = _resolve_last_ready(timeframe, horizon_min)
+                latest["data_freshness"] = freshness
+                _decorate_prediction_provenance(
+                    latest,
+                    holdout_metric=holdout_metric,
+                    calibration_regime=latest.get("regime"),
+                )
+                predictions.append(latest)
+            else:
+                predictions.append(
+                    {
+                        "timeframe": timeframe,
+                        "timeframe_minutes": horizon_min,
+                        "prediction_horizon_min": horizon_min,
+                        "prediction_target": target_label,
+                        "status": "stale_data",
+                        "data_freshness": freshness,
+                    }
+                )
+            continue
 
         regime = _market_regime()
         pred = _predict_return_from_ensemble(tf_cfg, latest_row, regime=regime)
@@ -1522,13 +1617,9 @@ def refresh_prediction(config: TournamentConfig) -> Dict[str, Any]:
         predicted_return = _apply_return_calibrator(predicted_return, calibrator)
         confidence_pct = float(pred.get("confidence_pct") or 55.0)
         low_conf_threshold = float(os.getenv("LOW_CONFIDENCE_PCT", "45"))
-        downweight = float(os.getenv("LOW_CONF_DOWNWEIGHT", "0.5"))
         skip_threshold = float(os.getenv("LOW_CONFIDENCE_SKIP_PCT", "0"))
         low_confidence = confidence_pct < low_conf_threshold
         skipped_low_conf = skip_threshold > 0 and confidence_pct < skip_threshold
-        if low_confidence:
-            factor = max(0.1, min(1.0, downweight * (confidence_pct / max(1.0, low_conf_threshold))))
-            predicted_return = float(predicted_return * factor)
         predicted_return = _clip_return(predicted_return, horizon_min)
         ret_std = pred.get("uncertainty_return_std")
         try:
@@ -1537,6 +1628,9 @@ def refresh_prediction(config: TournamentConfig) -> Dict[str, Any]:
             ret_std_val = max(0.0005, abs(predicted_return) * 0.5)
         max_band_std = float(os.getenv("MAX_RETURN_STD", "0.12"))
         ret_std_val = max(0.0001, min(max_band_std, ret_std_val))
+        if low_confidence:
+            widen = 1.0 + max(0.0, (low_conf_threshold - confidence_pct) / max(1.0, low_conf_threshold))
+            ret_std_val = max(0.0001, min(max_band_std, ret_std_val * widen))
         predicted_price = _price_from_log_return(float(anchor_price), predicted_return)
         band_z = float(os.getenv("PRED_BAND_Z", "1.64"))
         low_price = _price_from_log_return(float(anchor_price), predicted_return - (band_z * ret_std_val))
@@ -1575,6 +1669,12 @@ def refresh_prediction(config: TournamentConfig) -> Dict[str, Any]:
             record["ensemble_members"] = pred.get("ensemble_members")
             record["ensemble_size"] = pred.get("ensemble_size")
         _apply_match_fields(record)
+        record["data_freshness"] = freshness
+        _decorate_prediction_provenance(
+            record,
+            holdout_metric=holdout_metric,
+            calibration_regime=calibrator.get("regime") if calibrator else regime,
+        )
         predictions.append(record)
 
     return {
@@ -1592,10 +1692,25 @@ def latest_prediction(config: TournamentConfig, update_pending: bool = True) -> 
     for timeframe in get_timeframes(config):
         latest = get_latest_prediction_for_timeframe(timeframe)
         horizon_min = _timeframe_to_minutes(timeframe, config.candle_minutes)
+        tf_cfg = _config_for_timeframe(config, timeframe)
+        run_artifact = _load_run_artifact(tf_cfg)
+        holdout_metric = None
+        try:
+            holdout_metric = float((((run_artifact.get("served_artifact") or {}).get("holdout_metrics") or {}).get("price_mae")))
+        except Exception:
+            holdout_metric = None
+        snapshot = _latest_feature_snapshot(tf_cfg)
+        freshness = snapshot.get("freshness") if snapshot else None
         if latest:
             _apply_match_fields(latest)
             _decorate_pending_target(latest, horizon_min)
             latest["last_ready"] = _resolve_last_ready(timeframe, horizon_min)
+            latest["data_freshness"] = freshness
+            _decorate_prediction_provenance(
+                latest,
+                holdout_metric=holdout_metric,
+                calibration_regime=latest.get("regime"),
+            )
             predictions.append(latest)
         else:
             predictions.append(
@@ -1604,6 +1719,7 @@ def latest_prediction(config: TournamentConfig, update_pending: bool = True) -> 
                     "timeframe_minutes": horizon_min,
                     "prediction_horizon_min": horizon_min,
                     "status": "no_prediction",
+                    "data_freshness": freshness,
                 }
             )
     return {
