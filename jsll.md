@@ -148,6 +148,8 @@ Notable behaviors:
 - prediction generation now uses a dedicated inference frame built from the latest completed feature row
 - predicted price is anchored to that feature-row close instead of mixing a lagged model row with arbitrary current live price
 - recent bias and linear calibration can now prefer same-regime history when enough matched samples exist
+- prediction responses now expose provenance fields such as forecast anchor time/price, selection basis, and calibration regime
+- stale data detection now uses a current watermark check instead of only old-age heuristics
 
 ## 8. Tournament / ML Layer
 
@@ -190,6 +192,9 @@ Accuracy hardening now implemented in this layer:
 - selected top models are refit on the full pre-live dataset before model artifacts are saved
 - random global candidate truncation has been replaced by a stratified budget across tasks/families/feature sets
 - the served ensemble only updates when champion replacement actually happens
+- return-model promotion is now holdout-price-first instead of being dominated by trading-score heuristics
+- per-run artifact files now record served artifact id, holdout metrics, train/holdout windows, and calibration bucket summaries
+- return ensembles now prefer more diverse members and can use learned non-negative member weights
 
 ## 9. Feature Engineering Shape
 
@@ -222,6 +227,7 @@ Important current nuance:
 - `make_supervised()` still builds the generic supervised frame for storage/research convenience
 - tournament evaluation now applies fold-local target shaping inside `tournament.py`, which removes the prior full-dataset leakage path
 - inference uses `make_inference_frame()` so serving no longer depends on the lagged labeled row
+- target scaling is now more horizon-aware than the original single generic scale path
 
 ## 10. Prediction Behavior
 
@@ -245,6 +251,9 @@ Implemented prediction-path improvements:
 - regime-aware bias correction and regime-aware linear calibration are applied when enough matched history exists
 - context-rich feature sets are now available to the point-forecast path
 - return-model search now includes more robust regression families when sklearn is installed
+- low-confidence handling now widens uncertainty more than it mutates the point forecast
+- missing target-candle settlement no longer falls back to live spot price
+- dashboard text can now show forecast anchor time/price and target time without changing the overall layout
 
 ### Implemented Accuracy Program
 
@@ -273,6 +282,15 @@ Phase 4:
 - robust return-family expansion in the model zoo
 - regression tests for horizon-filter/model-zoo exposure
 
+### Final Accuracy Contract After Today
+
+- all horizons still remain active and first-class
+- JSLL-only data scope is preserved
+- app still follows an always-show-latest UX
+- latest forecast must now be derived from the latest completed qualified bar
+- served return artifacts are promoted using holdout price accuracy first
+- stale/misaligned data should prevent silent pseudo-accurate forecast generation
+
 ## 11. Runtime Storage
 
 There are two storage styles here:
@@ -287,6 +305,7 @@ There are two storage styles here:
 - run-state JSON
 - saved model artifacts (`data/models/...`)
 - optional stacking artifacts for return ensembles
+- per-timeframe run artifacts (`run_artifact_{minutes}m.json`)
 
 Dashboard-specific runtime tables are managed by [`jeena_sikho_dashboard/db.py`](./jeena_sikho_dashboard/db.py).
 
@@ -299,6 +318,7 @@ Stored data includes:
 - confidence flags
 - regime info
 - ensemble/run metadata used for accuracy tracking and selection
+- calibration bucket summaries and served-artifact provenance
 
 ## 12. Environment and Configuration
 
@@ -345,6 +365,7 @@ Prediction quality / production gates:
 - `BIAS_WINDOW`
 - `CALIBRATION_MIN_SAMPLES`
 - `CALIBRATION_LOOKBACK`
+- `ENSEMBLE_MAX_CORR`
 
 Data quality / repair:
 
@@ -424,6 +445,7 @@ Targeted built-in regression suites can also be run without pytest:
 .\.venv\Scripts\python.exe -m unittest discover -s tests -p "test_phase2_tournament.py"
 .\.venv\Scripts\python.exe -m unittest discover -s tests -p "test_phase3_context_and_calibration.py"
 .\.venv\Scripts\python.exe -m unittest discover -s tests -p "test_phase4_model_zoo.py"
+.\.venv\Scripts\python.exe -m unittest discover -s tests -p "test_phase5_prediction_contract.py"
 ```
 
 Important note:
@@ -469,12 +491,15 @@ Only use `git reset --hard` after taking a backup if the VPS folder contains loc
 - [`price/views.py`](./price/views.py): simple/legacy quote page + JSON response
 - [`jeena_sikho_dashboard/views.py`](./jeena_sikho_dashboard/views.py): dashboard page and API view functions
 - [`jeena_sikho_dashboard/services.py`](./jeena_sikho_dashboard/services.py): core aggregation/business logic, inference alignment, regime-aware bias/calibration
+- [`jeena_sikho_dashboard/services.py`](./jeena_sikho_dashboard/services.py): also handles provenance fields, stale-data gating, and prediction contract shaping
 - [`jeena_sikho_dashboard/db.py`](./jeena_sikho_dashboard/db.py): runtime SQLite schema and accessors, recent ready-prediction retrieval with regime support
 - [`jeena_sikho_dashboard/templates/jeena_sikho_dashboard.html`](./jeena_sikho_dashboard/templates/jeena_sikho_dashboard.html): main dashboard HTML
 - [`jeena_sikho_dashboard/static/jeena_sikho_dashboard.js`](./jeena_sikho_dashboard/static/jeena_sikho_dashboard.js): dashboard client logic
 - [`jeena_sikho_tournament/features.py`](./jeena_sikho_tournament/features.py): features, supervised-frame generation, inference-frame generation, context features
 - [`jeena_sikho_tournament/models_zoo.py`](./jeena_sikho_tournament/models_zoo.py): candidate families including robust return models
-- [`jeena_sikho_tournament/tournament.py`](./jeena_sikho_tournament/tournament.py): holdout-aware scoring, full-data refit, candidate budgeting, ensemble governance
+- [`jeena_sikho_tournament/market_calendar.py`](./jeena_sikho_tournament/market_calendar.py): canonical NSE slot rules used by alignment and settlement logic
+- [`jeena_sikho_tournament/validator.py`](./jeena_sikho_tournament/validator.py): data validation plus freshness/watermark assessment
+- [`jeena_sikho_tournament/tournament.py`](./jeena_sikho_tournament/tournament.py): holdout-aware scoring, price-first promotion for return models, full-data refit, candidate budgeting, ensemble governance, run-artifact persistence
 - [`jeena_sikho_tournament/run_hourly.py`](./jeena_sikho_tournament/run_hourly.py): periodic orchestration
 - [`jeena_sikho_tournament/run_repair.py`](./jeena_sikho_tournament/run_repair.py): repair orchestration
 - [`jeena_sikho_tournament/doctor.py`](./jeena_sikho_tournament/doctor.py): health/smoke checks
@@ -483,6 +508,7 @@ Only use `git reset --hard` after taking a backup if the VPS folder contains loc
 - [`tests/test_phase2_tournament.py`](./tests/test_phase2_tournament.py): refit/governance/budgeting regression tests
 - [`tests/test_phase3_context_and_calibration.py`](./tests/test_phase3_context_and_calibration.py): context-feature and regime-calibration tests
 - [`tests/test_phase4_model_zoo.py`](./tests/test_phase4_model_zoo.py): robust model-zoo exposure tests
+- [`tests/test_phase5_prediction_contract.py`](./tests/test_phase5_prediction_contract.py): freshness, settlement, and provenance contract tests
 - [`scripts/run_hourly_task.cmd`](./scripts/run_hourly_task.cmd): helper launcher
 - [`scripts/run_nightly_repair.cmd`](./scripts/run_nightly_repair.cmd): helper launcher
 
@@ -496,6 +522,7 @@ Current repo risks visible from inspection:
 - `doctor` is still a partial smoke-check surface and not a complete production-certification gate
 - `scripts/run_hourly_task.cmd` is still stale and BTC-era path specific
 - deployment is path-prefixed in production, so any future hardcoded root-relative frontend links must be checked carefully
+- production still needs real matched-prediction history over time before any strong live-accuracy claims should be made
 
 ## 17. Bottom Line
 
@@ -507,10 +534,40 @@ This repository is a JSLL-specific market intelligence application with:
 - holdout-aware evaluation and improved train/serve consistency
 - full-data model refit and better candidate-selection discipline
 - richer context features and regime-aware post-processing
+- price-first promotion logic for displayed forecasts
+- stale-data and settlement-contract hardening
 - drift and data-quality controls
 - deployment-ready service structure
 
 It is materially more than a basic Django CRUD or price app. The core value is operational prediction monitoring for one market instrument with scheduled retraining, production-facing summaries, and now a materially stronger accuracy-improvement framework in the tournament and serving path.
+
+## 20. Today's Implementation + Live Deploy Status
+
+Today’s finalized work added and/or confirmed:
+
+- holdout-price-first return-model promotion
+- canonical NSE slot alignment for settlement-sensitive paths
+- no live-spot fallback for missing historical target-candle settlement
+- watermark/freshness-based stale-data detection
+- forecast provenance fields in prediction responses
+- anchor/target time visibility in dashboard prediction text
+- diverse ensemble-member selection plus learned member weighting
+- regression coverage for the prediction contract (`test_phase5_prediction_contract.py`)
+
+Live VPS deployment status from today:
+
+- latest pushed branch: `main`
+- latest deployed commit on remote push path during today’s session: `3b93b73`
+- VPS update steps completed:
+  - `git pull origin main`
+  - `python manage.py collectstatic --noinput`
+  - `python manage.py check`
+  - `sudo systemctl restart jsll-gunicorn`
+  - `sudo systemctl restart jsll-scheduler`
+- observed result:
+  - `jsll-gunicorn` running after restart
+  - `jsll-scheduler` running after restart
+  - scheduler logs showed normal “Outside NSE run window; skipping” behavior when checked outside market window
 
 ## 18. Production Incident Notes
 
