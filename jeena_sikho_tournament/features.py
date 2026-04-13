@@ -4,6 +4,8 @@ from typing import Iterable, Optional
 import numpy as np
 import pandas as pd
 
+from .exogenous import build_exogenous_feature_frame
+
 
 def _ema(series: pd.Series, span: int) -> pd.Series:
     return series.ewm(span=span, adjust=False, min_periods=span).mean()
@@ -64,10 +66,10 @@ def resolve_feature_windows_for_horizon(
 def allowed_feature_sets_for_horizon(candle_minutes: int) -> set[str]:
     minutes = max(1, int(candle_minutes))
     if minutes <= 120:
-        return {"minimal", "base", "momentum", "micro_momentum", "session", "vwap_flow", "signal", "trend", "volatility", "context", "price_action"}
+        return {"minimal", "base", "momentum", "micro_momentum", "session", "vwap_flow", "signal", "trend", "volatility", "context", "price_action", "macro_context"}
     if minutes >= 1440:
-        return {"minimal", "base", "long", "trend_longer", "volatility", "session", "signal", "trend", "context", "price_action"}
-    return {"minimal", "base", "momentum", "signal", "trend", "volatility", "session", "vwap_flow", "trend_longer", "context", "price_action"}
+        return {"minimal", "base", "long", "trend_longer", "volatility", "session", "signal", "trend", "context", "price_action", "macro_context"}
+    return {"minimal", "base", "momentum", "signal", "trend", "volatility", "session", "vwap_flow", "trend_longer", "context", "price_action", "macro_context"}
 
 
 def compute_features(
@@ -75,6 +77,7 @@ def compute_features(
     candle_minutes: int = 60,
     feature_windows_hours: Optional[Iterable[int]] = None,
 ) -> pd.DataFrame:
+    input_attrs = dict(getattr(df, "attrs", {}))
     df = df.copy()
     close = df["close"]
     high = df["high"]
@@ -191,7 +194,10 @@ def compute_features(
     df["vol_168"] = df["ret_1c"].rolling(vol_168_window, min_periods=vol_168_window).std(ddof=0)
     df["vol_ratio_24_168"] = df["vol_24"] / (df["vol_168"] + 1e-9)
 
+    df, exogenous_meta = _join_exogenous_features(df, candle_minutes)
     df = df.replace([np.inf, -np.inf], np.nan)
+    df.attrs.update(input_attrs)
+    df.attrs["exogenous_metadata"] = exogenous_meta
     return df
 
 
@@ -236,6 +242,10 @@ def _annotate_model_context(df: pd.DataFrame, candle_minutes: int) -> pd.DataFra
     event_mask = pd.Series(False, index=out.index)
     if "gap_from_prev_close" in out.columns:
         event_mask = out["gap_from_prev_close"].abs() >= event_gap
+    if "has_known_event" in out.columns:
+        event_mask = event_mask | (out["has_known_event"].fillna(0.0).astype(float) > 0.0)
+    if "known_event_window" in out.columns:
+        event_mask = event_mask | (out["known_event_window"].fillna(0.0).astype(float) > 0.0)
     out["is_event_day"] = event_mask.astype(int)
     out["target_scale"] = _target_scale_series(out, candle_minutes)
     return out
@@ -248,10 +258,13 @@ def make_inference_frame(
 ) -> pd.DataFrame:
     frame = compute_features(df, candle_minutes=candle_minutes, feature_windows_hours=feature_windows_hours)
     frame = _annotate_model_context(frame, candle_minutes)
+    attrs = dict(getattr(frame, "attrs", {}))
     if "volume" in frame.columns:
         frame = frame.loc[frame["volume"] > 0]
     frame = frame.replace([np.inf, -np.inf], np.nan)
-    return frame.dropna()
+    frame = frame.dropna()
+    frame.attrs.update(attrs)
+    return frame
 
 
 def feature_sets(df: pd.DataFrame) -> dict:
@@ -435,6 +448,29 @@ def feature_sets(df: pd.DataFrame) -> dict:
         "ret_2c",
         "ret_3c",
     ]
+    macro_context = [
+        c
+        for c in cols
+        if c.startswith("exo_")
+        or c.startswith("rel_")
+        or c.startswith("fx_")
+        or c in {"has_known_event", "days_to_known_event", "days_since_known_event", "event_severity", "known_event_window"}
+    ]
+    context = context + [c for c in macro_context if c not in context]
+    signal = signal + [
+        c
+        for c in [
+            "rel_nifty_strength_1c",
+            "rel_nifty_strength_24h",
+            "rel_sector_strength_1c",
+            "rel_sector_strength_24h",
+            "risk_off_vix_spike",
+            "fx_pressure_1c",
+            "fx_pressure_24h",
+            "fx_gap_interaction",
+        ]
+        if c in cols and c not in signal
+    ]
 
     sets = {
         "base": base,
@@ -453,6 +489,7 @@ def feature_sets(df: pd.DataFrame) -> dict:
         "minimal": minimal,
         "session": session,
         "context": context,
+        "macro_context": macro_context,
     }
 
     cleaned = {}
@@ -468,6 +505,7 @@ def make_supervised(
 ) -> pd.DataFrame:
     df = compute_features(df, candle_minutes=candle_minutes, feature_windows_hours=feature_windows_hours)
     df = _annotate_model_context(df, candle_minutes)
+    attrs = dict(getattr(df, "attrs", {}))
     target_label = _target_label_for_minutes(candle_minutes)
     df[target_label] = df["ret_1c"].shift(-1)
 
@@ -490,4 +528,26 @@ def make_supervised(
 
     df = df.replace([np.inf, -np.inf], np.nan)
     df = df.dropna()
+    df.attrs.update(attrs)
     return df
+
+
+def _join_exogenous_features(df: pd.DataFrame, candle_minutes: int) -> tuple[pd.DataFrame, dict]:
+    exogenous_frame, exogenous_meta = build_exogenous_feature_frame(df.index, candle_minutes)
+    if exogenous_frame.empty:
+        return df, exogenous_meta
+    out = df.join(exogenous_frame, how="left")
+    if "exo_nifty_ret_1c" in out.columns:
+        out["rel_nifty_strength_1c"] = out["ret_1c"] - out["exo_nifty_ret_1c"]
+        out["rel_nifty_strength_24h"] = out["ret_24h"] - out["exo_nifty_ret_24h"]
+    if "exo_sector_ret_1c" in out.columns:
+        out["rel_sector_strength_1c"] = out["ret_1c"] - out["exo_sector_ret_1c"]
+        out["rel_sector_strength_24h"] = out["ret_24h"] - out["exo_sector_ret_24h"]
+    if "exo_vix_ret_1c" in out.columns:
+        out["risk_off_vix_spike"] = (out["exo_vix_ret_1c"] > 0).astype(int)
+    if "exo_usdinr_ret_1c" in out.columns:
+        out["fx_pressure_1c"] = out["exo_usdinr_ret_1c"]
+        out["fx_pressure_24h"] = out["exo_usdinr_ret_24h"]
+        if "gap_from_prev_close" in out.columns:
+            out["fx_gap_interaction"] = out["gap_from_prev_close"] * out["exo_usdinr_ret_1c"]
+    return out, exogenous_meta

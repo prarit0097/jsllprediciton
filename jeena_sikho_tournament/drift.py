@@ -7,6 +7,7 @@ from typing import Dict, List, Tuple
 import numpy as np
 
 from .config import TournamentConfig
+from jeena_sikho_dashboard.db import PREDICTIONS_TABLE
 from .multi_timeframe import resolve_timeframes
 
 
@@ -88,16 +89,19 @@ def should_retrain_on_drift(config: TournamentConfig) -> Tuple[bool, str]:
         return True, "db_connect_failed"
     try:
         for tf in frames:
-            cur = con.execute(
-                """
-                SELECT predicted_price, actual_price_1h
-                FROM btc_predictions
-                WHERE status = 'ready' AND timeframe = ?
-                ORDER BY id DESC
-                LIMIT ?
-                """,
-                (tf, window),
-            )
+            try:
+                cur = con.execute(
+                    f"""
+                    SELECT predicted_price, actual_price_1h
+                    FROM {PREDICTIONS_TABLE}
+                    WHERE status = 'ready' AND timeframe = ?
+                    ORDER BY id DESC
+                    LIMIT ?
+                    """,
+                    (tf, window),
+                )
+            except sqlite3.OperationalError:
+                return True, "predictions_table_missing"
             rows = cur.fetchall()
             if len(rows) < 12:
                 return True, f"insufficient_ready_{tf}"

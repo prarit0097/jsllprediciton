@@ -81,6 +81,11 @@ Main routes:
 - `/api/jeena-sikho/prediction/latest`
 - `/api/jeena-sikho/prediction/refresh`
 
+Important operational note:
+
+- mutation endpoints (`tournament/run`, `prediction/refresh`) should now be treated as admin-only surfaces protected by `APP_ADMIN_TOKEN`
+- public dashboard polling should use read endpoints, not browser-triggered prediction-refresh writes
+
 Legacy redirects:
 
 - `/btc/` -> `/`
@@ -320,6 +325,10 @@ Stored data includes:
 - ensemble/run metadata used for accuracy tracking and selection
 - calibration bucket summaries and served-artifact provenance
 
+Naming note:
+
+- runtime prediction storage is now neutralized away from the old BTC naming; legacy `btc_predictions` tables should auto-migrate to `market_predictions`
+
 ## 12. Environment and Configuration
 
 Primary reference:
@@ -333,6 +342,7 @@ Branding / routing:
 - `APP_BRAND_NAME`
 - `APP_MARKET_LABEL`
 - `APP_API_PREFIX`
+- `APP_ADMIN_TOKEN`
 - `APP_DATA_DIR`
 
 Market selection:
@@ -347,7 +357,9 @@ Tournament sizing:
 - `MAX_CANDIDATES_TOTAL`
 - `MAX_CANDIDATES_PER_TARGET`
 - `MAX_WORKERS`
+- `RUN_LOCK_STALE_SECONDS`
 - `TOURNAMENT_CV_FOLDS`
+- `BUSINESS_PRIMARY_TIMEFRAME`
 
 Prediction quality / production gates:
 
@@ -357,6 +369,13 @@ Prediction quality / production gates:
 - `PRED_BAND_Z`
 - `PROD_MAX_MAPE`
 - `PROD_MIN_HIT_RATE`
+- `PROD_MAX_PRICE_MAE_*`
+- `PROD_MAX_P90_ABS_ERR_*`
+- `PROD_MIN_DIR_HIT_*`
+- `PROD_MAX_BIAS_RS_*`
+- `PROD_MAX_CALIB_RMSE_*`
+- `PROD_MIN_SAMPLES_*`
+- `SHADOW_PROMOTION_MIN_SETTLED_*`
 - `USE_TEST`
 - `TEST_HOURS`
 - `TARGET_WINSOR_LOWER`
@@ -377,6 +396,18 @@ Data quality / repair:
 - `NIGHTLY_REPAIR_AFTER_CLOSE`
 - `PREOPEN_REFILL_ENABLE`
 - `SCHEDULED_AUTO_REPAIR_ENABLE`
+
+Exogenous / event context:
+
+- `EXOGENOUS_FEEDS_ENABLE`
+- `EXOGENOUS_LOOKBACK_HOURS`
+- `EXOGENOUS_NIFTY_SYMBOL`
+- `EXOGENOUS_VIX_SYMBOL`
+- `EXOGENOUS_USDINR_SYMBOL`
+- `EXOGENOUS_SECTOR_SYMBOL`
+- `EXOGENOUS_SECTOR_MARKET`
+- `EVENT_FEATURES_ENABLE`
+- `EVENT_CALENDAR_FILE`
 
 NSE calendar:
 

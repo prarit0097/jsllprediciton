@@ -104,6 +104,39 @@
         border-radius: 999px;
         font-size: 12px;
       }
+      .trust-badge {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        margin-right: 6px;
+      }
+      .trust-primary {
+        box-shadow: 0 0 0 1px rgba(98,194,255,0.28);
+      }
+      .trust-badge-trusted {
+        background: rgba(26,209,163,0.18);
+        color: var(--good);
+        border-color: rgba(26,209,163,0.35);
+      }
+      .trust-badge-shadow,
+      .trust-badge-watch {
+        background: rgba(98,194,255,0.16);
+        color: var(--accent-2);
+        border-color: rgba(98,194,255,0.35);
+      }
+      .trust-badge-stale_data,
+      .trust-badge-degraded {
+        background: rgba(244,201,93,0.14);
+        color: var(--accent);
+        border-color: rgba(244,201,93,0.3);
+      }
+      .trust-badge-insufficient_samples,
+      .trust-badge-blocked,
+      .trust-badge-neutral {
+        background: rgba(248,113,113,0.14);
+        color: var(--warn);
+        border-color: rgba(248,113,113,0.32);
+      }
       table {
         width: 100%;
         border-collapse: collapse;
@@ -178,6 +211,11 @@
         border-radius: 10px;
         border: 1px solid var(--border);
         background: rgba(255,255,255,0.03);
+      }
+      .pred-item-primary,
+      .metric-row-primary {
+        border-color: rgba(98,194,255,0.28) !important;
+        background: rgba(98,194,255,0.08) !important;
       }
       .pred-idx {
         width: 24px;
@@ -401,6 +439,7 @@
           <div class="mini-block muted" id="drift-status">Drift: --</div>
           <div class="mini-block muted" id="champions-horizon">Horizon champions: --</div>
           <div class="mini-block muted" id="completeness-horizon">Completeness: --</div>
+          <div class="mini-block muted" id="served-horizons">Served horizons: --</div>
         </div>
 
         <div class="card">
@@ -469,6 +508,8 @@
             <table>
               <thead>
                 <tr>
+                  <th>Timeframe</th>
+                  <th>Quality</th>
                   <th>Rank</th>
                   <th>Target</th>
                   <th>Feature Set</th>

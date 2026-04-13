@@ -9,7 +9,7 @@ from .tournament import run_tournament
 
 LOGGER = logging.getLogger("jeena_sikho_tournament")
 
-DEFAULT_TIMEFRAMES = ["1m", "3m", "5m", "10m", "15m", "30m", "1h", "2h", "4h"]
+DEFAULT_TIMEFRAMES = ["1h", "2h", "1d"]
 
 
 def _parse_timeframes(value: Optional[str]) -> List[str]:

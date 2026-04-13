@@ -99,10 +99,13 @@ See `.env.example` for the full surface. The most important variables are:
 - `MARKET_YFINANCE_SYMBOL=JSLL.NS`
 - `PRICE_SOURCE=yfinance`
 - `MARKET_TIMEFRAMES=1h,2h,1d`
+- `BUSINESS_PRIMARY_TIMEFRAME=1d`
 - `RUN_MODE=daily`
 - `AUTO_RETRAIN_ON_DRIFT=1`
 - `STRICT_DATA_QUALITY=1`
 - `LOW_CONFIDENCE_PCT`, `LOW_CONFIDENCE_SKIP_PCT`
+- `EXOGENOUS_FEEDS_ENABLE=1`, `EXOGENOUS_NIFTY_SYMBOL`, `EXOGENOUS_VIX_SYMBOL`, `EXOGENOUS_USDINR_SYMBOL`
+- `EVENT_FEATURES_ENABLE=1` with `EVENT_CALENDAR_FILE=...` when you have a JSLL event calendar
 
 ## Current Production Shape
 
@@ -181,11 +184,19 @@ Important `.env` notes:
 ```env
 APP_BASE_PREFIX=/jsll
 APP_API_PREFIX=/jsll/api/jeena-sikho
+APP_ADMIN_TOKEN=replace-with-strong-admin-token
+BUSINESS_PRIMARY_TIMEFRAME=1d
 DJANGO_DEBUG=0
 DJANGO_ALLOWED_HOSTS=api.seestox.com,seestox.com,www.seestox.com
 DJANGO_CSRF_TRUSTED_ORIGINS=https://api.seestox.com,https://seestox.com,https://www.seestox.com
 DJANGO_STATIC_URL=/jsll/static/
 DJANGO_STATIC_ROOT=/opt/jsll/app/staticfiles
+EXOGENOUS_FEEDS_ENABLE=1
+EXOGENOUS_NIFTY_SYMBOL=^NSEI
+EXOGENOUS_VIX_SYMBOL=^INDIAVIX
+EXOGENOUS_USDINR_SYMBOL=INR=X
+EVENT_FEATURES_ENABLE=0
+EVENT_CALENDAR_FILE=/opt/jsll/app/data/jsll_events.json
 MAX_MISSING_RATIO=0.08
 COMPLETENESS_MIN_PCT=90
 AUTO_REPAIR_ON_DQ_FAIL=1
@@ -202,6 +213,31 @@ Long-horizon note:
 - `2d` to `7d` predictions can appear before true matched actuals exist
 - in that case the dashboard can still show pending/insufficient-sample states
 - that is a data maturity issue, not always a deployment bug
+
+## Admin Mutation Endpoints
+
+The write endpoints are now admin-token gated outside debug mode:
+
+- `POST /api/jeena-sikho/tournament/run`
+- `POST /api/jeena-sikho/prediction/refresh`
+
+Use either:
+
+```bash
+curl -X POST https://api.seestox.com/jsll/api/jeena-sikho/tournament/run \
+  -H "X-App-Admin-Token: $APP_ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{}'
+```
+
+or:
+
+```bash
+curl -X POST https://api.seestox.com/jsll/api/jeena-sikho/prediction/refresh \
+  -H "Authorization: Bearer $APP_ADMIN_TOKEN"
+```
+
+The dashboard no longer triggers `prediction/refresh` from public browser polling.
 
 ## Deep Project Notes
 

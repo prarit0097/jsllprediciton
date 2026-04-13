@@ -14,11 +14,14 @@ from .backtest import trading_score
 from .config import TournamentConfig
 from .data_sources import fetch_and_stitch
 from .features import allowed_feature_sets_for_horizon, feature_sets, make_supervised, resolve_feature_windows_for_horizon
+from .forecast_metrics import summarize_price_forecast
 from .metrics import accuracy, f1_score, mae, pinball_loss, coverage
 from .models_zoo import ModelSpec, build_quantile_bundle, get_candidates
 from .registry import (
+    get_promotion_state,
     load_registry,
     record_model_score,
+    record_promotion_state,
     save_registry,
     stability_penalty,
     update_champion,
@@ -258,14 +261,26 @@ def _price_metrics_from_returns(eval_df: pd.DataFrame, y_pred: np.ndarray, y_tru
     pred_price = base_price * np.exp(np.asarray(y_pred, dtype=float))
     actual_price = base_price * np.exp(np.asarray(y_true, dtype=float))
     abs_diff = np.abs(pred_price - actual_price)
+    sq_diff = np.square(pred_price - actual_price)
     pct_err = np.where(actual_price != 0.0, (abs_diff / np.abs(actual_price)) * 100.0, np.nan)
+    denom = np.abs(pred_price) + np.abs(actual_price)
+    smape_vals = np.where(denom != 0.0, (200.0 * abs_diff) / denom, np.nan)
     direction_hit = (np.sign(y_pred) == np.sign(y_true)).astype(float)
+    sample_count = int(len(abs_diff))
     return {
         "price_mae": float(np.mean(abs_diff)) if len(abs_diff) else 0.0,
+        "price_rmse": float(np.sqrt(np.mean(sq_diff))) if len(sq_diff) else 0.0,
+        "median_abs_error": float(np.median(abs_diff)) if len(abs_diff) else 0.0,
+        "p90_abs_error": float(np.quantile(abs_diff, 0.9)) if len(abs_diff) else 0.0,
         "price_mape": float(np.nanmean(pct_err)) if len(pct_err) else 0.0,
+        "smape": float(np.nanmean(smape_vals)) if len(smape_vals) else 0.0,
         "return_mae": float(mae(y_true, y_pred)),
+        "avg_abs_return": float(np.mean(np.abs(y_true))) if len(y_true) else 0.0,
         "direction_hit_rate": float(np.mean(direction_hit) * 100.0) if len(direction_hit) else 0.0,
         "avg_actual_price": float(np.mean(np.abs(actual_price))) if len(actual_price) else 1.0,
+        "signed_bias_rs": float(np.mean(pred_price - actual_price)) if len(actual_price) else 0.0,
+        "band_80_coverage": None,
+        "sample_count": sample_count,
     }
 
 
@@ -274,12 +289,93 @@ def _selection_score_return(metrics: Dict[str, float]) -> float:
     price_mae = float(metrics.get("price_mae", 0.0))
     price_mape = float(metrics.get("price_mape", 100.0))
     return_mae = float(metrics.get("return_mae", 0.0))
+    avg_abs_return = float(metrics.get("avg_abs_return", 0.0))
     hit_rate = float(metrics.get("direction_hit_rate", 0.0)) / 100.0
 
     price_mae_score = max(0.0, 1.0 - (price_mae / max(1.0, mean_price)))
     price_mape_score = max(0.0, 1.0 - (price_mape / 100.0))
-    return_mae_score = _primary_score_reg(return_mae, y_true)
+    return_ref = max(1e-6, avg_abs_return)
+    return_mae_score = max(0.0, 1.0 - (return_mae / return_ref))
     return float((0.7 * price_mae_score) + (0.15 * price_mape_score) + (0.1 * return_mae_score) + (0.05 * hit_rate))
+
+
+def _safe_metric_float(value: Any) -> Optional[float]:
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return None
+    return numeric if np.isfinite(numeric) else None
+
+
+def _result_metrics(result: Dict[str, Any]) -> Dict[str, Any]:
+    metrics = result.get("holdout_metrics") or result.get("metrics") or {}
+    return metrics if isinstance(metrics, dict) else {}
+
+
+def _result_price_mae(result: Dict[str, Any]) -> Optional[float]:
+    return _safe_metric_float(_result_metrics(result).get("price_mae"))
+
+
+def _result_sort_key(task: str, result: Dict[str, Any]) -> Tuple[float, float]:
+    if task == "return":
+        price_mae = _result_price_mae(result)
+        return (price_mae if price_mae is not None else float("inf"), -float(result.get("final_score", 0.0)))
+    return (-float(result.get("final_score", 0.0)), 0.0)
+
+
+def _comparison_payload(reference_id: Optional[str], reference_mae: Optional[float], challenger_mae: Optional[float]) -> Dict[str, Any]:
+    improvement_ratio = None
+    passed = None
+    if reference_mae is not None and challenger_mae is not None:
+        passed = challenger_mae < reference_mae
+        if reference_mae > 0:
+            improvement_ratio = float((reference_mae - challenger_mae) / reference_mae)
+    return {
+        "model_id": reference_id,
+        "price_mae": reference_mae,
+        "challenger_price_mae": challenger_mae,
+        "improvement_ratio": improvement_ratio,
+        "passed": passed,
+    }
+
+
+def _baseline_comparison(
+    task: str,
+    best: Dict[str, Any],
+    task_results: List[Dict[str, Any]],
+    registry: Dict[str, Any],
+) -> Dict[str, Any]:
+    comparison: Dict[str, Any] = {
+        "selection_metric": "holdout_price_mae" if best.get("holdout_metrics") is not None else "price_mae",
+    }
+    if task != "return":
+        return comparison
+    challenger_mae = _result_price_mae(best)
+    baseline_rows = [
+        row
+        for row in task_results
+        if bool(row.get("spec").meta.get("baseline")) and row.get("spec").name in {"naive_zero", "naive_last"}
+    ]
+    if baseline_rows:
+        baseline_rows.sort(
+            key=lambda row: (_result_price_mae(row) if _result_price_mae(row) is not None else float("inf"))
+        )
+        baseline = baseline_rows[0]
+        comparison["naive_last_close"] = _comparison_payload(
+            _model_id(baseline["spec"], baseline["feature_set_id"]),
+            _result_price_mae(baseline),
+            challenger_mae,
+        )
+    incumbent = registry.get("champions", {}).get(task) or {}
+    incumbent_metrics = incumbent.get("holdout_metrics") or incumbent.get("metrics") or {}
+    incumbent_mae = _safe_metric_float(incumbent_metrics.get("price_mae"))
+    if incumbent:
+        comparison["incumbent"] = _comparison_payload(
+            incumbent.get("model_id"),
+            incumbent_mae,
+            challenger_mae,
+        )
+    return comparison
 
 
 def _fit_predict_direction(spec: ModelSpec, X_train, y_train, X_val):
@@ -476,9 +572,16 @@ def _score_candidate_once(
         return {
             "metrics": {
                 "price_mae": price_metrics["price_mae"],
+                "price_rmse": price_metrics["price_rmse"],
+                "median_abs_error": price_metrics["median_abs_error"],
+                "p90_abs_error": price_metrics["p90_abs_error"],
                 "price_mape": price_metrics["price_mape"],
+                "smape": price_metrics["smape"],
                 "return_mae": mae_val,
                 "direction_hit_rate": price_metrics["direction_hit_rate"],
+                "signed_bias_rs": price_metrics["signed_bias_rs"],
+                "band_80_coverage": price_metrics["band_80_coverage"],
+                "sample_count": price_metrics["sample_count"],
                 "close_hit": close_hit,
                 "net": net,
                 "mdd": mdd,
@@ -870,6 +973,10 @@ def _run_artifact_payload(
         "artifact_id": served.get("served_artifact_id"),
         "holdout_metrics": served.get("best", {}).get("holdout_metrics") or served.get("best", {}).get("metrics"),
         "selection_basis": "holdout",
+        "baseline_comparison": served.get("best", {}).get("baseline_comparison"),
+        "promotion_state": served.get("promotion_state") or served.get("best", {}).get("promotion_state"),
+        "promotion_reason": served.get("decision"),
+        "shadow_candidate": served.get("shadow_candidate"),
     }
     return {
         "run_at": run_at,
@@ -1133,7 +1240,7 @@ def run_tournament(config: TournamentConfig) -> Dict[str, Any]:
                 r["selection_primary"] = selection_primary
                 r["selection_trading"] = selection_trading
 
-            task_results.sort(key=lambda x: x["final_score"], reverse=True)
+            task_results.sort(key=lambda x: _result_sort_key(task, x))
             artifacts_dir = config.data_dir / "models" / task
             artifacts_dir.mkdir(parents=True, exist_ok=True)
             ts = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
@@ -1225,6 +1332,7 @@ def run_tournament(config: TournamentConfig) -> Dict[str, Any]:
             best_model_id = _model_id(best["spec"], best["feature_set_id"])
             best_fs_id = best["feature_set_id"]
             best_model_path = best_member["model_path"] if best_member else None
+            baseline_comparison = _baseline_comparison(task, best, task_results, registry)
 
             challenger = {
                 "model_id": best_model_id,
@@ -1239,6 +1347,10 @@ def run_tournament(config: TournamentConfig) -> Dict[str, Any]:
                 "feature_set_id": best_fs_id,
                 "family": best["family"],
                 "target_mode": best.get("target_mode"),
+                "timeframe": config.timeframe,
+                "baseline_comparison": baseline_comparison,
+                "selection_metric_name": baseline_comparison.get("selection_metric"),
+                "selection_metric_value": _result_price_mae(best),
             }
             feature_model = best_saved_model if best_saved_model is not None else best.get("model")
             top_features = _extract_feature_importance(feature_model, task_feature_cols.get(best_fs_id, []), top_k=10)
@@ -1269,6 +1381,7 @@ def run_tournament(config: TournamentConfig) -> Dict[str, Any]:
                 config.champion_margin,
                 config.champion_margin_override,
                 config.champion_cooldown_hours,
+                timeframe=config.timeframe,
             )
             _activate_served_ensemble(registry, task, ensemble_record, decision.replaced)
 
@@ -1276,6 +1389,8 @@ def run_tournament(config: TournamentConfig) -> Dict[str, Any]:
                 "timestamp": datetime.now(timezone.utc).isoformat(),
                 "best": challenger,
                 "decision": decision.reason,
+                "promotion_state": decision.promotion_state,
+                "baseline_comparison": baseline_comparison,
                 "coverage": coverage,
                 "run_mode": run_mode,
             })
@@ -1292,9 +1407,11 @@ def run_tournament(config: TournamentConfig) -> Dict[str, Any]:
             results[task] = {
                 "best": challenger,
                 "decision": decision.reason,
+                "promotion_state": decision.promotion_state,
                 "served_ensemble_updated": decision.replaced,
                 "served_artifact_id": served_artifact_id,
                 "ensemble": current_served_ensemble,
+                "shadow_candidate": (registry.get("shadow", {}) or {}).get(task),
                 "top_scores": [
                     {"model_id": _model_id(r["spec"], r["feature_set_id"]), "final_score": r["final_score"]}
                     for r in task_results[:5]

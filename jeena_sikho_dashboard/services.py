@@ -12,14 +12,17 @@ import requests
 
 from jeena_sikho_tournament.config import TournamentConfig, _timeframe_to_minutes
 from jeena_sikho_tournament.data_sources import fetch_and_stitch
+from jeena_sikho_tournament.forecast_metrics import summarize_price_forecast
 from jeena_sikho_tournament.features import make_inference_frame, make_supervised, resolve_feature_windows_for_horizon
 from jeena_sikho_tournament.market_calendar import (
     IST,
     align_to_nse_interval_floor,
+    is_nse_trading_day,
     load_nse_holidays,
     next_nse_slot_at_or_after,
     nse_market_state,
 )
+from jeena_sikho_tournament.run_lock import acquire_run_lock, is_run_locked, release_run_lock
 from jeena_sikho_tournament.storage import Storage
 from jeena_sikho_tournament.validator import assess_freshness
 
@@ -30,10 +33,12 @@ from .db import (
     get_latest_ready_prediction_fallback,
     get_latest_ready_prediction_for_timeframe,
     get_latest_run,
+    get_latest_runs_for_timeframes,
     get_ohlcv_close_at,
     get_recent_ready_predictions,
     get_recent_runs,
     get_scores,
+    get_scores_for_runs,
     insert_prediction,
     list_pending_predictions,
     update_prediction,
@@ -56,7 +61,8 @@ COINBASE_SPOT_URL = f"https://api.coinbase.com/v2/prices/{COINBASE_SPOT_PAIR}/sp
 KRAKEN_PAIR = os.getenv("KRAKEN_PAIR", "XXBTZUSD")
 KRAKEN_TICKER_URL = f"https://api.kraken.com/0/public/Ticker?pair={KRAKEN_PAIR}"
 LEGACY_PREDICTION_HORIZON_MINUTES = 60
-DEFAULT_TIMEFRAMES = ["1m", "3m", "5m", "10m", "15m", "30m", "1h", "2h", "4h"]
+DEFAULT_TIMEFRAMES = ["1h", "2h", "1d"]
+BUSINESS_PRIMARY_TIMEFRAME = (os.getenv("BUSINESS_PRIMARY_TIMEFRAME", "1d").strip() or "1d").lower()
 MATCH_EPS = 1e-6
 MATCH_MAX_NONZERO = 99.9999
 
@@ -362,6 +368,15 @@ def _prediction_target_timestamp(pred_at: datetime, horizon_min: int, tf_minutes
     if not _is_indian_equity():
         anchor = _align_to_interval(pred_at, step)
         return anchor + timedelta(minutes=horizon)
+
+    if step >= 1440 or horizon >= 1440:
+        trading_days = max(1, int(np.ceil(horizon / 1440.0)))
+        cur = pred_at.astimezone(IST).replace(hour=15, minute=30, second=0, microsecond=0)
+        for _ in range(trading_days):
+            cur = cur + timedelta(days=1)
+            while not is_nse_trading_day(cur, _NSE_HOLIDAYS):
+                cur = cur + timedelta(days=1)
+        return cur.astimezone(timezone.utc)
 
     anchor = align_to_nse_interval_floor(pred_at, step, _NSE_HOLIDAYS)
     full_steps = max(1, int(np.ceil(horizon / step)))
@@ -670,6 +685,13 @@ def _champion_detail_from_registry(reg: Dict[str, Any], task: str) -> Dict[str, 
     fi_rows = (((reg.get("feature_importance") or {}).get(task)) or [])
     latest_fi = fi_rows[-1] if fi_rows else {}
     top_feats = [str(x.get("feature")) for x in (latest_fi.get("top_features") or [])[:5]]
+    timestamp = champ.get("timestamp")
+    champion_age_hours = None
+    stamp_dt = _parse_iso(timestamp)
+    if stamp_dt:
+        if stamp_dt.tzinfo is None:
+            stamp_dt = stamp_dt.replace(tzinfo=timezone.utc)
+        champion_age_hours = max(0.0, (datetime.now(timezone.utc) - stamp_dt.astimezone(timezone.utc)).total_seconds() / 3600.0)
     return {
         "model_id": champ.get("model_id"),
         "feature_set_id": champ.get("feature_set_id"),
@@ -678,7 +700,101 @@ def _champion_detail_from_registry(reg: Dict[str, Any], task: str) -> Dict[str, 
         "stability": stability,
         "confidence_pct": confidence if champ else None,
         "top_features": top_feats,
+        "timestamp": timestamp,
+        "champion_age_hours": champion_age_hours,
+        "promotion_state": champ.get("promotion_state") or ("active" if champ else None),
     }
+
+
+def _timeframe_gate_suffix(timeframe: str) -> str:
+    raw = str(timeframe or "").strip()
+    cleaned = "".join(ch for ch in raw if ch.isalnum())
+    return cleaned.upper() or "1H"
+
+
+def _timeframe_quality_thresholds(timeframe: str) -> Dict[str, Optional[float]]:
+    minutes = _timeframe_to_minutes(timeframe, LEGACY_PREDICTION_HORIZON_MINUTES)
+    is_daily = minutes >= 1440
+    defaults: Dict[str, Optional[float]]
+    if is_daily:
+        defaults = {
+            "max_price_mae": 3.0,
+            "max_p90_abs_error": 7.0,
+            "min_direction_hit_rate": 56.0,
+            "max_signed_bias_rs": 1.5,
+            "min_samples": 60.0,
+            "max_calibration_rmse": None,
+        }
+    else:
+        defaults = {
+            "max_price_mae": 1.5,
+            "max_p90_abs_error": 3.5,
+            "min_direction_hit_rate": 54.0,
+            "max_signed_bias_rs": 0.75,
+            "min_samples": 80.0,
+            "max_calibration_rmse": None,
+        }
+    suffix = _timeframe_gate_suffix(timeframe)
+    env_map = {
+        "max_price_mae": f"PROD_MAX_PRICE_MAE_{suffix}",
+        "max_p90_abs_error": f"PROD_MAX_P90_ABS_ERR_{suffix}",
+        "min_direction_hit_rate": f"PROD_MIN_DIR_HIT_{suffix}",
+        "max_signed_bias_rs": f"PROD_MAX_BIAS_RS_{suffix}",
+        "min_samples": f"PROD_MIN_SAMPLES_{suffix}",
+        "max_calibration_rmse": f"PROD_MAX_CALIB_RMSE_{suffix}",
+    }
+    thresholds = dict(defaults)
+    for key, env_name in env_map.items():
+        raw = os.getenv(env_name)
+        if raw is None or raw == "":
+            continue
+        try:
+            thresholds[key] = float(raw)
+        except (TypeError, ValueError):
+            continue
+    return thresholds
+
+
+def _first_numeric(*values: Any) -> Optional[float]:
+    for value in values:
+        if value is None:
+            continue
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            continue
+        if np.isfinite(numeric):
+            return numeric
+    return None
+
+
+def _freshness_status(freshness: Optional[Dict[str, Any]]) -> str:
+    if not freshness:
+        return "missing"
+    return "stale" if freshness.get("stale") else "fresh"
+
+
+def _classify_data_source_quality(
+    freshness: Optional[Dict[str, Any]],
+    *,
+    completeness_pct: Optional[float] = None,
+) -> str:
+    status = _freshness_status(freshness)
+    if status == "missing":
+        return "missing"
+    if status == "stale":
+        return "stale"
+    if completeness_pct is not None:
+        try:
+            pct_val = float(completeness_pct)
+        except (TypeError, ValueError):
+            pct_val = None
+        if pct_val is not None and np.isfinite(pct_val):
+            if pct_val < 80.0:
+                return "degraded"
+            if pct_val < 95.0:
+                return "watch"
+    return "good"
 
 
 def get_price_at_timestamp(config: TournamentConfig, value: str) -> Dict[str, Any]:
@@ -780,10 +896,20 @@ def get_tournament_summary(config: TournamentConfig) -> Dict[str, Any]:
         snapshot = _latest_feature_snapshot(cfg_tf)
         freshness_by_horizon[tf] = snapshot.get("freshness") if snapshot else None
 
+    metrics_by_horizon = _collect_metrics_by_horizon(config)
     drift_status = _compute_drift_status(config)
-    backtest_report = _build_backtest_report(config)
+    backtest_report = _build_backtest_report(config, metrics_by_horizon=metrics_by_horizon)
     auto_retrain = bool(drift_status.get("alert"))
     completeness_rows = _completeness_by_horizon(config)
+    served_horizon_statuses = _build_served_horizon_statuses(
+        config,
+        metrics_by_horizon=metrics_by_horizon,
+        backtest_report=backtest_report,
+        drift_status=drift_status,
+        champions_by_horizon=champions_by_horizon,
+        freshness_by_horizon=freshness_by_horizon,
+        completeness_rows=completeness_rows,
+    )
     return {
         "last_run_at": run_at,
         "last_run_started_at": run_started_at,
@@ -792,24 +918,34 @@ def get_tournament_summary(config: TournamentConfig) -> Dict[str, Any]:
         "selection_basis": "holdout",
         "forecast_generation_basis": "completed_bar",
         "candidate_count": candidate_count,
+        "primary_business_timeframe": BUSINESS_PRIMARY_TIMEFRAME,
         "champions": champions,
         "champions_by_horizon": champions_by_horizon,
         "eta_seconds": eta_seconds,
         "next_run_at": next_run_local.isoformat(),
         "drift_status": drift_status,
+        "metrics_by_horizon": metrics_by_horizon,
         "backtest_report": backtest_report,
         "completeness_by_horizon": completeness_rows,
         "auto_retrain_recommended": auto_retrain,
         "run_artifacts_by_horizon": run_artifacts_by_horizon,
         "freshness_by_horizon": freshness_by_horizon,
+        "served_horizon_statuses": served_horizon_statuses,
     }
 
 
-def get_scoreboard(limit: int = 500) -> List[Dict[str, Any]]:
-    latest = get_latest_run()
-    if not latest:
+def get_scoreboard(config: TournamentConfig, limit: int = 500) -> List[Dict[str, Any]]:
+    runs = get_latest_runs_for_timeframes(get_timeframes(config))
+    if not runs:
+        latest = get_latest_run()
+        if not latest:
+            return []
+        return get_scores(latest["id"], limit)
+    run_ids = [int(run["id"]) for run in runs]
+    if not run_ids:
         return []
-    return get_scores(latest["id"], limit)
+    per_run_limit = max(1, int(limit))
+    return get_scores_for_runs(run_ids, limit_per_run=per_run_limit)
 
 
 def update_pending_predictions(config: TournamentConfig) -> None:
@@ -1167,29 +1303,61 @@ def _decorate_prediction_provenance(
     row["generated_from_completed_bar"] = True
     row["selection_basis"] = selection_basis
     row["holdout_primary_metric"] = holdout_metric
+    row["holdout_price_mae"] = holdout_metric
     row["calibration_regime"] = calibration_regime or row.get("regime")
+    row["confidence_proxy_label"] = row.get("confidence_proxy_label") or "model confidence proxy"
     return row
+
+
+def _run_artifact_prediction_metadata(run_artifact: Dict[str, Any]) -> Dict[str, Any]:
+    served = (run_artifact.get("served_artifact") or {}) if isinstance(run_artifact, dict) else {}
+    return {
+        "baseline_comparison": served.get("baseline_comparison") or run_artifact.get("baseline_comparison"),
+        "shadow_status": run_artifact.get("shadow_status") or served.get("shadow_status"),
+        "promotion_state": run_artifact.get("promotion_state") or served.get("promotion_state"),
+        "confidence_proxy_label": run_artifact.get("confidence_proxy_label") or served.get("confidence_proxy_label"),
+    }
 
 
 def _summarize_ready_metrics(rows: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     if not rows:
         return None
     abs_errors: List[float] = []
+    signed_errors: List[float] = []
     pct_errors: List[float] = []
+    smape_errors: List[float] = []
     hit_total = 0
     hit_true = 0
     util_vals: List[float] = []
     calib_err_sq: List[float] = []
+    band_hits = 0
+    band_total = 0
     for row in rows:
         predicted = row.get("predicted_price")
         actual = row.get("actual_price_1h")
         if predicted is None or actual is None:
             continue
+        try:
+            predicted_val = float(predicted)
+            actual_val = float(actual)
+        except (TypeError, ValueError):
+            continue
         metrics = _compute_match_metrics(predicted, actual)
         if metrics["abs_diff"] is not None:
             abs_errors.append(float(metrics["abs_diff"]))
+            signed_errors.append(float(predicted_val - actual_val))
         if metrics["pct_error"] is not None:
             pct_errors.append(float(metrics["pct_error"]))
+        denom = abs(predicted_val) + abs(actual_val)
+        if denom > 0:
+            smape_errors.append(float((200.0 * abs(predicted_val - actual_val)) / denom))
+        low_price = _first_numeric(row.get("predicted_price_low"))
+        high_price = _first_numeric(row.get("predicted_price_high"))
+        if low_price is not None and high_price is not None:
+            lo, hi = sorted((low_price, high_price))
+            band_total += 1
+            if lo <= actual_val <= hi:
+                band_hits += 1
 
         predicted_ret = row.get("predicted_return")
         current = row.get("current_price")
@@ -1214,19 +1382,31 @@ def _summarize_ready_metrics(rows: List[Dict[str, Any]]) -> Optional[Dict[str, A
     if sample_size == 0:
         return None
     mae_val = float(np.mean(abs_errors))
+    rmse_val = float(np.sqrt(np.mean(np.square(abs_errors))))
     mape_val = float(np.mean(pct_errors)) if pct_errors else None
     hit_rate = (100.0 * hit_true / hit_total) if hit_total > 0 else None
     out: Dict[str, Any] = {
         "samples": sample_size,
+        "sample_count": float(sample_size),
         "mae": mae_val,
+        "price_mae": mae_val,
+        "price_rmse": rmse_val,
         "mape": mape_val,
+        "smape": float(np.mean(smape_errors)) if smape_errors else None,
+        "median_abs_error": float(np.median(abs_errors)),
+        "p90_abs_error": float(np.percentile(abs_errors, 90)) if abs_errors else None,
+        "signed_bias_rs": float(np.mean(signed_errors)) if signed_errors else None,
         "hit_rate": hit_rate,
+        "direction_hit_rate": hit_rate,
         "directional_utility": float(np.mean(util_vals)) if util_vals else None,
         "calibration_rmse": float(np.sqrt(np.mean(calib_err_sq))) if calib_err_sq else None,
+        "band_80_coverage": (100.0 * band_hits / band_total) if band_total > 0 else None,
     }
     if hit_total > 0:
         out["hit_count"] = hit_true
         out["hit_total"] = hit_total
+    if band_total > 0:
+        out["band_coverage_count"] = band_total
     return out
 
 
@@ -1237,43 +1417,89 @@ def _collect_metrics_by_horizon(config: TournamentConfig) -> List[Dict[str, Any]
         horizon_min = _timeframe_to_minutes(timeframe, config.candle_minutes)
         ready_rows = get_recent_ready_predictions(timeframe, metrics_limit)
         summary = _summarize_ready_metrics(ready_rows)
+        live_metrics_20 = _summarize_ready_metrics(get_recent_ready_predictions(timeframe, 20))
         rows.append(
             {
                 "timeframe": timeframe,
                 "target": _horizon_target_label(horizon_min),
                 "horizon_minutes": horizon_min,
                 "metrics": summary,
+                "live_metrics_20": live_metrics_20,
+                "live_mae_20": (live_metrics_20 or {}).get("price_mae") if live_metrics_20 else None,
             }
         )
     return rows
 
 
-def _build_backtest_report(config: TournamentConfig) -> List[Dict[str, Any]]:
-    rows = _collect_metrics_by_horizon(config)
+def _build_backtest_report(
+    config: TournamentConfig,
+    *,
+    metrics_by_horizon: Optional[List[Dict[str, Any]]] = None,
+) -> List[Dict[str, Any]]:
+    rows = metrics_by_horizon if metrics_by_horizon is not None else _collect_metrics_by_horizon(config)
     out: List[Dict[str, Any]] = []
     for row in rows:
         metrics = row.get("metrics") or {}
-        mape = metrics.get("mape")
-        hit_rate = metrics.get("hit_rate")
-        util = metrics.get("directional_utility")
-        calibration_rmse = metrics.get("calibration_rmse")
-        production_ready = bool(
-            metrics
-            and mape is not None
-            and hit_rate is not None
-            and float(mape) <= float(os.getenv("PROD_MAX_MAPE", "3.0"))
-            and float(hit_rate) >= float(os.getenv("PROD_MIN_HIT_RATE", "52.0"))
-        )
+        live_metrics_20 = row.get("live_metrics_20") or {}
+        timeframe = str(row.get("timeframe") or "")
+        tf_cfg = _config_for_timeframe(config, timeframe) if timeframe else config
+        run_artifact = _load_run_artifact(tf_cfg)
+        holdout_metrics = (((run_artifact.get("served_artifact") or {}).get("holdout_metrics")) or {})
+        thresholds = _timeframe_quality_thresholds(timeframe)
+        holdout_price_mae = _first_numeric(holdout_metrics.get("price_mae"))
+        sample_count = _first_numeric(
+            holdout_metrics.get("sample_count"),
+            metrics.get("sample_count"),
+            metrics.get("samples"),
+        ) or 0.0
+        p90_abs_error = _first_numeric(holdout_metrics.get("p90_abs_error"), metrics.get("p90_abs_error"))
+        direction_hit_rate = _first_numeric(holdout_metrics.get("direction_hit_rate"), metrics.get("direction_hit_rate"), metrics.get("hit_rate"))
+        signed_bias_rs = _first_numeric(holdout_metrics.get("signed_bias_rs"), metrics.get("signed_bias_rs"))
+        calibration_rmse = _first_numeric(holdout_metrics.get("calibration_rmse"), metrics.get("calibration_rmse"))
+        band_80_coverage = _first_numeric(holdout_metrics.get("band_80_coverage"), metrics.get("band_80_coverage"))
+        reasons: List[str] = []
+        if sample_count < float(thresholds.get("min_samples") or 0.0):
+            reasons.append("insufficient_samples")
+        if holdout_price_mae is None:
+            reasons.append("holdout_missing")
+        if holdout_price_mae is not None and thresholds.get("max_price_mae") is not None and holdout_price_mae > float(thresholds["max_price_mae"]):
+            reasons.append("price_mae")
+        if p90_abs_error is not None and thresholds.get("max_p90_abs_error") is not None and p90_abs_error > float(thresholds["max_p90_abs_error"]):
+            reasons.append("p90_abs_error")
+        if direction_hit_rate is not None and thresholds.get("min_direction_hit_rate") is not None and direction_hit_rate < float(thresholds["min_direction_hit_rate"]):
+            reasons.append("direction_hit_rate")
+        if signed_bias_rs is not None and thresholds.get("max_signed_bias_rs") is not None and abs(signed_bias_rs) > float(thresholds["max_signed_bias_rs"]):
+            reasons.append("signed_bias_rs")
+        if calibration_rmse is not None and thresholds.get("max_calibration_rmse") is not None and calibration_rmse > float(thresholds["max_calibration_rmse"]):
+            reasons.append("calibration_rmse")
+        if band_80_coverage is not None and not (75.0 <= band_80_coverage <= 85.0):
+            reasons.append("band_80_coverage")
+        production_ready = len(reasons) == 0 and holdout_price_mae is not None
         out.append(
             {
-                "timeframe": row.get("timeframe"),
+                "timeframe": timeframe,
                 "target": row.get("target"),
                 "samples": metrics.get("samples") if metrics else 0,
+                "sample_count": sample_count,
                 "mae": metrics.get("mae") if metrics else None,
-                "mape": mape,
-                "hit_rate": hit_rate,
-                "directional_utility": util,
+                "price_mae": metrics.get("price_mae") if metrics else None,
+                "price_rmse": metrics.get("price_rmse") if metrics else None,
+                "median_abs_error": metrics.get("median_abs_error") if metrics else None,
+                "p90_abs_error": metrics.get("p90_abs_error") if metrics else None,
+                "mape": metrics.get("mape"),
+                "smape": metrics.get("smape") if metrics else None,
+                "hit_rate": metrics.get("hit_rate"),
+                "direction_hit_rate": metrics.get("direction_hit_rate") if metrics else None,
+                "directional_utility": metrics.get("directional_utility"),
                 "calibration_rmse": calibration_rmse,
+                "signed_bias_rs": metrics.get("signed_bias_rs") if metrics else None,
+                "band_80_coverage": metrics.get("band_80_coverage") if metrics else None,
+                "live_mae_20": live_metrics_20.get("price_mae") if live_metrics_20 else None,
+                "live_metrics_20": live_metrics_20,
+                "holdout_price_mae": holdout_price_mae,
+                "holdout_metrics": holdout_metrics,
+                "holdout_window": run_artifact.get("holdout_window"),
+                "quality_gate_reasons": reasons,
                 "production_ready": production_ready,
             }
         )
@@ -1324,6 +1550,167 @@ def _compute_drift_status(config: TournamentConfig) -> Dict[str, Any]:
             }
         )
     return {"alert": alert, "details": details}
+
+
+def _latest_runs_by_timeframe(config: TournamentConfig) -> Dict[str, Dict[str, Any]]:
+    runs = get_latest_runs_for_timeframes(get_timeframes(config))
+    out: Dict[str, Dict[str, Any]] = {}
+    for run in runs:
+        timeframe = run.get("timeframe")
+        if timeframe:
+            out[str(timeframe)] = run
+    return out
+
+
+def _timeframe_quality_badge(
+    *,
+    status: Optional[str],
+    freshness_status: str,
+    data_source_quality: str,
+    production_ready: bool,
+    sample_count: float,
+    min_samples: float,
+    holdout_price_mae: Optional[float],
+    drift_alert: bool,
+) -> tuple[str, str, str, List[str]]:
+    reasons: List[str] = []
+    if status in {"no_champion", "no_data", "no_prediction"}:
+        reasons.append(status)
+        return "blocked", "blocked_by_dq", "data_blocked", reasons
+    if freshness_status == "stale" or status == "stale_data":
+        reasons.append("stale_data")
+        return "stale_data", "blocked_by_dq", "data_blocked", reasons
+    if freshness_status == "missing":
+        reasons.append("freshness_missing")
+        return "blocked", "blocked_by_dq", "data_blocked", reasons
+    if data_source_quality in {"missing", "degraded"} and status in {"no_prediction", "no_data"}:
+        reasons.append("data_source_quality")
+        return "blocked", "blocked_by_dq", "data_blocked", reasons
+    if sample_count < min_samples:
+        reasons.append("insufficient_samples")
+        return "insufficient_samples", "blocked_by_holdout", "insufficient_samples", reasons
+    if holdout_price_mae is None:
+        reasons.append("holdout_missing")
+        return "blocked", "blocked_by_holdout", "holdout_missing", reasons
+    if not production_ready:
+        reasons.append("holdout_gate_failed")
+        return "degraded", "blocked_by_holdout", "holdout_gate_failed", reasons
+    if drift_alert:
+        reasons.append("drift_alert")
+        return "degraded", "blocked_by_shadow", "shadow_watch", reasons
+    return "trusted", "active", "active_incumbent", reasons
+
+
+def _build_served_horizon_statuses(
+    config: TournamentConfig,
+    *,
+    metrics_by_horizon: Optional[List[Dict[str, Any]]] = None,
+    backtest_report: Optional[List[Dict[str, Any]]] = None,
+    drift_status: Optional[Dict[str, Any]] = None,
+    champions_by_horizon: Optional[Dict[str, Any]] = None,
+    freshness_by_horizon: Optional[Dict[str, Any]] = None,
+    completeness_rows: Optional[List[Dict[str, Any]]] = None,
+) -> List[Dict[str, Any]]:
+    metrics_rows = metrics_by_horizon if metrics_by_horizon is not None else _collect_metrics_by_horizon(config)
+    report_rows = backtest_report if backtest_report is not None else _build_backtest_report(config, metrics_by_horizon=metrics_rows)
+    drift = drift_status if drift_status is not None else _compute_drift_status(config)
+    metrics_by_tf = {str(row.get("timeframe")): row for row in metrics_rows}
+    report_by_tf = {str(row.get("timeframe")): row for row in report_rows}
+    drift_by_tf = {str(row.get("timeframe")): row for row in (drift.get("details") or [])}
+    completeness_by_tf = {str(row.get("timeframe")): row for row in (completeness_rows or [])}
+    champions = champions_by_horizon or {}
+    freshness_map = freshness_by_horizon or {}
+    run_meta_by_tf = _latest_runs_by_timeframe(config)
+    statuses: List[Dict[str, Any]] = []
+    for timeframe in get_timeframes(config):
+        metrics_row = metrics_by_tf.get(timeframe) or {}
+        report_row = report_by_tf.get(timeframe) or {}
+        drift_detail = drift_by_tf.get(timeframe) or {}
+        champion_row = ((champions.get(timeframe) or {}).get("return")) or {}
+        freshness = freshness_map.get(timeframe)
+        completeness_row = completeness_by_tf.get(timeframe) or {}
+        completeness_pct = _first_numeric(completeness_row.get("completeness_pct"))
+        freshness_status = _freshness_status(freshness)
+        data_source_quality = _classify_data_source_quality(freshness, completeness_pct=completeness_pct)
+        sample_count = _first_numeric(report_row.get("sample_count"), (metrics_row.get("metrics") or {}).get("sample_count"), (metrics_row.get("metrics") or {}).get("samples")) or 0.0
+        thresholds = _timeframe_quality_thresholds(timeframe)
+        quality_badge, promotion_state, shadow_status, reasons = _timeframe_quality_badge(
+            status=None,
+            freshness_status=freshness_status,
+            data_source_quality=data_source_quality,
+            production_ready=bool(report_row.get("production_ready")),
+            sample_count=sample_count,
+            min_samples=float(thresholds.get("min_samples") or 0.0),
+            holdout_price_mae=_first_numeric(report_row.get("holdout_price_mae")),
+            drift_alert=str(drift_detail.get("status") or "").lower() == "alert",
+        )
+        champion_age_hours = _first_numeric(champion_row.get("champion_age_hours"))
+        if champion_age_hours is None:
+            run_meta = run_meta_by_tf.get(timeframe) or {}
+            finished_at = _parse_iso(run_meta.get("run_finished_at") or run_meta.get("run_at"))
+            if finished_at:
+                if finished_at.tzinfo is None:
+                    finished_at = finished_at.replace(tzinfo=timezone.utc)
+                champion_age_hours = max(0.0, (datetime.now(timezone.utc) - finished_at.astimezone(timezone.utc)).total_seconds() / 3600.0)
+        statuses.append(
+            {
+                "timeframe": timeframe,
+                "is_primary_business_horizon": timeframe == BUSINESS_PRIMARY_TIMEFRAME,
+                "quality_badge": quality_badge,
+                "promotion_state": champion_row.get("promotion_state") or promotion_state,
+                "shadow_status": shadow_status,
+                "confidence_proxy_label": "model confidence proxy",
+                "freshness_status": freshness_status,
+                "data_source_quality": data_source_quality,
+                "champion_model": champion_row.get("model_id"),
+                "champion_age_hours": champion_age_hours,
+                "holdout_price_mae": _first_numeric(report_row.get("holdout_price_mae")),
+                "live_mae_20": _first_numeric(report_row.get("live_mae_20")),
+                "median_abs_error": _first_numeric((metrics_row.get("metrics") or {}).get("median_abs_error")),
+                "p90_abs_error": _first_numeric(report_row.get("p90_abs_error")),
+                "signed_bias_rs": _first_numeric((metrics_row.get("metrics") or {}).get("signed_bias_rs")),
+                "band_80_coverage": _first_numeric((metrics_row.get("metrics") or {}).get("band_80_coverage")),
+                "sample_count": sample_count,
+                "drift_status": drift_detail.get("status"),
+                "holdout_window": report_row.get("holdout_window"),
+                "fail_fast_blocked": quality_badge in {"blocked", "stale_data", "insufficient_samples"},
+                "fail_fast_reasons": reasons + list(report_row.get("quality_gate_reasons") or []),
+                "completeness_pct": completeness_pct,
+            }
+        )
+    statuses.sort(key=lambda row: (0 if row.get("is_primary_business_horizon") else 1, _timeframe_to_minutes(str(row.get("timeframe") or "1h"), LEGACY_PREDICTION_HORIZON_MINUTES)))
+    return statuses
+
+
+def _prediction_rows_to_served_statuses(predictions: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    statuses: List[Dict[str, Any]] = []
+    for row in predictions:
+        statuses.append(
+            {
+                "timeframe": row.get("timeframe"),
+                "is_primary_business_horizon": bool(row.get("is_primary_business_horizon")),
+                "quality_badge": row.get("quality_badge"),
+                "promotion_state": row.get("promotion_state"),
+                "shadow_status": row.get("shadow_status"),
+                "confidence_proxy_label": row.get("confidence_proxy_label"),
+                "freshness_status": row.get("freshness_status"),
+                "data_source_quality": row.get("data_source_quality"),
+                "champion_age_hours": row.get("champion_age_hours"),
+                "holdout_price_mae": row.get("holdout_price_mae"),
+                "live_mae_20": row.get("live_mae_20"),
+                "median_abs_error": row.get("median_abs_error"),
+                "p90_abs_error": row.get("p90_abs_error"),
+                "signed_bias_rs": row.get("signed_bias_rs"),
+                "band_80_coverage": row.get("band_80_coverage"),
+                "sample_count": row.get("sample_count"),
+                "fail_fast_blocked": bool(row.get("fail_fast_blocked")),
+                "fail_fast_reasons": list(row.get("fail_fast_reasons") or []),
+                "status": row.get("status"),
+                "prediction_target": row.get("prediction_target"),
+            }
+        )
+    statuses.sort(key=lambda item: (0 if item.get("is_primary_business_horizon") else 1, _timeframe_to_minutes(str(item.get("timeframe") or "1h"), LEGACY_PREDICTION_HORIZON_MINUTES)))
+    return statuses
 
 
 def _estimate_eta_from_runs(
@@ -1480,12 +1867,77 @@ def _decorate_pending_target(row: Dict[str, Any], horizon_min: int) -> Dict[str,
     return row
 
 
+def _attach_prediction_trust_surface(
+    row: Dict[str, Any],
+    *,
+    timeframe: str,
+    metrics_row: Optional[Dict[str, Any]] = None,
+    backtest_row: Optional[Dict[str, Any]] = None,
+    drift_detail: Optional[Dict[str, Any]] = None,
+    run_meta: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    metrics_row = metrics_row or {}
+    backtest_row = backtest_row or {}
+    drift_detail = drift_detail or {}
+    run_meta = run_meta or {}
+    live_metrics = metrics_row.get("metrics") or {}
+    live_metrics_20 = metrics_row.get("live_metrics_20") or {}
+    freshness = row.get("data_freshness")
+    freshness_status = _freshness_status(freshness)
+    data_source_quality = _classify_data_source_quality(freshness)
+    thresholds = _timeframe_quality_thresholds(timeframe)
+    sample_count = _first_numeric(backtest_row.get("sample_count"), live_metrics.get("sample_count"), live_metrics.get("samples")) or 0.0
+    run_finished = _parse_iso(run_meta.get("run_finished_at") or run_meta.get("run_at"))
+    champion_age_hours = None
+    if run_finished:
+        if run_finished.tzinfo is None:
+            run_finished = run_finished.replace(tzinfo=timezone.utc)
+        champion_age_hours = max(0.0, (datetime.now(timezone.utc) - run_finished.astimezone(timezone.utc)).total_seconds() / 3600.0)
+    holdout_price_mae = _first_numeric(row.get("holdout_price_mae"), backtest_row.get("holdout_price_mae"), backtest_row.get("holdout_primary_metric"))
+    quality_badge, promotion_state, shadow_status, reasons = _timeframe_quality_badge(
+        status=str(row.get("status") or "") or None,
+        freshness_status=freshness_status,
+        data_source_quality=data_source_quality,
+        production_ready=bool(backtest_row.get("production_ready")),
+        sample_count=sample_count,
+        min_samples=float(thresholds.get("min_samples") or 0.0),
+        holdout_price_mae=holdout_price_mae,
+        drift_alert=str(drift_detail.get("status") or "").lower() == "alert",
+    )
+    row["holdout_price_mae"] = holdout_price_mae
+    row["live_mae_20"] = _first_numeric(live_metrics_20.get("price_mae"))
+    row["median_abs_error"] = _first_numeric(backtest_row.get("median_abs_error"), live_metrics.get("median_abs_error"))
+    row["p90_abs_error"] = _first_numeric(backtest_row.get("p90_abs_error"), live_metrics.get("p90_abs_error"))
+    row["signed_bias_rs"] = _first_numeric(backtest_row.get("signed_bias_rs"), live_metrics.get("signed_bias_rs"))
+    row["band_80_coverage"] = _first_numeric(backtest_row.get("band_80_coverage"), live_metrics.get("band_80_coverage"))
+    row["champion_age_hours"] = champion_age_hours
+    row["shadow_status"] = row.get("shadow_status") or shadow_status
+    row["promotion_state"] = row.get("promotion_state") or promotion_state
+    row["quality_badge"] = quality_badge
+    row["data_source_quality"] = data_source_quality
+    row["freshness_status"] = freshness_status
+    row["confidence_proxy_label"] = row.get("confidence_proxy_label") or "model confidence proxy"
+    row["baseline_comparison"] = row.get("baseline_comparison") or backtest_row.get("baseline_comparison")
+    row["fail_fast_blocked"] = quality_badge in {"blocked", "stale_data", "insufficient_samples"}
+    row["fail_fast_reasons"] = reasons + list(backtest_row.get("quality_gate_reasons") or [])
+    row["is_primary_business_horizon"] = timeframe == BUSINESS_PRIMARY_TIMEFRAME
+    row["sample_count"] = sample_count
+    return row
+
+
 def refresh_prediction(config: TournamentConfig) -> Dict[str, Any]:
     if _RUN_STATE.get("running"):
         return latest_prediction(config, update_pending=False)
     ensure_tables()
     update_pending_predictions(config)
     predictions: List[Dict[str, Any]] = []
+    metrics_by_horizon = _collect_metrics_by_horizon(config)
+    backtest_report = _build_backtest_report(config, metrics_by_horizon=metrics_by_horizon)
+    drift_status = _compute_drift_status(config)
+    metrics_by_tf = {str(row.get("timeframe")): row for row in metrics_by_horizon}
+    report_by_tf = {str(row.get("timeframe")): row for row in backtest_report}
+    drift_by_tf = {str(row.get("timeframe")): row for row in (drift_status.get("details") or [])}
+    run_meta_by_tf = _latest_runs_by_timeframe(config)
 
     latest_run = get_latest_run()
     run_id = latest_run["id"] if latest_run else None
@@ -1500,28 +1952,42 @@ def refresh_prediction(config: TournamentConfig) -> Dict[str, Any]:
         tf_reg = _load_registry(tf_cfg.registry_path)
         has_tf_models = bool((tf_reg.get("champions") if isinstance(tf_reg, dict) else None) or (tf_reg.get("ensembles") if isinstance(tf_reg, dict) else None))
         if not has_tf_models:
-            predictions.append(
-                {
-                    "timeframe": timeframe,
-                    "timeframe_minutes": horizon_min,
-                    "prediction_horizon_min": horizon_min,
-                    "prediction_target": target_label,
-                    "status": "no_champion",
-                }
+            row = {
+                "timeframe": timeframe,
+                "timeframe_minutes": horizon_min,
+                "prediction_horizon_min": horizon_min,
+                "prediction_target": target_label,
+                "status": "no_champion",
+            }
+            _attach_prediction_trust_surface(
+                row,
+                timeframe=timeframe,
+                metrics_row=metrics_by_tf.get(timeframe),
+                backtest_row=report_by_tf.get(timeframe),
+                drift_detail=drift_by_tf.get(timeframe),
+                run_meta=run_meta_by_tf.get(timeframe),
             )
+            predictions.append(row)
             continue
 
         snapshot = _latest_feature_snapshot(tf_cfg)
         if not snapshot:
-            predictions.append(
-                {
-                    "timeframe": timeframe,
-                    "timeframe_minutes": horizon_min,
-                    "prediction_horizon_min": horizon_min,
-                    "prediction_target": target_label,
-                    "status": "no_data",
-                }
+            row = {
+                "timeframe": timeframe,
+                "timeframe_minutes": horizon_min,
+                "prediction_horizon_min": horizon_min,
+                "prediction_target": target_label,
+                "status": "no_data",
+            }
+            _attach_prediction_trust_surface(
+                row,
+                timeframe=timeframe,
+                metrics_row=metrics_by_tf.get(timeframe),
+                backtest_row=report_by_tf.get(timeframe),
+                drift_detail=drift_by_tf.get(timeframe),
+                run_meta=run_meta_by_tf.get(timeframe),
             )
+            predictions.append(row)
             continue
         latest_row = snapshot["latest_row"]
         anchor_ts = snapshot["anchor_ts"]
@@ -1529,6 +1995,7 @@ def refresh_prediction(config: TournamentConfig) -> Dict[str, Any]:
         source_df = snapshot["source_df"]
         freshness = snapshot.get("freshness") or {}
         run_artifact = _load_run_artifact(tf_cfg)
+        trust_metadata = _run_artifact_prediction_metadata(run_artifact)
         holdout_metric = None
         try:
             holdout_metric = float((((run_artifact.get("served_artifact") or {}).get("holdout_metrics") or {}).get("price_mae")))
@@ -1542,10 +2009,19 @@ def refresh_prediction(config: TournamentConfig) -> Dict[str, Any]:
                 _decorate_pending_target(latest, horizon_min)
                 latest["last_ready"] = _resolve_last_ready(timeframe, horizon_min)
                 latest["data_freshness"] = freshness
+                latest.update({k: v for k, v in trust_metadata.items() if v is not None})
                 _decorate_prediction_provenance(
                     latest,
                     holdout_metric=holdout_metric,
                     calibration_regime=latest.get("regime"),
+                )
+                _attach_prediction_trust_surface(
+                    latest,
+                    timeframe=timeframe,
+                    metrics_row=metrics_by_tf.get(timeframe),
+                    backtest_row=report_by_tf.get(timeframe),
+                    drift_detail=drift_by_tf.get(timeframe),
+                    run_meta=run_meta_by_tf.get(timeframe),
                 )
                 predictions.append(latest)
                 continue
@@ -1557,10 +2033,19 @@ def refresh_prediction(config: TournamentConfig) -> Dict[str, Any]:
                 latest["status"] = latest.get("status") or "market_closed"
                 latest["last_ready"] = _resolve_last_ready(timeframe, horizon_min)
                 latest["data_freshness"] = freshness
+                latest.update({k: v for k, v in trust_metadata.items() if v is not None})
                 _decorate_prediction_provenance(
                     latest,
                     holdout_metric=holdout_metric,
                     calibration_regime=latest.get("regime"),
+                )
+                _attach_prediction_trust_surface(
+                    latest,
+                    timeframe=timeframe,
+                    metrics_row=metrics_by_tf.get(timeframe),
+                    backtest_row=report_by_tf.get(timeframe),
+                    drift_detail=drift_by_tf.get(timeframe),
+                    run_meta=run_meta_by_tf.get(timeframe),
                 )
                 predictions.append(latest)
                 continue
@@ -1571,23 +2056,40 @@ def refresh_prediction(config: TournamentConfig) -> Dict[str, Any]:
                 latest["status"] = "stale_data"
                 latest["last_ready"] = _resolve_last_ready(timeframe, horizon_min)
                 latest["data_freshness"] = freshness
+                latest.update({k: v for k, v in trust_metadata.items() if v is not None})
                 _decorate_prediction_provenance(
                     latest,
                     holdout_metric=holdout_metric,
                     calibration_regime=latest.get("regime"),
                 )
+                _attach_prediction_trust_surface(
+                    latest,
+                    timeframe=timeframe,
+                    metrics_row=metrics_by_tf.get(timeframe),
+                    backtest_row=report_by_tf.get(timeframe),
+                    drift_detail=drift_by_tf.get(timeframe),
+                    run_meta=run_meta_by_tf.get(timeframe),
+                )
                 predictions.append(latest)
             else:
-                predictions.append(
-                    {
-                        "timeframe": timeframe,
-                        "timeframe_minutes": horizon_min,
-                        "prediction_horizon_min": horizon_min,
-                        "prediction_target": target_label,
-                        "status": "stale_data",
-                        "data_freshness": freshness,
-                    }
+                row = {
+                    "timeframe": timeframe,
+                    "timeframe_minutes": horizon_min,
+                    "prediction_horizon_min": horizon_min,
+                    "prediction_target": target_label,
+                    "status": "stale_data",
+                    "data_freshness": freshness,
+                    **{k: v for k, v in trust_metadata.items() if v is not None},
+                }
+                _attach_prediction_trust_surface(
+                    row,
+                    timeframe=timeframe,
+                    metrics_row=metrics_by_tf.get(timeframe),
+                    backtest_row=report_by_tf.get(timeframe),
+                    drift_detail=drift_by_tf.get(timeframe),
+                    run_meta=run_meta_by_tf.get(timeframe),
                 )
+                predictions.append(row)
             continue
 
         regime = _market_regime()
@@ -1599,15 +2101,22 @@ def refresh_prediction(config: TournamentConfig) -> Dict[str, Any]:
             pred = _predict_return_from_direction(tf_cfg, latest_row, source_df)
             prediction_target = f"direction_{target_label}"
         if pred is None:
-            predictions.append(
-                {
-                    "timeframe": timeframe,
-                    "timeframe_minutes": horizon_min,
-                    "prediction_horizon_min": horizon_min,
-                    "prediction_target": target_label,
-                    "status": "no_champion",
-                }
+            row = {
+                "timeframe": timeframe,
+                "timeframe_minutes": horizon_min,
+                "prediction_horizon_min": horizon_min,
+                "prediction_target": target_label,
+                "status": "no_champion",
+            }
+            _attach_prediction_trust_surface(
+                row,
+                timeframe=timeframe,
+                metrics_row=metrics_by_tf.get(timeframe),
+                backtest_row=report_by_tf.get(timeframe),
+                drift_detail=drift_by_tf.get(timeframe),
+                run_meta=run_meta_by_tf.get(timeframe),
             )
+            predictions.append(row)
             continue
 
         predicted_return = float(pred["predicted_return"])
@@ -1670,18 +2179,30 @@ def refresh_prediction(config: TournamentConfig) -> Dict[str, Any]:
             record["ensemble_size"] = pred.get("ensemble_size")
         _apply_match_fields(record)
         record["data_freshness"] = freshness
+        record.update({k: v for k, v in trust_metadata.items() if v is not None})
         _decorate_prediction_provenance(
             record,
             holdout_metric=holdout_metric,
             calibration_regime=calibrator.get("regime") if calibrator else regime,
         )
+        _attach_prediction_trust_surface(
+            record,
+            timeframe=timeframe,
+            metrics_row=metrics_by_tf.get(timeframe),
+            backtest_row=report_by_tf.get(timeframe),
+            drift_detail=drift_by_tf.get(timeframe),
+            run_meta=run_meta_by_tf.get(timeframe),
+        )
         predictions.append(record)
 
+    served_horizon_statuses = _prediction_rows_to_served_statuses(predictions)
     return {
         "predictions": predictions,
-        "metrics_by_horizon": _collect_metrics_by_horizon(config),
-        "backtest_report": _build_backtest_report(config),
-        "drift_status": _compute_drift_status(config),
+        "primary_business_timeframe": BUSINESS_PRIMARY_TIMEFRAME,
+        "metrics_by_horizon": metrics_by_horizon,
+        "backtest_report": backtest_report,
+        "drift_status": drift_status,
+        "served_horizon_statuses": served_horizon_statuses,
     }
 
 
@@ -1689,11 +2210,19 @@ def latest_prediction(config: TournamentConfig, update_pending: bool = True) -> 
     if update_pending and not _RUN_STATE.get("running"):
         update_pending_predictions(config)
     predictions: List[Dict[str, Any]] = []
+    metrics_by_horizon = _collect_metrics_by_horizon(config)
+    backtest_report = _build_backtest_report(config, metrics_by_horizon=metrics_by_horizon)
+    drift_status = _compute_drift_status(config)
+    metrics_by_tf = {str(row.get("timeframe")): row for row in metrics_by_horizon}
+    report_by_tf = {str(row.get("timeframe")): row for row in backtest_report}
+    drift_by_tf = {str(row.get("timeframe")): row for row in (drift_status.get("details") or [])}
+    run_meta_by_tf = _latest_runs_by_timeframe(config)
     for timeframe in get_timeframes(config):
         latest = get_latest_prediction_for_timeframe(timeframe)
         horizon_min = _timeframe_to_minutes(timeframe, config.candle_minutes)
         tf_cfg = _config_for_timeframe(config, timeframe)
         run_artifact = _load_run_artifact(tf_cfg)
+        trust_metadata = _run_artifact_prediction_metadata(run_artifact)
         holdout_metric = None
         try:
             holdout_metric = float((((run_artifact.get("served_artifact") or {}).get("holdout_metrics") or {}).get("price_mae")))
@@ -1706,38 +2235,64 @@ def latest_prediction(config: TournamentConfig, update_pending: bool = True) -> 
             _decorate_pending_target(latest, horizon_min)
             latest["last_ready"] = _resolve_last_ready(timeframe, horizon_min)
             latest["data_freshness"] = freshness
+            latest.update({k: v for k, v in trust_metadata.items() if v is not None})
             _decorate_prediction_provenance(
                 latest,
                 holdout_metric=holdout_metric,
                 calibration_regime=latest.get("regime"),
             )
+            _attach_prediction_trust_surface(
+                latest,
+                timeframe=timeframe,
+                metrics_row=metrics_by_tf.get(timeframe),
+                backtest_row=report_by_tf.get(timeframe),
+                drift_detail=drift_by_tf.get(timeframe),
+                run_meta=run_meta_by_tf.get(timeframe),
+            )
             predictions.append(latest)
         else:
-            predictions.append(
-                {
-                    "timeframe": timeframe,
+            row = {
+                "timeframe": timeframe,
                     "timeframe_minutes": horizon_min,
                     "prediction_horizon_min": horizon_min,
                     "status": "no_prediction",
                     "data_freshness": freshness,
+                    **{k: v for k, v in trust_metadata.items() if v is not None},
                 }
+            _attach_prediction_trust_surface(
+                row,
+                timeframe=timeframe,
+                metrics_row=metrics_by_tf.get(timeframe),
+                backtest_row=report_by_tf.get(timeframe),
+                drift_detail=drift_by_tf.get(timeframe),
+                run_meta=run_meta_by_tf.get(timeframe),
             )
+            predictions.append(row)
+    served_horizon_statuses = _prediction_rows_to_served_statuses(predictions)
     return {
         "predictions": predictions,
-        "metrics_by_horizon": _collect_metrics_by_horizon(config),
-        "backtest_report": _build_backtest_report(config),
-        "drift_status": _compute_drift_status(config),
+        "primary_business_timeframe": BUSINESS_PRIMARY_TIMEFRAME,
+        "metrics_by_horizon": metrics_by_horizon,
+        "backtest_report": backtest_report,
+        "drift_status": drift_status,
+        "served_horizon_statuses": served_horizon_statuses,
     }
 
 
 def run_status() -> Dict[str, Any]:
     state = dict(_RUN_STATE)
     file_state = _read_run_state_file()
+    active_lock, lock_info = is_run_locked(Path(os.getenv("APP_DATA_DIR", "data")))
     if not file_state:
+        if active_lock:
+            state["running"] = True
+            state["lock"] = lock_info
         return state
 
-    running = bool(state.get("running") or file_state.get("running"))
+    running = bool(state.get("running") or file_state.get("running") or active_lock)
     state["running"] = running
+    if lock_info:
+        state["lock"] = lock_info
 
     file_started = _parse_iso(file_state.get("last_started_at"))
     mem_started = _parse_iso(state.get("last_started_at"))
@@ -1763,18 +2318,28 @@ def _run_tournament_thread(config: TournamentConfig) -> None:
         from jeena_sikho_tournament.multi_timeframe import run_multi_timeframe_tournament
         run_multi_timeframe_tournament(config)
     finally:
+        release_run_lock("web", data_dir=config.data_dir)
         with _RUN_LOCK:
             _RUN_STATE["running"] = False
+            _RUN_STATE["lock"] = None
+            _RUN_STATE["last_finished_at"] = datetime.now(timezone.utc).isoformat()
 
 
 def run_tournament_async(config: TournamentConfig, run_mode: Optional[str]) -> Dict[str, Any]:
     with _RUN_LOCK:
         if _RUN_STATE["running"]:
             return {"status": "already_running", **_RUN_STATE}
+        acquired, lock_info = acquire_run_lock("web", data_dir=config.data_dir, metadata={"mode": run_mode or config.run_mode})
+        if not acquired:
+            state = dict(_RUN_STATE)
+            state["running"] = True
+            state["lock"] = lock_info
+            return {"status": "already_running", **state}
         if run_mode:
             config.run_mode = run_mode
         _RUN_STATE["running"] = True
         _RUN_STATE["last_started_at"] = datetime.now(timezone.utc).isoformat()
+        _RUN_STATE["lock"] = lock_info
         t = threading.Thread(target=_run_tournament_thread, args=(config,), daemon=True)
         t.start()
     return {"status": "started", **_RUN_STATE}

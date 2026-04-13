@@ -18,11 +18,11 @@ class TournamentConfig:
     registry_path: Path = DEFAULT_DATA_DIR / DEFAULT_REGISTRY_FILE
     log_path: Path = DEFAULT_DATA_DIR / DEFAULT_LOG_FILE
 
-    symbol: str = "BTC/USDT"
-    yfinance_symbol: str = "BTC-USD"
-    timeframe: str = "10m"
-    candle_minutes: int = 10
-    ohlcv_table: str = "ohlcv_10m"
+    symbol: str = "JSLL/INR"
+    yfinance_symbol: str = "JSLL.NS"
+    timeframe: str = "1h"
+    candle_minutes: int = 60
+    ohlcv_table: str = "ohlcv"
     start_date_utc: str = "2015-01-01 00:00:00"
     data_lookback_years: int = 20
     update_every_hours: int = 1
@@ -30,7 +30,7 @@ class TournamentConfig:
     train_days: int = 180
     val_hours: int = 720
     test_hours: int = 24
-    use_test: bool = False
+    use_test: bool = True
 
     fee_slippage: float = 0.0008
     min_val_points: int = 500
@@ -47,7 +47,7 @@ class TournamentConfig:
     history_keep: int = 100
     stability_weight: float = 0.2
 
-    run_mode: str = "hourly"
+    run_mode: str = "daily"
     enable_dl: bool = False
 
     ensemble_top_k: int = 3

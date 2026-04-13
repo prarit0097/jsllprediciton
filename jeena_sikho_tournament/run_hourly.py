@@ -1,18 +1,24 @@
 from pathlib import Path
 import json
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from .config import TournamentConfig
 from .drift import should_retrain_on_drift
 from .market_calendar import IST, NSE_OPEN_MIN, NSE_RUN_CLOSE_MIN, is_nse_run_window, load_nse_holidays
-from .multi_timeframe import config_for_timeframe, run_multi_timeframe_tournament
+from .multi_timeframe import config_for_timeframe, resolve_timeframes, run_multi_timeframe_tournament
 from .repair import run_nightly_repair
+from .run_lock import acquire_run_lock, is_run_locked, release_run_lock
+from .storage import Storage
 from .tournament import run_tournament
 from .env import load_env
+from .validator import assess_freshness
 
 
 def _is_running() -> bool:
+    active, _ = is_run_locked(Path(os.getenv("APP_DATA_DIR", "data")))
+    if active:
+        return True
     state_path = Path("data") / "run_state.json"
     if not state_path.exists():
         return False
@@ -20,7 +26,20 @@ def _is_running() -> bool:
         data = json.loads(state_path.read_text(encoding="utf-8"))
     except Exception:
         return False
-    return bool(data.get("running"))
+    if not bool(data.get("running")):
+        return False
+    updated_at = data.get("updated_at")
+    if updated_at:
+        try:
+            ts = datetime.fromisoformat(updated_at)
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            stale_after = max(60, int(os.getenv("RUN_LOCK_STALE_SECONDS", "21600")))
+            if datetime.now(timezone.utc) - ts.astimezone(timezone.utc) > timedelta(seconds=stale_after):
+                return False
+        except Exception:
+            return False
+    return True
 
 
 def _is_indian_equity(config: TournamentConfig) -> bool:
@@ -163,6 +182,58 @@ def _handle_maintenance_windows(config: TournamentConfig, now_utc: datetime) -> 
     return False
 
 
+def _load_json_file(path: Path) -> dict:
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _verify_served_horizons(base_config: TournamentConfig, timeframes: list[str]) -> None:
+    failures: list[str] = []
+    holidays = load_nse_holidays(base_config.data_dir)
+    now_utc = datetime.now(timezone.utc)
+    for timeframe in timeframes:
+        cfg = config_for_timeframe(base_config, timeframe)
+        registry = _load_json_file(cfg.registry_path)
+        return_champion = ((registry.get("champions") or {}).get("return")) if isinstance(registry, dict) else None
+        if not return_champion:
+            failures.append(f"{timeframe}:no_return_champion")
+
+        run_artifact_path = cfg.data_dir / f"run_artifact_{cfg.candle_minutes}m.json"
+        run_artifact = _load_json_file(run_artifact_path)
+        served_artifact = run_artifact.get("served_artifact") if isinstance(run_artifact, dict) else None
+        if not served_artifact:
+            failures.append(f"{timeframe}:missing_run_artifact")
+        elif not (served_artifact.get("holdout_metrics") or {}):
+            failures.append(f"{timeframe}:missing_holdout_metrics")
+
+        storage = Storage(cfg.db_path, cfg.ohlcv_table)
+        try:
+            df = storage.load()
+        except Exception:
+            failures.append(f"{timeframe}:no_data")
+            continue
+        if df.empty:
+            failures.append(f"{timeframe}:no_data")
+            continue
+        freshness = assess_freshness(
+            df,
+            cfg.candle_minutes,
+            nse_mode=_is_indian_equity(cfg),
+            holidays=holidays if _is_indian_equity(cfg) else set(),
+            now_utc=now_utc,
+        )
+        if freshness.get("stale"):
+            failures.append(f"{timeframe}:stale_data")
+
+    if failures:
+        raise RuntimeError("Served horizon verification failed: " + "; ".join(failures))
+
+
 def main():
     load_env()
     if _is_running():
@@ -170,6 +241,7 @@ def main():
         return
     config = TournamentConfig()
     config.base_dir = Path(".")
+    lock_acquired = False
     force_run = os.getenv("FORCE_RUN", "").strip().lower() in {"1", "true", "yes", "on"}
     holidays = load_nse_holidays(config.data_dir)
     now_utc = datetime.now(timezone.utc)
@@ -190,11 +262,23 @@ def main():
             print(f"Skipping run: {reason}. Set FORCE_RUN=1 to override.")
             return
         print(f"Drift retrain trigger: {reason}")
-    if os.getenv("MARKET_TIMEFRAMES") or os.getenv("TIMEFRAMES") or os.getenv("BTC_TIMEFRAMES"):
-        run_multi_timeframe_tournament(config)
-    else:
-        tf_cfg = config_for_timeframe(config, config.timeframe)
-        run_tournament(tf_cfg)
+    acquired, lock_info = acquire_run_lock("scheduler", data_dir=config.data_dir, metadata={"mode": config.run_mode})
+    if not acquired:
+        owner = (lock_info or {}).get("owner", "unknown")
+        print(f"Tournament already running under {owner}; skipping.")
+        return
+    lock_acquired = True
+    try:
+        timeframes = resolve_timeframes(config)
+        if len(timeframes) > 1:
+            run_multi_timeframe_tournament(config)
+        else:
+            tf_cfg = config_for_timeframe(config, timeframes[0] if timeframes else config.timeframe)
+            run_tournament(tf_cfg)
+        _verify_served_horizons(config, timeframes)
+    finally:
+        if lock_acquired:
+            release_run_lock("scheduler", data_dir=config.data_dir)
 
 
 if __name__ == "__main__":

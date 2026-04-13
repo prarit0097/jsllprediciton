@@ -1,5 +1,6 @@
 let scoreboardCache = [];
 let lastPrediction = null;
+let lastSummary = null;
 let lastNowPrice = null;
 let lastNowPriceInr = null;
 let lastQuoteCurrency = 'USD';
@@ -227,9 +228,18 @@ function normalizePredictions(data) {
   return data.predictions;
 }
 
+function primaryBusinessTimeframe() {
+  return lastPrediction?.primary_business_timeframe || lastSummary?.primary_business_timeframe || '1d';
+}
+
 function predictionMinutes(pred) {
   if (!pred) return 0;
   return pred.prediction_horizon_min || pred.timeframe_minutes || 0;
+}
+
+function predictionTimeframe(pred) {
+  if (!pred) return '';
+  return (pred.timeframe || '').toLowerCase();
 }
 
 function labelForPrediction(pred) {
@@ -240,15 +250,24 @@ function labelForPrediction(pred) {
   return mins < 60 ? `${mins}m` : `${mins / 60}h`;
 }
 
+function horizonRank(pred) {
+  const tf = predictionTimeframe(pred);
+  const primaryTf = primaryBusinessTimeframe();
+  if (tf && tf === primaryTf) return -100000;
+  return predictionMinutes(pred) || 999999;
+}
+
 function sortPredictions(preds) {
-  return [...preds].sort((a, b) => predictionMinutes(a) - predictionMinutes(b));
+  return [...preds].sort((a, b) => horizonRank(a) - horizonRank(b));
 }
 
 function selectPrimaryPrediction(preds) {
   if (!preds.length) return null;
+  const primaryTf = primaryBusinessTimeframe();
   const byMinutes = sortPredictions(preds);
-  const ten = byMinutes.find(p => predictionMinutes(p) === 10) || byMinutes[0];
-  return ten || byMinutes[0];
+  const primary = byMinutes.find(p => predictionTimeframe(p) === primaryTf && p.predicted_price);
+  if (primary) return primary;
+  return byMinutes.find(p => p.predicted_price) || byMinutes[0];
 }
 
 function formatCountdown(predictedAt, horizonMin, targetIso = null) {
@@ -327,6 +346,71 @@ function formatConfidence(pred) {
   return `${fmt(c, 1)}%`;
 }
 
+function qualityBadgeLabel(value) {
+  const map = {
+    trusted: 'Trusted',
+    shadow: 'Shadow',
+    stale_data: 'Stale data',
+    insufficient_samples: 'Insufficient samples',
+    degraded: 'Degraded',
+    blocked: 'Blocked',
+  };
+  return map[value] || (value ? value.replace(/_/g, ' ') : '--');
+}
+
+function qualityBadgeHtml(value, extraClass = '') {
+  if (!value) return '<span class="badge trust-badge trust-badge-neutral">Unknown</span>';
+  const safe = String(value).replace(/[^a-z0-9_-]/gi, '-').toLowerCase();
+  const cls = ['badge', 'trust-badge', `trust-badge-${safe}`, extraClass].filter(Boolean).join(' ');
+  return `<span class="${cls}">${qualityBadgeLabel(value)}</span>`;
+}
+
+function formatConfidenceProxy(pred) {
+  const conf = formatConfidence(pred);
+  const label = pred?.confidence_proxy_label || 'model confidence proxy';
+  return `${label}: ${conf}`;
+}
+
+function formatTrustMetrics(pred) {
+  if (!pred) return '--';
+  const parts = [];
+  if (pred.holdout_price_mae !== null && pred.holdout_price_mae !== undefined) {
+    parts.push(`Holdout MAE ${fmt(pred.holdout_price_mae, 2)}`);
+  }
+  if (pred.live_mae_20 !== null && pred.live_mae_20 !== undefined) {
+    parts.push(`Live20 MAE ${fmt(pred.live_mae_20, 2)}`);
+  }
+  if (pred.median_abs_error !== null && pred.median_abs_error !== undefined) {
+    parts.push(`Median ${fmt(pred.median_abs_error, 2)}`);
+  }
+  if (pred.p90_abs_error !== null && pred.p90_abs_error !== undefined) {
+    parts.push(`P90 ${fmt(pred.p90_abs_error, 2)}`);
+  }
+  if (pred.signed_bias_rs !== null && pred.signed_bias_rs !== undefined) {
+    parts.push(`Bias ${fmt(pred.signed_bias_rs, 2)}`);
+  }
+  if (pred.band_80_coverage !== null && pred.band_80_coverage !== undefined) {
+    parts.push(`Band80 ${fmt(pred.band_80_coverage, 1)}%`);
+  }
+  if (pred.champion_age_hours !== null && pred.champion_age_hours !== undefined) {
+    parts.push(`Champion age ${fmt(pred.champion_age_hours, 1)}h`);
+  }
+  return parts.join(' | ') || '--';
+}
+
+function formatTrustState(pred) {
+  if (!pred) return '--';
+  const parts = [];
+  if (pred.promotion_state) parts.push(`State ${String(pred.promotion_state).replace(/_/g, ' ')}`);
+  if (pred.shadow_status) parts.push(`Shadow ${String(pred.shadow_status).replace(/_/g, ' ')}`);
+  if (pred.freshness_status) parts.push(`Freshness ${pred.freshness_status}`);
+  if (pred.data_source_quality) parts.push(`Data ${pred.data_source_quality}`);
+  if (Array.isArray(pred.fail_fast_reasons) && pred.fail_fast_reasons.length) {
+    parts.push(`Flags ${pred.fail_fast_reasons.join(', ')}`);
+  }
+  return parts.join(' | ') || '--';
+}
+
 function formatPredictionProvenance(pred) {
   if (!pred) return '';
   const anchorAt = pred.forecast_anchor_at || pred.predicted_at;
@@ -353,6 +437,30 @@ function formatDiffHtml(pred, lineBreak = false) {
   const diffText = fmtQuoted(absVal, lastQuoteCurrency);
   const prefix = lineBreak ? '<br>' : ' | ';
   return `${prefix}<span class="diff-label">Difference:</span> <span class="diff-value"><span class="${signClass}">${sign}</span>${diffText}</span>`;
+}
+
+function horizonStatusMap() {
+  const statuses = Array.isArray(lastSummary?.served_horizon_statuses) ? lastSummary.served_horizon_statuses : [];
+  return Object.fromEntries(statuses.map((row) => [row.timeframe, row]));
+}
+
+function renderServedHorizonStatuses(data) {
+  const el = document.getElementById('served-horizons');
+  if (!el) return;
+  const rows = Array.isArray(data?.served_horizon_statuses) ? data.served_horizon_statuses : [];
+  if (!rows.length) {
+    el.textContent = 'Served horizons: --';
+    return;
+  }
+  const lines = rows.map((row) => {
+    const prefix = row.is_primary_business_horizon ? `${row.timeframe} primary` : row.timeframe;
+    const metrics = [];
+    if (row.holdout_price_mae !== null && row.holdout_price_mae !== undefined) metrics.push(`holdout ${fmt(row.holdout_price_mae, 2)}`);
+    if (row.live_mae_20 !== null && row.live_mae_20 !== undefined) metrics.push(`live20 ${fmt(row.live_mae_20, 2)}`);
+    if (row.fail_fast_reasons?.length) metrics.push(`flags ${row.fail_fast_reasons.join(', ')}`);
+    return `${prefix}: ${qualityBadgeLabel(row.quality_badge)}${metrics.length ? ` | ${metrics.join(' | ')}` : ''}`;
+  });
+  el.textContent = `Served horizons: ${lines.join(' || ')}`;
 }
 
 function renderPriceRow(primary, nowPriceUsd, nowPriceInr) {
@@ -387,10 +495,13 @@ function renderPriceRow(primary, nowPriceUsd, nowPriceInr) {
   const band = (primary.predicted_price_low && primary.predicted_price_high)
     ? ` [${formatDualPrice(primary.predicted_price_low, lastFxRate)} - ${formatDualPrice(primary.predicted_price_high, lastFxRate)}]`
     : '';
-  const conf = formatConfidence(primary);
+  const conf = formatConfidenceProxy(primary);
   const match = statusText(primary);
   const isSingle = Array.isArray(lastPrediction?.predictions) && lastPrediction.predictions.length <= 1;
   const provenance = formatPredictionProvenance(primary);
+  const quality = qualityBadgeHtml(primary.quality_badge, primary.is_primary_business_horizon ? 'trust-primary' : '');
+  const trustMetrics = formatTrustMetrics(primary);
+  const trustState = formatTrustState(primary);
 
   const lastReady = primary.last_ready;
 
@@ -399,7 +510,7 @@ function renderPriceRow(primary, nowPriceUsd, nowPriceInr) {
     if (priceRow) {
       priceRow.style.display = '';
       priceRow.innerHTML = `
-        <span class="price-left">Predicted (${label || `${horizonMin}m`}): ${predDisplay}${band} | Conf: ${conf}${primary.low_confidence ? ' low' : ''} | Match: ${match}<br><span class="muted">${provenance}</span></span>
+        <span class="price-left">${quality} Predicted (${label || `${horizonMin}m`}): ${predDisplay}${band} | ${conf}${primary.low_confidence ? ' low' : ''} | Match: ${match}<br><span class="muted">${trustMetrics}</span><br><span class="muted">${provenance}</span><br><span class="muted">${trustState}</span></span>
         <span class="price-right"></span>
       `;
     }
@@ -464,9 +575,11 @@ function renderPredList(predictions) {
     const band = (pred.predicted_price_low && pred.predicted_price_high)
       ? ` [${formatDualPrice(pred.predicted_price_low, lastFxRate)} - ${formatDualPrice(pred.predicted_price_high, lastFxRate)}]`
       : '';
-    const conf = formatConfidence(pred);
     const match = statusText(pred);
     const provenance = formatPredictionProvenance(pred);
+    const trustMetrics = formatTrustMetrics(pred);
+    const trustState = formatTrustState(pred);
+    const quality = qualityBadgeHtml(pred.quality_badge, pred.is_primary_business_horizon ? 'trust-primary' : '');
 
     let lastMatchedLine = 'Last matched on last predicted price: --';
     let diffActualLine = 'Difference: -- | Actual: --';
@@ -484,10 +597,10 @@ function renderPredList(predictions) {
       diffActualLine = `${diffOnly} | ${actualLine}${actualTime ? ' ' + actualTime : ''}`;
     }
 
-    const line = `Predicted (${label}): ${predPrice}${band} | Conf: ${conf}${pred.low_confidence ? ' low' : ''} | Match: ${match}<br>${provenance}<br>${lastMatchedLine}<br>${diffActualLine}`;
+    const line = `${quality} Predicted (${label}): ${predPrice}${band} | ${formatConfidenceProxy(pred)}${pred.low_confidence ? ' low' : ''} | Match: ${match}<br>${trustMetrics}<br>${provenance}<br>${trustState}<br>${lastMatchedLine}<br>${diffActualLine}`;
 
     const item = document.createElement('div');
-    item.className = 'pred-item';
+    item.className = `pred-item${pred.is_primary_business_horizon ? ' pred-item-primary' : ''}`;
     item.innerHTML = `<div class="pred-idx">${idx + 1}</div><div class="pred-text">${line}</div>`;
     list.appendChild(item);
   });
@@ -496,35 +609,34 @@ function renderPredList(predictions) {
 function renderHorizonMetrics(data) {
   const el = document.getElementById('horizon-metrics');
   if (!el) return;
-  const rows = Array.isArray(data?.metrics_by_horizon) ? data.metrics_by_horizon : [];
-  if (!rows.length) {
+  const statusRows = Array.isArray(data?.served_horizon_statuses) ? data.served_horizon_statuses : [];
+  const metricRows = Array.isArray(data?.metrics_by_horizon) ? data.metrics_by_horizon : [];
+  if (!statusRows.length && !metricRows.length) {
     el.innerHTML = '';
     return;
   }
-
-  const ordered = [...rows].sort((a, b) => (a.horizon_minutes || 0) - (b.horizon_minutes || 0));
+  const metricsByTf = Object.fromEntries(metricRows.map((row) => [row.timeframe, row]));
+  const ordered = statusRows.length
+    ? [...statusRows]
+    : [...metricRows].sort((a, b) => (a.horizon_minutes || 0) - (b.horizon_minutes || 0));
   const lines = [];
   ordered.forEach((row) => {
     const tf = row.timeframe || '--';
-    const target = row.target || '--';
-    const metrics = row.metrics;
-    if (!metrics || !metrics.samples) {
-      lines.push(`<div class="metric-row">${tf} (${target}): pending matches</div>`);
-      return;
-    }
-    const mae = fmt(metrics.mae, 4);
-    const mape = metrics.mape === null || metrics.mape === undefined ? '--' : `${fmt(metrics.mape, 2)}%`;
-    const hit = metrics.hit_rate === null || metrics.hit_rate === undefined ? '--' : `${fmt(metrics.hit_rate, 2)}%`;
-    const util = metrics.directional_utility === null || metrics.directional_utility === undefined ? '--' : fmt(metrics.directional_utility, 5);
-    const calib = metrics.calibration_rmse === null || metrics.calibration_rmse === undefined ? '--' : fmt(metrics.calibration_rmse, 5);
+    const metricRow = metricsByTf[tf] || row;
+    const metrics = metricRow.metrics || {};
+    const target = metricRow.target || row.prediction_target || '--';
+    const prefix = row.is_primary_business_horizon ? `${tf} primary` : tf;
+    const badge = qualityBadgeHtml(row.quality_badge || 'blocked', row.is_primary_business_horizon ? 'trust-primary' : '');
+    const mae = row.live_mae_20 === null || row.live_mae_20 === undefined ? '--' : fmt(row.live_mae_20, 2);
+    const holdout = row.holdout_price_mae === null || row.holdout_price_mae === undefined ? '--' : fmt(row.holdout_price_mae, 2);
+    const median = row.median_abs_error === null || row.median_abs_error === undefined ? '--' : fmt(row.median_abs_error, 2);
+    const p90 = row.p90_abs_error === null || row.p90_abs_error === undefined ? '--' : fmt(row.p90_abs_error, 2);
+    const samples = row.sample_count === null || row.sample_count === undefined ? (metrics.samples || '--') : fmt(row.sample_count, 0);
+    const state = row.promotion_state ? String(row.promotion_state).replace(/_/g, ' ') : '--';
+    const dataState = [row.freshness_status, row.data_source_quality].filter(Boolean).join('/');
     lines.push(
-      `<div class="metric-row">${tf} (${target}) | n=${metrics.samples} | MAE=${mae} | MAPE=${mape} | Hit=${hit} | Util=${util} | CalRMSE=${calib}</div>`,
+      `<div class="metric-row${row.is_primary_business_horizon ? ' metric-row-primary' : ''}">${badge} ${prefix} (${target}) | Holdout MAE=${holdout} | Live20 MAE=${mae} | Median=${median} | P90=${p90} | n=${samples} | State=${state}${dataState ? ` | Data=${dataState}` : ''}</div>`,
     );
-  });
-  const report = Array.isArray(data?.backtest_report) ? data.backtest_report : [];
-  report.forEach((row) => {
-    const ready = row.production_ready ? 'READY' : 'not-ready';
-    lines.push(`<div class="metric-row">${row.timeframe} pack: ${ready}</div>`);
   });
   el.innerHTML = lines.join('');
 }
@@ -532,15 +644,16 @@ function renderHorizonMetrics(data) {
 function updateTimeframePill(predictions) {
   const pill = document.getElementById('timeframe-pill');
   if (!pill) return;
+  const primaryTf = primaryBusinessTimeframe();
   if (!predictions || predictions.length === 0) {
-    pill.textContent = 'timeframe: --';
+    pill.textContent = `primary: ${primaryTf}`;
     return;
   }
-  if (predictions.length === 1) {
-    pill.textContent = `${labelForPrediction(predictions[0])} candles`;
-  } else {
-    pill.textContent = 'multi-timeframe';
-  }
+  const ordered = sortPredictions(predictions).map((pred) => labelForPrediction(pred));
+  const secondary = ordered.filter((label, idx) => idx > 0);
+  pill.textContent = secondary.length
+    ? `primary: ${primaryTf} | tactical: ${secondary.join(' / ')}`
+    : `primary: ${primaryTf}`;
 }
 
 function renderPredictionUI() {
@@ -610,6 +723,8 @@ async function loadPrice() {
 async function loadSummary() {
   try {
     const data = await getJSON(`${API_PREFIX}/tournament/summary`);
+    lastSummary = data;
+    if (scoreboardCache.length) applyFilters();
     const summaryRunAt = data.last_run_at || null;
     if (summaryRunAt && summaryRunAt !== lastSummaryRunAt) {
       lastSummaryRunAt = summaryRunAt;
@@ -658,6 +773,7 @@ async function loadSummary() {
         compEl.textContent = `Completeness (${compRows[0].lookback_days}d): ${parts.join(' || ')}`;
       }
     }
+    renderServedHorizonStatuses(data);
   } catch (err) {
     // ignore
   }
@@ -665,12 +781,17 @@ async function loadSummary() {
 
 function renderScoreboard(rows) {
   const tbody = document.getElementById('scoreboard-body');
+  const statusByTf = horizonStatusMap();
   tbody.innerHTML = '';
   rows.forEach((row) => {
     const tr = document.createElement('tr');
     if (row.is_champion) tr.classList.add('winner');
+    const tfStatus = statusByTf[row.timeframe || ''];
     const badge = row.is_champion ? ' <span class="badge">Champion</span>' : '';
+    const quality = qualityBadgeHtml(tfStatus?.quality_badge || 'blocked');
     tr.innerHTML = `
+      <td>${row.timeframe || '--'}</td>
+      <td>${quality}</td>
       <td>${row.rank}</td>
       <td>${row.target}</td>
       <td>${row.feature_set}</td>
@@ -816,7 +937,7 @@ async function init() {
   await loadSummary();
   await loadScoreboard();
   await loadPrice();
-  await refreshPredictionAndLoad();
+  await loadPrediction();
   await pollRunStatus();
 
   const runNowBtn = document.getElementById('run-now');
@@ -835,7 +956,7 @@ async function init() {
   }
 
   setInterval(loadPrice, PRICE_POLL_MS);
-  setInterval(refreshPredictionAndLoad, PREDICTION_POLL_MS);
+  setInterval(loadPrediction, PREDICTION_POLL_MS);
   setInterval(loadSummary, SUMMARY_POLL_MS);
   setInterval(loadScoreboard, SCOREBOARD_POLL_MS);
   setInterval(pollRunStatus, RUN_STATUS_POLL_MS);
