@@ -29,7 +29,7 @@ Django-based prediction and monitoring app for Jeena Sikho Lifecare Limited (`JS
 - `/api/jeena-sikho/tournament/scoreboard`: scoreboard rows
 - `/api/jeena-sikho/tournament/run`: manual tournament trigger (`POST`)
 - `/api/jeena-sikho/tournament/run/status`: async run status
-- `/api/jeena-sikho/prediction/latest`: latest ready predictions
+- `/api/jeena-sikho/prediction/latest`: latest ready predictions plus operator-facing capability/promotion sufficiency surfaces
 - `/api/jeena-sikho/prediction/refresh`: on-demand prediction refresh (`POST`)
 
 ## Setup
@@ -201,6 +201,24 @@ MAX_MISSING_RATIO=0.08
 COMPLETENESS_MIN_PCT=90
 AUTO_REPAIR_ON_DQ_FAIL=1
 ```
+
+Operator payloads now expose these non-breaking top-level report surfaces on
+both `prediction/latest` and `tournament/summary`:
+
+- `capability_status`
+- `baseline_accuracy_snapshot`
+- `matched_history_sufficiency`
+- `shadow_promotion_report`
+- `promotion_decision_log`
+
+Per-horizon prediction/status rows also include explicit matched-history
+sufficiency fields:
+
+- `matched_history_status`
+- `matched_history_sufficient`
+- `matched_history_sample_count`
+- `matched_history_required_samples`
+- `matched_history_remaining_samples`
 
 nginx gotcha:
 

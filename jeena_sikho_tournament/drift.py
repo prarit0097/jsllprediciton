@@ -1,14 +1,16 @@
 import json
 import os
 import sqlite3
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Tuple
 
 import numpy as np
 
 from .config import TournamentConfig
+from .registry import load_registry, record_promotion_state, save_registry
 from jeena_sikho_dashboard.db import PREDICTIONS_TABLE
-from .multi_timeframe import resolve_timeframes
+from .multi_timeframe import config_for_timeframe, resolve_timeframes
 
 
 def _load_registry(path: Path) -> Dict:
@@ -70,6 +72,49 @@ def _summarize_rows(rows: List[Tuple[float, float]]) -> Dict[str, float]:
     }
 
 
+def _update_drift_registry_state(config: TournamentConfig, timeframe: str, *, drift_alert: bool, reason: str) -> None:
+    tf_config = config_for_timeframe(config, timeframe)
+    registry = load_registry(tf_config.registry_path)
+    monitor = registry.setdefault("drift_monitor", {}).setdefault(
+        timeframe,
+        {"consecutive_breaches": 0, "updated_at": None, "last_reason": None},
+    )
+    if drift_alert:
+        consecutive = int(monitor.get("consecutive_breaches", 0)) + 1
+        monitor.update(
+            {
+                "consecutive_breaches": consecutive,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+                "last_reason": reason,
+            }
+        )
+        rollback_threshold = max(1, int(os.getenv("DRIFT_ROLLBACK_BREACHES", "2")))
+        if consecutive >= rollback_threshold:
+            champion = (registry.get("champions", {}) or {}).get("return")
+            if isinstance(champion, dict):
+                champion["promotion_state"] = "rolled_back"
+                champion["rollback_reason"] = reason
+            record_promotion_state(
+                registry,
+                "return",
+                "rolled_back",
+                {
+                    "reason": reason,
+                    "timeframe": timeframe,
+                    "consecutive_drift_breaches": consecutive,
+                },
+            )
+    else:
+        monitor.update(
+            {
+                "consecutive_breaches": 0,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+                "last_reason": reason,
+            }
+        )
+    save_registry(tf_config.registry_path, registry)
+
+
 def should_retrain_on_drift(config: TournamentConfig) -> Tuple[bool, str]:
     if not _has_any_champion(config):
         return True, "no_champion_yet"
@@ -111,11 +156,15 @@ def should_retrain_on_drift(config: TournamentConfig) -> Tuple[bool, str]:
             if not recent or not prev:
                 return True, f"insufficient_metrics_{tf}"
             if float(recent["mape"]) >= float(prev["mape"]) * ratio:
+                _update_drift_registry_state(config, tf, drift_alert=True, reason=f"drift_alert_{tf}")
                 return True, f"drift_alert_{tf}"
             if float(recent["mae"]) >= float(prev["mae"]) * mae_ratio:
+                _update_drift_registry_state(config, tf, drift_alert=True, reason=f"drift_alert_mae_{tf}")
                 return True, f"drift_alert_mae_{tf}"
             if float(recent["hit_rate"]) <= float(prev["hit_rate"]) - hit_drop:
+                _update_drift_registry_state(config, tf, drift_alert=True, reason=f"drift_alert_hit_{tf}")
                 return True, f"drift_alert_hit_{tf}"
+            _update_drift_registry_state(config, tf, drift_alert=False, reason=f"stable_no_drift_{tf}")
     finally:
         con.close()
     return False, "stable_no_drift"

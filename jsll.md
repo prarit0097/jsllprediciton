@@ -155,6 +155,8 @@ Notable behaviors:
 - recent bias and linear calibration can now prefer same-regime history when enough matched samples exist
 - prediction responses now expose provenance fields such as forecast anchor time/price, selection basis, and calibration regime
 - stale data detection now uses a current watermark check instead of only old-age heuristics
+- summary/latest payloads also expose operator surfaces for runtime capability, baseline accuracy snapshot, matched-history sufficiency, shadow promotion status, and the latest promotion decisions
+- per-horizon rows now carry explicit matched-history sufficiency fields so operators can tell when “continual learning” claims are under-sampled
 
 ## 8. Tournament / ML Layer
 

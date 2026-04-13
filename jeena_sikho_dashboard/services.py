@@ -1,4 +1,5 @@
 import json
+import importlib.util
 import logging
 import os
 import threading
@@ -755,6 +756,89 @@ def _timeframe_quality_thresholds(timeframe: str) -> Dict[str, Optional[float]]:
     return thresholds
 
 
+def _timeframe_default_samples(timeframe: str) -> float:
+    minutes = _timeframe_to_minutes(timeframe, LEGACY_PREDICTION_HORIZON_MINUTES)
+    return 60.0 if minutes >= 1440 else 80.0
+
+
+def _shadow_promotion_min_settled(timeframe: str) -> float:
+    minutes = _timeframe_to_minutes(timeframe, LEGACY_PREDICTION_HORIZON_MINUTES)
+    default = 10.0 if minutes >= 1440 else 20.0
+    env_name = f"SHADOW_PROMOTION_MIN_SETTLED_{_timeframe_gate_suffix(timeframe)}"
+    raw = os.getenv(env_name)
+    if raw is None or raw == "":
+        return default
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return default
+    return max(1.0, value)
+
+
+def _matched_history_requirement(timeframe: str) -> float:
+    thresholds = _timeframe_quality_thresholds(timeframe)
+    min_samples = thresholds.get("min_samples")
+    if min_samples is None:
+        return _timeframe_default_samples(timeframe)
+    try:
+        return float(min_samples)
+    except (TypeError, ValueError):
+        return _timeframe_default_samples(timeframe)
+
+
+def _matched_history_surface(timeframe: str, sample_count: Optional[float]) -> Dict[str, Any]:
+    sample_val = _first_numeric(sample_count) or 0.0
+    required = _matched_history_requirement(timeframe)
+    sufficient = sample_val >= required
+    remaining = max(0.0, required - sample_val)
+    return {
+        "matched_history_status": "sufficient" if sufficient else "insufficient",
+        "matched_history_sufficient": sufficient,
+        "matched_history_sample_count": sample_val,
+        "matched_history_required_samples": required,
+        "matched_history_remaining_samples": remaining,
+    }
+
+
+def _runtime_capability_status() -> Dict[str, Any]:
+    expected_modules = {
+        "yfinance": "data",
+        "sklearn": "core_ml",
+        "joblib": "core_ml",
+        "xgboost": "ensemble",
+        "lightgbm": "ensemble",
+        "catboost": "ensemble",
+        "ccxt": "market_data",
+    }
+    available: Dict[str, bool] = {}
+    for module_name in expected_modules:
+        try:
+            available[module_name] = importlib.util.find_spec(module_name) is not None
+        except Exception:
+            available[module_name] = False
+    core_ml_ready = bool(available.get("sklearn") and available.get("joblib"))
+    full_ensemble_ready = core_ml_ready and all(
+        available.get(name, False) for name in ("xgboost", "lightgbm", "catboost", "ccxt")
+    )
+    status = "full-ensemble" if full_ensemble_ready else "core-ml" if core_ml_ready else "baseline-only"
+    missing_modules = [name for name, present in available.items() if not present]
+    return {
+        "status": status,
+        "degraded": status != "full-ensemble",
+        "core_ml_ready": core_ml_ready,
+        "full_ensemble_ready": full_ensemble_ready,
+        "promotion_capable": core_ml_ready,
+        "available_modules": [name for name, present in available.items() if present],
+        "missing_modules": missing_modules,
+        "module_matrix": available,
+        "notes": (
+            "full ensemble families unavailable in runtime"
+            if status != "full-ensemble"
+            else "runtime satisfies current ensemble expectations"
+        ),
+    }
+
+
 def _first_numeric(*values: Any) -> Optional[float]:
     for value in values:
         if value is None:
@@ -910,6 +994,19 @@ def get_tournament_summary(config: TournamentConfig) -> Dict[str, Any]:
         freshness_by_horizon=freshness_by_horizon,
         completeness_rows=completeness_rows,
     )
+    capability_status = _runtime_capability_status()
+    baseline_accuracy_snapshot = _build_baseline_accuracy_snapshot(
+        config,
+        metrics_by_horizon=metrics_by_horizon,
+        backtest_report=backtest_report,
+        served_horizon_statuses=served_horizon_statuses,
+    )
+    matched_history_sufficiency = _build_matched_history_sufficiency(served_horizon_statuses)
+    shadow_promotion_report = _build_shadow_promotion_report(
+        config,
+        served_horizon_statuses=served_horizon_statuses,
+    )
+    promotion_decision_log = _build_promotion_decision_log(config)
     return {
         "last_run_at": run_at,
         "last_run_started_at": run_started_at,
@@ -931,6 +1028,11 @@ def get_tournament_summary(config: TournamentConfig) -> Dict[str, Any]:
         "run_artifacts_by_horizon": run_artifacts_by_horizon,
         "freshness_by_horizon": freshness_by_horizon,
         "served_horizon_statuses": served_horizon_statuses,
+        "capability_status": capability_status,
+        "baseline_accuracy_snapshot": baseline_accuracy_snapshot,
+        "matched_history_sufficiency": matched_history_sufficiency,
+        "shadow_promotion_report": shadow_promotion_report,
+        "promotion_decision_log": promotion_decision_log,
     }
 
 
@@ -1676,6 +1778,7 @@ def _build_served_horizon_statuses(
                 "fail_fast_blocked": quality_badge in {"blocked", "stale_data", "insufficient_samples"},
                 "fail_fast_reasons": reasons + list(report_row.get("quality_gate_reasons") or []),
                 "completeness_pct": completeness_pct,
+                **_matched_history_surface(timeframe, sample_count),
             }
         )
     statuses.sort(key=lambda row: (0 if row.get("is_primary_business_horizon") else 1, _timeframe_to_minutes(str(row.get("timeframe") or "1h"), LEGACY_PREDICTION_HORIZON_MINUTES)))
@@ -1703,6 +1806,11 @@ def _prediction_rows_to_served_statuses(predictions: List[Dict[str, Any]]) -> Li
                 "signed_bias_rs": row.get("signed_bias_rs"),
                 "band_80_coverage": row.get("band_80_coverage"),
                 "sample_count": row.get("sample_count"),
+                "matched_history_status": row.get("matched_history_status"),
+                "matched_history_sufficient": row.get("matched_history_sufficient"),
+                "matched_history_sample_count": row.get("matched_history_sample_count"),
+                "matched_history_required_samples": row.get("matched_history_required_samples"),
+                "matched_history_remaining_samples": row.get("matched_history_remaining_samples"),
                 "fail_fast_blocked": bool(row.get("fail_fast_blocked")),
                 "fail_fast_reasons": list(row.get("fail_fast_reasons") or []),
                 "status": row.get("status"),
@@ -1711,6 +1819,160 @@ def _prediction_rows_to_served_statuses(predictions: List[Dict[str, Any]]) -> Li
         )
     statuses.sort(key=lambda item: (0 if item.get("is_primary_business_horizon") else 1, _timeframe_to_minutes(str(item.get("timeframe") or "1h"), LEGACY_PREDICTION_HORIZON_MINUTES)))
     return statuses
+
+
+def _build_matched_history_sufficiency(served_horizon_statuses: List[Dict[str, Any]]) -> Dict[str, Any]:
+    rows: List[Dict[str, Any]] = []
+    for row in served_horizon_statuses:
+        rows.append(
+            {
+                "timeframe": row.get("timeframe"),
+                "is_primary_business_horizon": bool(row.get("is_primary_business_horizon")),
+                "status": row.get("matched_history_status"),
+                "sufficient": bool(row.get("matched_history_sufficient")),
+                "sample_count": _first_numeric(row.get("matched_history_sample_count"), row.get("sample_count")) or 0.0,
+                "required_samples": _first_numeric(row.get("matched_history_required_samples")) or _matched_history_requirement(str(row.get("timeframe") or "")),
+                "remaining_samples": _first_numeric(row.get("matched_history_remaining_samples")) or 0.0,
+            }
+        )
+    overall = "sufficient" if rows and all(bool(row.get("sufficient")) for row in rows) else "insufficient"
+    return {
+        "status": overall,
+        "ready_for_continual_learning": overall == "sufficient",
+        "timeframes": rows,
+    }
+
+
+def _build_baseline_accuracy_snapshot(
+    config: TournamentConfig,
+    *,
+    metrics_by_horizon: List[Dict[str, Any]],
+    backtest_report: List[Dict[str, Any]],
+    served_horizon_statuses: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    metrics_by_tf = {str(row.get("timeframe")): row for row in metrics_by_horizon}
+    report_by_tf = {str(row.get("timeframe")): row for row in backtest_report}
+    status_by_tf = {str(row.get("timeframe")): row for row in served_horizon_statuses}
+    rows: List[Dict[str, Any]] = []
+    for timeframe in get_timeframes(config):
+        metric_row = metrics_by_tf.get(timeframe) or {}
+        report_row = report_by_tf.get(timeframe) or {}
+        status_row = status_by_tf.get(timeframe) or {}
+        metrics = metric_row.get("metrics") or {}
+        rows.append(
+            {
+                "timeframe": timeframe,
+                "is_primary_business_horizon": timeframe == BUSINESS_PRIMARY_TIMEFRAME,
+                "price_mae": _first_numeric(metrics.get("price_mae"), report_row.get("price_mae")),
+                "price_rmse": _first_numeric(metrics.get("price_rmse"), report_row.get("price_rmse")),
+                "median_abs_error": _first_numeric(metrics.get("median_abs_error"), report_row.get("median_abs_error")),
+                "p90_abs_error": _first_numeric(metrics.get("p90_abs_error"), report_row.get("p90_abs_error")),
+                "mape": _first_numeric(metrics.get("mape"), report_row.get("mape")),
+                "smape": _first_numeric(metrics.get("smape"), report_row.get("smape")),
+                "signed_bias_rs": _first_numeric(metrics.get("signed_bias_rs"), report_row.get("signed_bias_rs")),
+                "direction_hit_rate": _first_numeric(metrics.get("direction_hit_rate"), report_row.get("direction_hit_rate"), metrics.get("hit_rate")),
+                "band_80_coverage": _first_numeric(metrics.get("band_80_coverage"), report_row.get("band_80_coverage")),
+                "sample_count": _first_numeric(report_row.get("sample_count"), metrics.get("sample_count"), metrics.get("samples")) or 0.0,
+                "champion_age_hours": _first_numeric(status_row.get("champion_age_hours")),
+                "freshness_status": status_row.get("freshness_status"),
+                "shadow_status": status_row.get("shadow_status"),
+                "promotion_state": status_row.get("promotion_state"),
+                "holdout_window": report_row.get("holdout_window"),
+                "matched_history_status": status_row.get("matched_history_status"),
+            }
+        )
+    overall_status = "sufficient" if rows and all(row.get("matched_history_status") == "sufficient" for row in rows) else "insufficient_history"
+    return {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "primary_business_timeframe": BUSINESS_PRIMARY_TIMEFRAME,
+        "status": overall_status,
+        "timeframes": rows,
+    }
+
+
+def _build_shadow_promotion_report(
+    config: TournamentConfig,
+    *,
+    served_horizon_statuses: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    status_by_tf = {str(row.get("timeframe")): row for row in served_horizon_statuses}
+    rows: List[Dict[str, Any]] = []
+    for timeframe in get_timeframes(config):
+        cfg_tf = _config_for_timeframe(config, timeframe)
+        run_artifact = _load_run_artifact(cfg_tf)
+        served = (run_artifact.get("served_artifact") or {}) if isinstance(run_artifact, dict) else {}
+        registry = _load_registry(cfg_tf.registry_path)
+        shadow_candidates = (registry.get("shadow_candidates") or {}) if isinstance(registry, dict) else {}
+        promotion_state = (registry.get("promotion_state") or {}) if isinstance(registry, dict) else {}
+        return_state = promotion_state.get("return") or {}
+        shadow_candidate = served.get("shadow_candidate") or shadow_candidates.get("return") or {}
+        status_row = status_by_tf.get(timeframe) or {}
+        min_shadow_samples = _shadow_promotion_min_settled(timeframe)
+        sample_count = _first_numeric(status_row.get("matched_history_sample_count"), status_row.get("sample_count")) or 0.0
+        rows.append(
+            {
+                "timeframe": timeframe,
+                "is_primary_business_horizon": timeframe == BUSINESS_PRIMARY_TIMEFRAME,
+                "promotion_state": served.get("promotion_state") or return_state.get("state") or status_row.get("promotion_state"),
+                "promotion_reason": served.get("promotion_reason") or return_state.get("reason"),
+                "shadow_status": served.get("shadow_status") or status_row.get("shadow_status"),
+                "shadow_candidate_model_id": shadow_candidate.get("model_id"),
+                "incumbent_model_id": status_row.get("champion_model"),
+                "baseline_comparison": served.get("baseline_comparison") or shadow_candidate.get("baseline_comparison"),
+                "shadow_settled_sample_count": sample_count,
+                "shadow_required_settled_samples": min_shadow_samples,
+                "shadow_settled_sufficient": sample_count >= min_shadow_samples,
+                "holdout_window": run_artifact.get("holdout_window"),
+                "updated_at": return_state.get("updated_at") or run_artifact.get("run_at"),
+            }
+        )
+    return {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "primary_business_timeframe": BUSINESS_PRIMARY_TIMEFRAME,
+        "timeframes": rows,
+    }
+
+
+def _build_promotion_decision_log(config: TournamentConfig) -> List[Dict[str, Any]]:
+    entries: List[Dict[str, Any]] = []
+    for timeframe in get_timeframes(config):
+        cfg_tf = _config_for_timeframe(config, timeframe)
+        registry = _load_registry(cfg_tf.registry_path)
+        if not isinstance(registry, dict):
+            registry = {}
+        promotion_state = (registry.get("promotion_state") or {})
+        shadow_candidates = (registry.get("shadow_candidates") or {})
+        champions = (registry.get("champions") or {})
+        for task, detail in promotion_state.items():
+            if not isinstance(detail, dict):
+                continue
+            entries.append(
+                {
+                    "timeframe": timeframe,
+                    "task": task,
+                    "state": detail.get("state"),
+                    "reason": detail.get("reason"),
+                    "model_id": detail.get("model_id") or (shadow_candidates.get(task) or {}).get("model_id") or (champions.get(task) or {}).get("model_id"),
+                    "updated_at": detail.get("updated_at"),
+                    "baseline_comparison": (shadow_candidates.get(task) or {}).get("baseline_comparison"),
+                }
+            )
+        run_artifact = _load_run_artifact(cfg_tf)
+        served = (run_artifact.get("served_artifact") or {}) if isinstance(run_artifact, dict) else {}
+        if served:
+            entries.append(
+                {
+                    "timeframe": timeframe,
+                    "task": served.get("task") or "return",
+                    "state": served.get("promotion_state"),
+                    "reason": served.get("promotion_reason"),
+                    "model_id": served.get("artifact_id"),
+                    "updated_at": run_artifact.get("run_at"),
+                    "baseline_comparison": served.get("baseline_comparison"),
+                }
+            )
+    entries.sort(key=lambda row: str(row.get("updated_at") or ""), reverse=True)
+    return entries
 
 
 def _estimate_eta_from_runs(
@@ -1922,6 +2184,7 @@ def _attach_prediction_trust_surface(
     row["fail_fast_reasons"] = reasons + list(backtest_row.get("quality_gate_reasons") or [])
     row["is_primary_business_horizon"] = timeframe == BUSINESS_PRIMARY_TIMEFRAME
     row["sample_count"] = sample_count
+    row.update(_matched_history_surface(timeframe, sample_count))
     return row
 
 
@@ -2196,6 +2459,19 @@ def refresh_prediction(config: TournamentConfig) -> Dict[str, Any]:
         predictions.append(record)
 
     served_horizon_statuses = _prediction_rows_to_served_statuses(predictions)
+    capability_status = _runtime_capability_status()
+    baseline_accuracy_snapshot = _build_baseline_accuracy_snapshot(
+        config,
+        metrics_by_horizon=metrics_by_horizon,
+        backtest_report=backtest_report,
+        served_horizon_statuses=served_horizon_statuses,
+    )
+    matched_history_sufficiency = _build_matched_history_sufficiency(served_horizon_statuses)
+    shadow_promotion_report = _build_shadow_promotion_report(
+        config,
+        served_horizon_statuses=served_horizon_statuses,
+    )
+    promotion_decision_log = _build_promotion_decision_log(config)
     return {
         "predictions": predictions,
         "primary_business_timeframe": BUSINESS_PRIMARY_TIMEFRAME,
@@ -2203,6 +2479,11 @@ def refresh_prediction(config: TournamentConfig) -> Dict[str, Any]:
         "backtest_report": backtest_report,
         "drift_status": drift_status,
         "served_horizon_statuses": served_horizon_statuses,
+        "capability_status": capability_status,
+        "baseline_accuracy_snapshot": baseline_accuracy_snapshot,
+        "matched_history_sufficiency": matched_history_sufficiency,
+        "shadow_promotion_report": shadow_promotion_report,
+        "promotion_decision_log": promotion_decision_log,
     }
 
 
@@ -2269,6 +2550,19 @@ def latest_prediction(config: TournamentConfig, update_pending: bool = True) -> 
             )
             predictions.append(row)
     served_horizon_statuses = _prediction_rows_to_served_statuses(predictions)
+    capability_status = _runtime_capability_status()
+    baseline_accuracy_snapshot = _build_baseline_accuracy_snapshot(
+        config,
+        metrics_by_horizon=metrics_by_horizon,
+        backtest_report=backtest_report,
+        served_horizon_statuses=served_horizon_statuses,
+    )
+    matched_history_sufficiency = _build_matched_history_sufficiency(served_horizon_statuses)
+    shadow_promotion_report = _build_shadow_promotion_report(
+        config,
+        served_horizon_statuses=served_horizon_statuses,
+    )
+    promotion_decision_log = _build_promotion_decision_log(config)
     return {
         "predictions": predictions,
         "primary_business_timeframe": BUSINESS_PRIMARY_TIMEFRAME,
@@ -2276,6 +2570,11 @@ def latest_prediction(config: TournamentConfig, update_pending: bool = True) -> 
         "backtest_report": backtest_report,
         "drift_status": drift_status,
         "served_horizon_statuses": served_horizon_statuses,
+        "capability_status": capability_status,
+        "baseline_accuracy_snapshot": baseline_accuracy_snapshot,
+        "matched_history_sufficiency": matched_history_sufficiency,
+        "shadow_promotion_report": shadow_promotion_report,
+        "promotion_decision_log": promotion_decision_log,
     }
 
 

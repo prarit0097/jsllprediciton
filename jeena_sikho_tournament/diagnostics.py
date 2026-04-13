@@ -1,10 +1,11 @@
 import importlib.util
+import json
 import os
 import sys
 import traceback
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -36,6 +37,7 @@ class CheckResult:
         self.name = name
         self.status = "PASS"
         self.message = ""
+        self.details: Dict[str, Any] = {}
 
     def warn(self, msg: str):
         if self.status != "FAIL":
@@ -55,6 +57,130 @@ def _has_module(name: str) -> bool:
     return importlib.util.find_spec(name) is not None
 
 
+def _capability_rank(name: str) -> int:
+    order = {"baseline-only": 0, "core-ml": 1, "full-ensemble": 2}
+    return order.get((name or "").strip().lower(), 0)
+
+
+def _normalize_capability_name(name: Optional[str]) -> str:
+    normalized = (name or "").strip().lower()
+    if normalized in {"", "auto"}:
+        return "baseline-only"
+    if normalized not in {"baseline-only", "core-ml", "full-ensemble"}:
+        return "baseline-only"
+    return normalized
+
+
+def _catboost_applicable() -> bool:
+    return sys.version_info < (3, 14)
+
+
+def inspect_runtime_capabilities(required_capability: Optional[str] = None) -> Dict[str, Any]:
+    dependencies = {
+        "sklearn": {"group": "core-ml", "required": True, "applicable": True, "installed": _has_module("sklearn")},
+        "joblib": {"group": "core-ml", "required": True, "applicable": True, "installed": _has_module("joblib")},
+        "xgboost": {"group": "ensemble", "required": False, "applicable": True, "installed": _has_module("xgboost")},
+        "lightgbm": {"group": "ensemble", "required": False, "applicable": True, "installed": _has_module("lightgbm")},
+        "catboost": {
+            "group": "ensemble",
+            "required": False,
+            "applicable": _catboost_applicable(),
+            "installed": _catboost_applicable() and _has_module("catboost"),
+        },
+        "ccxt": {"group": "data-provider", "required": False, "applicable": True, "installed": _has_module("ccxt")},
+        "yfinance": {"group": "data-provider", "required": False, "applicable": True, "installed": _has_module("yfinance")},
+    }
+
+    missing_core_ml = [
+        name
+        for name, meta in dependencies.items()
+        if meta["group"] == "core-ml" and meta["applicable"] and not meta["installed"]
+    ]
+    missing_ensemble = [
+        name
+        for name, meta in dependencies.items()
+        if meta["group"] == "ensemble" and meta["applicable"] and not meta["installed"]
+    ]
+    missing_data_providers = [
+        name
+        for name, meta in dependencies.items()
+        if meta["group"] == "data-provider" and meta["applicable"] and not meta["installed"]
+    ]
+    unavailable_unsupported = [
+        name for name, meta in dependencies.items() if not meta["applicable"]
+    ]
+    available_ensemble = [
+        name
+        for name, meta in dependencies.items()
+        if meta["group"] == "ensemble" and meta["applicable"] and meta["installed"]
+    ]
+    available_data_providers = [
+        name
+        for name, meta in dependencies.items()
+        if meta["group"] == "data-provider" and meta["applicable"] and meta["installed"]
+    ]
+
+    if missing_core_ml:
+        capability_status = "baseline-only"
+        capability_reason = "Missing core ML runtime dependencies"
+    elif missing_ensemble:
+        capability_status = "core-ml"
+        capability_reason = "Core ML is available, but ensemble boosters are incomplete"
+    else:
+        capability_status = "full-ensemble"
+        capability_reason = "Core ML and ensemble boosters are available"
+
+    if not available_data_providers:
+        data_provider_status = "blocked"
+    elif missing_data_providers:
+        data_provider_status = "degraded"
+    else:
+        data_provider_status = "ready"
+
+    if missing_core_ml:
+        dependency_health = "blocked"
+    elif missing_ensemble or data_provider_status != "ready":
+        dependency_health = "degraded"
+    else:
+        dependency_health = "healthy"
+
+    required_capability = _normalize_capability_name(
+        required_capability or os.getenv("JSLL_REQUIRED_CAPABILITY") or os.getenv("REQUIRED_CAPABILITY_STATUS")
+    )
+    promotion_ready = (
+        not missing_core_ml and _capability_rank(capability_status) >= _capability_rank(required_capability)
+    )
+    if promotion_ready:
+        promotion_block_reason = ""
+    else:
+        promotion_block_reason = (
+            f"Runtime capability {capability_status} does not satisfy required {required_capability}"
+        )
+
+    install_suggestions = []
+    all_missing = missing_core_ml + missing_ensemble + missing_data_providers
+    if all_missing:
+        install_suggestions.append("pip install " + " ".join(all_missing))
+
+    return {
+        "capability_status": capability_status,
+        "capability_reason": capability_reason,
+        "dependency_health": dependency_health,
+        "required_capability": required_capability,
+        "promotion_ready": promotion_ready,
+        "promotion_block_reason": promotion_block_reason,
+        "data_provider_status": data_provider_status,
+        "dependencies": dependencies,
+        "missing_core_ml": missing_core_ml,
+        "missing_ensemble": missing_ensemble,
+        "missing_data_providers": missing_data_providers,
+        "unsupported_dependencies": unavailable_unsupported,
+        "available_ensemble": available_ensemble,
+        "available_data_providers": available_data_providers,
+        "install_suggestions": install_suggestions,
+    }
+
+
 def check_structure(base: Path) -> CheckResult:
     res = CheckResult("Structure")
     missing = []
@@ -71,41 +197,30 @@ def check_structure(base: Path) -> CheckResult:
     return res
 
 
-def check_dependencies() -> Tuple[CheckResult, List[str]]:
+def check_dependencies(required_capability: Optional[str] = None) -> Tuple[CheckResult, List[str], Dict[str, Any]]:
     res = CheckResult("Dependencies")
-    missing = []
-    warns = []
+    missing_python = [name for name in ["pandas", "numpy"] if not _has_module(name)]
+    capability = inspect_runtime_capabilities(required_capability=required_capability)
+    res.details = capability
 
-    required = ["pandas", "numpy", "sklearn", "joblib"]
-    recommended = ["ccxt", "yfinance"]
-    optional = ["lightgbm", "xgboost"]
-    # catboost wheels are often unavailable on newest Python releases (e.g. 3.14),
-    # so avoid noisy install suggestions when unsupported.
-    if sys.version_info < (3, 14):
-        optional.append("catboost")
-
-    for r in required:
-        if not _has_module(r):
-            missing.append(r)
-    for r in recommended:
-        if not _has_module(r):
-            warns.append(r)
-    # Optional boosters should not trigger WARN for overall health
-    missing_optional = [r for r in optional if not _has_module(r)]
-
-    if missing:
-        res.fail(f"Missing required: {', '.join(missing)}")
-    elif warns:
-        res.warn(f"Missing recommended: {', '.join(warns)}")
+    if missing_python:
+        res.fail(f"Missing required: {', '.join(missing_python)}")
+    elif not capability["promotion_ready"]:
+        res.fail(capability["promotion_block_reason"] or "Runtime capability requirement not satisfied")
+    elif capability["dependency_health"] == "blocked":
+        missing = capability["missing_core_ml"] + capability["missing_data_providers"]
+        res.fail(f"Runtime blocked by missing dependencies: {', '.join(missing)}")
+    elif capability["dependency_health"] == "degraded":
+        missing = capability["missing_ensemble"] + capability["missing_data_providers"]
+        res.warn(
+            f"Capability {capability['capability_status']} with degraded dependencies: {', '.join(missing)}"
+        )
 
     install_cmds = []
-    if missing:
-        install_cmds.append("pip install " + " ".join(missing))
-    if warns:
-        install_cmds.append("pip install " + " ".join(warns))
-    if missing_optional:
-        install_cmds.append("pip install " + " ".join(missing_optional))
-    return res, install_cmds
+    if missing_python:
+        install_cmds.append("pip install " + " ".join(missing_python))
+    install_cmds.extend(capability["install_suggestions"])
+    return res, install_cmds, capability
 
 
 def check_storage(config: TournamentConfig) -> CheckResult:
@@ -307,12 +422,12 @@ def check_registry_predictor(config: TournamentConfig) -> CheckResult:
     return res
 
 
-def run_doctor(base: Path, debug: bool = False) -> int:
+def build_doctor_report(base: Path, debug: bool = False, required_capability: Optional[str] = None) -> Dict[str, Any]:
     results = []
 
     results.append(check_structure(base))
 
-    dep_res, install_cmds = check_dependencies()
+    dep_res, install_cmds, capability_report = check_dependencies(required_capability=required_capability)
     results.append(dep_res)
 
     config = TournamentConfig()
@@ -339,36 +454,88 @@ def run_doctor(base: Path, debug: bool = False) -> int:
         if r.status == "WARN" and overall != "FAIL":
             overall = "WARN"
 
-    for r in results:
-        if r.status == "PASS":
-            print(f"[PASS] {r.name}")
-        elif r.status == "WARN":
-            print(f"[WARN] {r.name} - {r.message}")
+    next_actions = "none."
+    if overall == "FAIL":
+        next_actions = "fix the FAIL sections above and rerun doctor."
+    elif overall == "WARN":
+        next_actions = "consider fixing WARN items for best results."
+
+    return {
+        "overall": overall,
+        "exit_code": 0 if overall == "PASS" else 1,
+        "results": [
+            {
+                "name": r.name,
+                "status": r.status,
+                "message": r.message,
+                "details": r.details,
+            }
+            for r in results
+        ],
+        "capability_status": capability_report["capability_status"],
+        "capability_report": capability_report,
+        "data_summary": data_summary,
+        "model_zoo_summary": zoo_summary,
+        "install_suggestions": install_cmds,
+        "next_actions": next_actions,
+        "debug": debug,
+    }
+
+
+def print_doctor_report(report: Dict[str, Any], json_output: bool = False) -> None:
+    if json_output:
+        print(json.dumps(report, indent=2, sort_keys=True, default=str))
+        return
+
+    for r in report["results"]:
+        if r["status"] == "PASS":
+            print(f"[PASS] {r['name']}")
+        elif r["status"] == "WARN":
+            print(f"[WARN] {r['name']} - {r['message']}")
         else:
-            print(f"[FAIL] {r.name} - {r.message}")
+            print(f"[FAIL] {r['name']} - {r['message']}")
 
-    if data_summary:
+    capability = report["capability_report"]
+    print("Runtime capability:")
+    print(f"  capability_status: {capability['capability_status']}")
+    print(f"  dependency_health: {capability['dependency_health']}")
+    print(f"  required_capability: {capability['required_capability']}")
+    print(f"  promotion_ready: {capability['promotion_ready']}")
+    print(f"  data_provider_status: {capability['data_provider_status']}")
+    if capability["missing_core_ml"]:
+        print(f"  missing_core_ml: {', '.join(capability['missing_core_ml'])}")
+    if capability["missing_ensemble"]:
+        print(f"  missing_ensemble: {', '.join(capability['missing_ensemble'])}")
+    if capability["missing_data_providers"]:
+        print(f"  missing_data_providers: {', '.join(capability['missing_data_providers'])}")
+    if capability["unsupported_dependencies"]:
+        print(f"  unsupported_dependencies: {', '.join(capability['unsupported_dependencies'])}")
+
+    if report["data_summary"]:
         print("Data summary:")
-        for k, v in data_summary.items():
+        for k, v in report["data_summary"].items():
             print(f"  {k}: {v}")
 
-    if zoo_summary:
+    if report["model_zoo_summary"]:
         print("Model zoo:")
-        for k, v in zoo_summary.items():
+        for k, v in report["model_zoo_summary"].items():
             print(f"  {k}: {v}")
 
-    if install_cmds:
+    if report["install_suggestions"]:
         print("Install suggestions:")
-        for cmd in install_cmds:
+        for cmd in report["install_suggestions"]:
             print(f"  {cmd}")
 
-    print(f"Overall: {overall}")
-    if overall == "FAIL":
-        print("Next actions: fix the FAIL sections above and rerun doctor.")
-    elif overall == "WARN":
-        print("Next actions: consider fixing WARN items for best results.")
-    else:
-        print("Next actions: none.")
+    print(f"Overall: {report['overall']}")
+    print(f"Next actions: {report['next_actions']}")
 
-    return 0 if overall == "PASS" else 1
+def run_doctor(
+    base: Path,
+    debug: bool = False,
+    required_capability: Optional[str] = None,
+    json_output: bool = False,
+) -> int:
+    report = build_doctor_report(base, debug=debug, required_capability=required_capability)
+    print_doctor_report(report, json_output=json_output)
+    return report["exit_code"]
 

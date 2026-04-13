@@ -1,4 +1,5 @@
 import json
+import importlib.util
 import logging
 import os
 from copy import deepcopy
@@ -339,14 +340,185 @@ def _comparison_payload(reference_id: Optional[str], reference_mae: Optional[flo
     }
 
 
+def _served_timeframes(config: TournamentConfig) -> List[str]:
+    env_value = os.getenv("MARKET_TIMEFRAMES") or os.getenv("TIMEFRAMES") or os.getenv("BTC_TIMEFRAMES")
+    if not env_value:
+        return [config.timeframe]
+    tokens: List[str] = []
+    for part in env_value.replace(";", ",").replace("|", ",").split(","):
+        token = part.strip()
+        if token:
+            tokens.append(token)
+    return tokens or [config.timeframe]
+
+
+def _timeframe_minutes(timeframe: str, fallback: int) -> int:
+    tf = (timeframe or "").strip().lower()
+    if tf.endswith("m") and tf[:-1].isdigit():
+        return int(tf[:-1])
+    if tf.endswith("h") and tf[:-1].isdigit():
+        return int(tf[:-1]) * 60
+    if tf.endswith("d") and tf[:-1].isdigit():
+        return int(tf[:-1]) * 24 * 60
+    return fallback
+
+
+def _artifact_path_for_timeframe(data_dir: Path, timeframe: str, fallback_minutes: int) -> Path:
+    minutes = _timeframe_minutes(timeframe, fallback_minutes)
+    return data_dir / f"run_artifact_{minutes}m.json"
+
+
+def _load_json_file(path: Path) -> Dict[str, Any]:
+    if not path.exists():
+        return {}
+    try:
+        with path.open("r", encoding="utf8") as fh:
+            payload = json.load(fh)
+        return payload if isinstance(payload, dict) else {}
+    except Exception:
+        return {}
+
+
+def _module_available(name: str) -> bool:
+    try:
+        return importlib.util.find_spec(name) is not None
+    except Exception:
+        return False
+
+
+def _runtime_capability_status() -> Dict[str, Any]:
+    modules = {
+        "sklearn": _module_available("sklearn"),
+        "joblib": _module_available("joblib"),
+        "xgboost": _module_available("xgboost"),
+        "lightgbm": _module_available("lightgbm"),
+        "catboost": _module_available("catboost"),
+        "ccxt": _module_available("ccxt"),
+    }
+    core_ml = modules["sklearn"] and modules["joblib"]
+    full_ensemble = core_ml and modules["xgboost"] and modules["lightgbm"] and modules["catboost"] and modules["ccxt"]
+    if full_ensemble:
+        status = "full-ensemble"
+    elif core_ml:
+        status = "core-ml"
+    else:
+        status = "baseline-only"
+
+    expected = (os.getenv("PROD_CAPABILITY_EXPECTATION") or os.getenv("PRODUCTION_CAPABILITY_EXPECTATION") or "baseline-only").strip().lower()
+    order = {"baseline-only": 0, "core-ml": 1, "full-ensemble": 2}
+    if expected not in order:
+        expected = "baseline-only"
+
+    passed = order[status] >= order[expected]
+    missing_modules: List[str] = []
+    if expected in {"core-ml", "full-ensemble"}:
+        for module in ["sklearn", "joblib"]:
+            if not modules[module]:
+                missing_modules.append(module)
+    if expected == "full-ensemble":
+        for module in ["xgboost", "lightgbm", "catboost", "ccxt"]:
+            if not modules[module]:
+                missing_modules.append(module)
+
+    return {
+        "status": status,
+        "expected": expected,
+        "passed": passed,
+        "modules": modules,
+        "missing_modules": missing_modules,
+    }
+
+
+def _shadow_min_settled(timeframe: str) -> int:
+    tf = (timeframe or "").strip().lower()
+    if tf == "1d":
+        default_value = 10
+        suffix = "1D"
+    elif tf == "2h":
+        default_value = 20
+        suffix = "2H"
+    else:
+        default_value = 20
+        suffix = "1H"
+    raw = os.getenv(f"SHADOW_PROMOTION_MIN_SETTLED_{suffix}")
+    try:
+        return max(1, int(raw)) if raw is not None else default_value
+    except (TypeError, ValueError):
+        return default_value
+
+
+def _shadow_promotion_report(timeframe: str) -> Dict[str, Any]:
+    required = _shadow_min_settled(timeframe)
+    rows = get_recent_ready_predictions(timeframe, max(required, 20))
+    valid_rows = []
+    for row in rows:
+        predicted_price = _safe_metric_float(row.get("predicted_price"))
+        actual_price = _safe_metric_float(row.get("actual_price_1h"))
+        if predicted_price is None or actual_price is None:
+            continue
+        valid_rows.append((predicted_price, actual_price))
+    settled_count = len(valid_rows)
+    recent_price_mae = None
+    if valid_rows:
+        recent_price_mae = float(np.mean([abs(pred - actual) for pred, actual in valid_rows]))
+    passed = settled_count >= required
+    return {
+        "timeframe": timeframe,
+        "required_min_settled": required,
+        "settled_count": settled_count,
+        "passed": passed,
+        "recent_price_mae": recent_price_mae,
+    }
+
+
+def _cross_horizon_report(config: TournamentConfig) -> Dict[str, Any]:
+    max_regression = float(os.getenv("PROD_MAX_CROSS_HORIZON_REGRESSION", "0.03"))
+    entries: List[Dict[str, Any]] = []
+    for timeframe in _served_timeframes(config):
+        if timeframe == config.timeframe:
+            continue
+        artifact = _load_json_file(_artifact_path_for_timeframe(config.data_dir, timeframe, config.candle_minutes))
+        served = artifact.get("served_artifact") if isinstance(artifact, dict) else None
+        snapshot = artifact.get("baseline_accuracy_snapshot") if isinstance(artifact, dict) else None
+        if not isinstance(served, dict) or not isinstance(snapshot, dict):
+            entries.append({"timeframe": timeframe, "status": "unavailable", "passed": True})
+            continue
+        current_metrics = served.get("holdout_metrics") if isinstance(served.get("holdout_metrics"), dict) else {}
+        baseline_metrics = snapshot.get("holdout_metrics") if isinstance(snapshot.get("holdout_metrics"), dict) else {}
+        current_mae = _safe_metric_float(current_metrics.get("price_mae"))
+        baseline_mae = _safe_metric_float(baseline_metrics.get("price_mae"))
+        if current_mae is None or baseline_mae is None or baseline_mae <= 0:
+            entries.append({"timeframe": timeframe, "status": "missing_price_mae", "passed": True})
+            continue
+        regression_ratio = float((current_mae - baseline_mae) / baseline_mae)
+        passed = regression_ratio <= max_regression
+        entries.append(
+            {
+                "timeframe": timeframe,
+                "baseline_price_mae": baseline_mae,
+                "current_price_mae": current_mae,
+                "regression_ratio": regression_ratio,
+                "max_allowed_regression": max_regression,
+                "passed": passed,
+            }
+        )
+    return {
+        "max_allowed_regression": max_regression,
+        "entries": entries,
+        "passed": all(entry.get("passed") is not False for entry in entries),
+    }
+
+
 def _baseline_comparison(
     task: str,
     best: Dict[str, Any],
     task_results: List[Dict[str, Any]],
     registry: Dict[str, Any],
+    config: TournamentConfig,
 ) -> Dict[str, Any]:
     comparison: Dict[str, Any] = {
         "selection_metric": "holdout_price_mae" if best.get("holdout_metrics") is not None else "price_mae",
+        "runtime_capability": _runtime_capability_status(),
     }
     if task != "return":
         return comparison
@@ -375,6 +547,10 @@ def _baseline_comparison(
             incumbent_mae,
             challenger_mae,
         )
+    shadow_report = _shadow_promotion_report(config.timeframe)
+    comparison["shadow_promotion_report"] = shadow_report
+    comparison["shadow_window_passed"] = shadow_report.get("passed")
+    comparison["cross_horizon"] = _cross_horizon_report(config)
     return comparison
 
 
@@ -658,7 +834,9 @@ def _evaluate_candidate(
     metric_keys = list(fold_metrics[0].keys())
     avg_metrics: Dict[str, float] = {}
     for key in metric_keys:
-        avg_metrics[key] = float(np.mean([m[key] for m in fold_metrics]))
+        values = [_safe_metric_float(m.get(key)) for m in fold_metrics]
+        valid_values = [value for value in values if value is not None]
+        avg_metrics[key] = float(np.mean(valid_values)) if valid_values else None
 
     y_pred_full = np.concatenate(preds_collect) if preds_collect else np.array([])
     y_true_full = np.concatenate(truth_collect) if truth_collect else np.array([])
@@ -961,6 +1139,8 @@ def _run_artifact_payload(
     holdout_train_df: Optional[pd.DataFrame],
     holdout_eval_df: Optional[pd.DataFrame],
     run_at: str,
+    registry: Dict[str, Any],
+    capability_status: Dict[str, Any],
 ) -> Dict[str, Any]:
     train_start = str(holdout_train_df.index.min()) if holdout_train_df is not None and not holdout_train_df.empty else None
     train_end = str(holdout_train_df.index.max()) if holdout_train_df is not None and not holdout_train_df.empty else None
@@ -977,6 +1157,7 @@ def _run_artifact_payload(
         "promotion_state": served.get("promotion_state") or served.get("best", {}).get("promotion_state"),
         "promotion_reason": served.get("decision"),
         "shadow_candidate": served.get("shadow_candidate"),
+        "shadow_promotion_report": (registry.get("shadow_promotion_report", {}) or {}).get("return"),
     }
     return {
         "run_at": run_at,
@@ -988,11 +1169,25 @@ def _run_artifact_payload(
         "tasks": task_results_by_task,
         "served_artifact": served_artifact,
         "calibration_buckets": _calibration_bucket_summary(config.timeframe),
+        "capability_status": capability_status,
+        "promotion_decision_log": registry.get("promotion_decision_log", []),
+        "shadow_promotion_report": (registry.get("shadow_promotion_report", {}) or {}).get("return"),
     }
 
 
 def _save_run_artifact(config: TournamentConfig, payload: Dict[str, Any]) -> None:
     path = config.data_dir / f"run_artifact_{config.candle_minutes}m.json"
+    existing = _load_json_file(path)
+    baseline_snapshot = existing.get("baseline_accuracy_snapshot") if isinstance(existing, dict) else None
+    if not isinstance(baseline_snapshot, dict):
+        served_metrics = ((payload.get("served_artifact") or {}).get("holdout_metrics") or {})
+        baseline_snapshot = {
+            "frozen_at": payload.get("run_at"),
+            "comparison_window_id": os.getenv("BASELINE_COMPARISON_WINDOW_ID") or payload.get("run_at"),
+            "timeframe": payload.get("timeframe"),
+            "holdout_metrics": served_metrics,
+        }
+    payload["baseline_accuracy_snapshot"] = baseline_snapshot
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".tmp")
     with tmp.open("w", encoding="utf8") as fh:
@@ -1332,7 +1527,7 @@ def run_tournament(config: TournamentConfig) -> Dict[str, Any]:
             best_model_id = _model_id(best["spec"], best["feature_set_id"])
             best_fs_id = best["feature_set_id"]
             best_model_path = best_member["model_path"] if best_member else None
-            baseline_comparison = _baseline_comparison(task, best, task_results, registry)
+            baseline_comparison = _baseline_comparison(task, best, task_results, registry, config)
 
             challenger = {
                 "model_id": best_model_id,
@@ -1464,6 +1659,8 @@ def run_tournament(config: TournamentConfig) -> Dict[str, Any]:
                 holdout_train_df=holdout_train_df if holdout_train_df is not None and not holdout_train_df.empty else cv_source,
                 holdout_eval_df=holdout_eval_df,
                 run_at=run_at,
+                registry=registry,
+                capability_status=_runtime_capability_status(),
             )
             _save_run_artifact(config, artifact_payload)
         except Exception as exc:

@@ -3,8 +3,10 @@ import json
 import os
 from datetime import datetime, timedelta, timezone
 
+from .bootstrap_artifacts import write_runtime_bootstrap_artifacts
 from .config import TournamentConfig
 from .drift import should_retrain_on_drift
+from .exogenous import refresh_public_signal_caches
 from .market_calendar import IST, NSE_OPEN_MIN, NSE_RUN_CLOSE_MIN, is_nse_run_window, load_nse_holidays
 from .multi_timeframe import config_for_timeframe, resolve_timeframes, run_multi_timeframe_tournament
 from .repair import run_nightly_repair
@@ -270,12 +272,14 @@ def main():
     lock_acquired = True
     try:
         timeframes = resolve_timeframes(config)
+        refresh_public_signal_caches([config_for_timeframe(config, tf).candle_minutes for tf in timeframes], now_utc=now_utc)
         if len(timeframes) > 1:
             run_multi_timeframe_tournament(config)
         else:
             tf_cfg = config_for_timeframe(config, timeframes[0] if timeframes else config.timeframe)
             run_tournament(tf_cfg)
         _verify_served_horizons(config, timeframes)
+        write_runtime_bootstrap_artifacts(config, timeframes)
     finally:
         if lock_acquired:
             release_run_lock("scheduler", data_dir=config.data_dir)

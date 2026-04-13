@@ -82,6 +82,85 @@ def build_exogenous_feature_frame(
     return out, metadata
 
 
+def refresh_exogenous_caches(timeframes: List[str], candle_minutes_map: Dict[str, int]) -> Dict[str, object]:
+    target_now = pd.Timestamp.now(tz="UTC").ceil("min")
+    report: Dict[str, object] = {
+        "generated_at": target_now.isoformat(),
+        "signals_enabled": exogenous_feeds_enabled(),
+        "event_features_enabled": event_features_enabled(),
+        "timeframes": {},
+    }
+    if not exogenous_feeds_enabled():
+        return report
+
+    lookback_hours = _int_env("EXOGENOUS_LOOKBACK_HOURS", 24 * 14)
+    for timeframe in timeframes:
+        candle_minutes = int(candle_minutes_map.get(timeframe, 60))
+        start = target_now - pd.Timedelta(hours=max(24, lookback_hours))
+        idx = pd.date_range(start=start, end=target_now, freq=f"{max(1, candle_minutes)}min", tz="UTC")
+        timeframe_report: Dict[str, object] = {"signals": {}}
+        for spec in resolve_public_signal_specs():
+            _, meta = load_public_signal_frame(spec, idx, candle_minutes)
+            timeframe_report["signals"][spec.alias] = meta
+        _, event_meta = load_event_calendar_features(idx)
+        timeframe_report["event_calendar"] = event_meta
+        report["timeframes"][timeframe] = timeframe_report
+    return report
+
+
+def refresh_public_signal_caches(
+    candle_minutes_list: List[int] | int,
+    *,
+    now_utc: pd.Timestamp | None = None,
+) -> Dict[str, object]:
+    """Refresh cached public-signal files ahead of training.
+
+    This keeps exogenous feeds outside the core OHLCV store and primes the
+    per-feed cache/meta files used later at feature-build time. Event-calendar
+    validation is also exercised here so nightly runs can surface contract
+    issues early without mutating the core market dataset.
+    """
+    if isinstance(candle_minutes_list, int):
+        candle_minutes_values = [int(candle_minutes_list)]
+    else:
+        candle_minutes_values = sorted({max(1, int(value)) for value in candle_minutes_list})
+    ts = pd.Timestamp(now_utc or pd.Timestamp.utcnow())
+    if ts.tzinfo is None:
+        ts = ts.tz_localize("UTC")
+    else:
+        ts = ts.tz_convert("UTC")
+    lookback_hours = max(24, _int_env("EXOGENOUS_LOOKBACK_HOURS", 24 * 14))
+    start = ts - pd.Timedelta(hours=lookback_hours)
+    target_index_by_candle = {
+        candle_minutes: pd.date_range(start=start, end=ts, freq=f"{max(1, int(candle_minutes))}min", tz="UTC")
+        for candle_minutes in candle_minutes_values
+    }
+
+    report: Dict[str, object] = {
+        "generated_at": ts.isoformat(),
+        "enabled": exogenous_feeds_enabled() or event_features_enabled(),
+        "signals": {},
+        "event_calendar": {"enabled": event_features_enabled()},
+    }
+
+    for candle_minutes, target_index in target_index_by_candle.items():
+        signal_reports: Dict[str, object] = {}
+        for spec in resolve_public_signal_specs():
+            _, meta = load_public_signal_frame(spec, target_index, candle_minutes)
+            signal_reports[spec.alias] = meta
+        report["signals"][str(candle_minutes)] = signal_reports
+
+    if event_features_enabled():
+        daily_index = pd.date_range(start=start.normalize(), end=ts.normalize(), freq="1D", tz="UTC")
+        _, event_meta = load_event_calendar_features(daily_index)
+        event_meta["contract"] = {
+            "required": ["event_date"],
+            "optional": ["symbol", "severity"],
+        }
+        report["event_calendar"] = event_meta
+    return report
+
+
 def load_public_signal_frame(
     spec: PublicSignalSpec,
     index: pd.DatetimeIndex,
@@ -136,6 +215,16 @@ def load_public_signal_frame(
 
 
 def load_event_calendar_features(index: pd.DatetimeIndex) -> Tuple[pd.DataFrame, Dict[str, object]]:
+    """Load optional event features from a flat JSON/CSV calendar contract.
+
+    Contract:
+    - required field: ``event_date``
+    - optional fields: ``symbol`` and ``severity``
+
+    JSON may be either a top-level list of rows or ``{"events": [...]}``.
+    CSV/JSON rows outside the active symbol filter are ignored.
+    Missing ``severity`` defaults to ``1.0``.
+    """
     target_index = _coerce_utc_index(index)
     meta: Dict[str, object] = {
         "enabled": event_features_enabled(),
@@ -143,6 +232,10 @@ def load_event_calendar_features(index: pd.DatetimeIndex) -> Tuple[pd.DataFrame,
         "path": None,
         "record_count": 0,
         "matched_days": 0,
+        "contract": {
+            "required": ["event_date"],
+            "optional": ["symbol", "severity"],
+        },
     }
     if not event_features_enabled() or target_index.empty:
         return pd.DataFrame(index=target_index), meta
@@ -337,6 +430,12 @@ def _signal_freshness(frame: pd.DataFrame, candle_minutes: int, nse_mode: bool) 
 
 
 def _read_event_calendar(path: Path) -> pd.DataFrame:
+    """Read the flat event-calendar contract from JSON or CSV.
+
+    Supported row keys:
+    - required: ``event_date`` (aliases ``date``, ``timestamp``, ``event_ts``)
+    - optional: ``symbol``, ``severity``
+    """
     try:
         if path.suffix.lower() == ".json":
             payload = json.loads(path.read_text(encoding="utf-8"))

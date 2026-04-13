@@ -179,6 +179,40 @@ class Phase2TournamentTests(unittest.TestCase):
         self.assertEqual(registry["champions"]["return"]["model_id"], "incumbent")
         self.assertEqual(challenger["promotion_state"], "shadow")
 
+    def test_update_champion_uses_timeframe_aware_validation_minimum(self):
+        registry = {"champions": {}}
+        challenger = {
+            "model_id": "challenger",
+            "timestamp": "2026-04-11T00:00:00+00:00",
+            "final_score": 0.95,
+            "holdout_metrics": {
+                "price_mae": 2.5,
+                "median_abs_error": 1.0,
+                "p90_abs_error": 2.0,
+                "direction_hit_rate": 60.0,
+                "signed_bias_rs": 0.2,
+                "sample_count": 60,
+            },
+            "val_points": 80,
+            "baseline_comparison": {
+                "naive_last_close": {"price_mae": 5.5},
+            },
+        }
+
+        decision = update_champion(
+            registry,
+            "return",
+            challenger,
+            min_val_points=500,
+            margin=0.02,
+            margin_override=0.05,
+            cooldown_hours=0,
+            timeframe="1d",
+        )
+
+        self.assertEqual(decision.promotion_state, "active")
+        self.assertEqual(registry["champions"]["return"]["model_id"], "challenger")
+
     def test_update_champion_promotes_when_holdout_and_baselines_pass(self):
         registry = {
             "champions": {

@@ -23,6 +23,9 @@ def _default_registry() -> Dict[str, Any]:
         "model_history": {},
         "promotion_state": {},
         "shadow_candidates": {},
+        "promotion_decision_log": [],
+        "shadow_promotion_report": {},
+        "drift_monitor": {},
     }
 
 
@@ -139,6 +142,14 @@ def _timeframe_defaults(timeframe: Optional[str]) -> Dict[str, float]:
     return resolved
 
 
+def _required_validation_points(timeframe: Optional[str], min_val_points: int) -> int:
+    gates = _timeframe_defaults(timeframe)
+    min_samples = int(gates.get("min_samples", 0))
+    if min_samples <= 0:
+        return int(min_val_points)
+    return max(1, min(int(min_val_points), min_samples))
+
+
 def _passes_holdout_gates(record: Dict[str, Any], timeframe: Optional[str]) -> Tuple[bool, str]:
     metrics = _active_metrics(record)
     gates = _timeframe_defaults(timeframe)
@@ -214,6 +225,53 @@ def _set_shadow_candidate(registry: Dict[str, Any], task: str, challenger: Dict[
     registry.setdefault("shadow_candidates", {})[task] = challenger
 
 
+def _append_promotion_decision_log(
+    registry: Dict[str, Any],
+    task: str,
+    challenger: Dict[str, Any],
+    state: str,
+    reason: str,
+    baseline_comparison: Dict[str, Any],
+) -> None:
+    entry = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "task": task,
+        "model_id": challenger.get("model_id"),
+        "timeframe": challenger.get("timeframe"),
+        "promotion_state": state,
+        "reason": reason,
+        "baseline_comparison": baseline_comparison,
+    }
+    log = registry.setdefault("promotion_decision_log", [])
+    log.append(entry)
+    registry["promotion_decision_log"] = log[-500:]
+
+
+def _record_shadow_promotion_report(
+    registry: Dict[str, Any],
+    task: str,
+    challenger: Dict[str, Any],
+    state: str,
+    reason: str,
+    baseline_comparison: Dict[str, Any],
+) -> None:
+    report = baseline_comparison.get("shadow_promotion_report")
+    if not isinstance(report, dict):
+        return
+    payload = dict(report)
+    payload.update(
+        {
+            "task": task,
+            "model_id": challenger.get("model_id"),
+            "timeframe": challenger.get("timeframe"),
+            "promotion_state": state,
+            "reason": reason,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+    )
+    registry.setdefault("shadow_promotion_report", {})[task] = payload
+
+
 def _set_decision_state(
     registry: Dict[str, Any],
     task: str,
@@ -231,6 +289,8 @@ def _set_decision_state(
         state,
         {"reason": reason, "model_id": challenger.get("model_id")},
     )
+    _append_promotion_decision_log(registry, task, challenger, state, reason, baseline_comparison)
+    _record_shadow_promotion_report(registry, task, challenger, state, reason, baseline_comparison)
     if state == "active":
         registry.setdefault("champions", {})[task] = challenger
         registry.setdefault("shadow", {}).pop(task, None)
@@ -257,14 +317,25 @@ def update_champion(
         champ,
         challenger.get("baseline_comparison") or {},
     )
-
-    if challenger.get("val_points", 0) < min_val_points:
+    runtime_capability = baseline_comparison.get("runtime_capability") or {}
+    if runtime_capability and runtime_capability.get("passed") is False:
         return _set_decision_state(
             registry,
             task,
             challenger,
             "blocked_by_dq",
-            "insufficient_validation_points",
+            "runtime_capability_insufficient",
+            baseline_comparison,
+        )
+
+    required_val_points = _required_validation_points(challenger.get("timeframe"), min_val_points)
+    if challenger.get("val_points", 0) < required_val_points:
+        return _set_decision_state(
+            registry,
+            task,
+            challenger,
+            "blocked_by_dq",
+            f"insufficient_validation_points:{challenger.get('val_points', 0)}<{required_val_points}",
             baseline_comparison,
         )
 
@@ -276,6 +347,17 @@ def update_champion(
             challenger,
             "blocked_by_holdout",
             holdout_reason,
+            baseline_comparison,
+        )
+
+    cross_horizon = baseline_comparison.get("cross_horizon") or {}
+    if cross_horizon and cross_horizon.get("passed") is False:
+        return _set_decision_state(
+            registry,
+            task,
+            challenger,
+            "blocked_by_holdout",
+            "cross_horizon_regression_blocked",
             baseline_comparison,
         )
 
