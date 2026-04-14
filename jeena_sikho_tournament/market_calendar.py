@@ -59,6 +59,19 @@ def load_nse_holidays(data_dir: Optional[Path] = None) -> Set[date]:
                     holidays.add(day)
         except Exception:
             continue
+    # Bundled fallback holiday files shipped with the application.
+    bundled_dir = Path(__file__).resolve().parent / "resources"
+    for p in sorted(bundled_dir.glob("nse_holidays_*.txt")):
+        try:
+            for line in p.read_text(encoding="utf-8").splitlines():
+                clean = line.split("#", 1)[0].strip()
+                if not clean:
+                    continue
+                day = _parse_day(clean)
+                if day:
+                    holidays.add(day)
+        except Exception:
+            continue
     return holidays
 
 

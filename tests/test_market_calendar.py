@@ -2,6 +2,7 @@ from datetime import date, datetime, timedelta, timezone
 
 from jeena_sikho_tournament.market_calendar import (
     IST,
+    load_nse_holidays,
     is_nse_market_open,
     is_nse_run_window,
     next_nse_slot_at_or_after,
@@ -32,3 +33,16 @@ def test_next_slot_skips_holiday():
     nxt = next_nse_slot_at_or_after(mon_preopen_utc, 60, holidays).astimezone(IST)
     assert nxt.date() == date(2026, 2, 17)
     assert nxt.hour == 9 and nxt.minute == 15
+
+
+def test_bundled_2026_holidays_include_ambedkar_jayanti():
+    holidays = load_nse_holidays()
+    assert date(2026, 4, 14) in holidays
+
+
+def test_market_closed_on_bundled_ambedkar_jayanti():
+    holidays = load_nse_holidays()
+    # 2026-04-14 10:30 IST
+    ts_utc = datetime(2026, 4, 14, 5, 0, tzinfo=timezone.utc)
+    assert is_nse_market_open(ts_utc, holidays) is False
+    assert is_nse_run_window(ts_utc, holidays) is False

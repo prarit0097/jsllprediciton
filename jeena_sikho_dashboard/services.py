@@ -74,7 +74,10 @@ _PRICE_CACHE: Dict[str, Any] = {}
 _FX_CACHE: Dict[str, Any] = {}
 _TOURNAMENT_INTERVAL_MIN = int(os.getenv("TOURNAMENT_INTERVAL_MINUTES", "120"))
 _TOURNAMENT_START_MIN = int(os.getenv("TOURNAMENT_SCHEDULE_MINUTE", "1"))
-_NSE_HOLIDAYS = load_nse_holidays(Path(os.getenv("APP_DATA_DIR", "data")))
+
+
+def _nse_holidays() -> set:
+    return load_nse_holidays(Path(os.getenv("APP_DATA_DIR", "data")))
 
 
 def _quote_currency() -> str:
@@ -104,7 +107,7 @@ def _market_state(now_utc: datetime) -> Dict[str, Any]:
     state: Dict[str, Any] = {}
     if not _is_indian_equity():
         return state
-    state.update(nse_market_state(now_utc, _NSE_HOLIDAYS))
+    state.update(nse_market_state(now_utc, _nse_holidays()))
     return state
 
 
@@ -372,18 +375,20 @@ def _prediction_target_timestamp(pred_at: datetime, horizon_min: int, tf_minutes
 
     if step >= 1440 or horizon >= 1440:
         trading_days = max(1, int(np.ceil(horizon / 1440.0)))
+        holidays = _nse_holidays()
         cur = pred_at.astimezone(IST).replace(hour=15, minute=30, second=0, microsecond=0)
         for _ in range(trading_days):
             cur = cur + timedelta(days=1)
-            while not is_nse_trading_day(cur, _NSE_HOLIDAYS):
+            while not is_nse_trading_day(cur, holidays):
                 cur = cur + timedelta(days=1)
         return cur.astimezone(timezone.utc)
 
-    anchor = align_to_nse_interval_floor(pred_at, step, _NSE_HOLIDAYS)
+    holidays = _nse_holidays()
+    anchor = align_to_nse_interval_floor(pred_at, step, holidays)
     full_steps = max(1, int(np.ceil(horizon / step)))
     target = anchor
     for _ in range(full_steps):
-        target = next_nse_slot_at_or_after(target + timedelta(minutes=step), step, _NSE_HOLIDAYS)
+        target = next_nse_slot_at_or_after(target + timedelta(minutes=step), step, holidays)
     return target
 
 
@@ -465,7 +470,7 @@ def _ensure_recent_data(config: TournamentConfig, days: int = 14) -> pd.DataFram
         if latest is None:
             need_fetch = True
         else:
-            holidays = _NSE_HOLIDAYS if _is_indian_equity() else set()
+            holidays = _nse_holidays() if _is_indian_equity() else set()
             freshness = assess_freshness(
                 df,
                 config.candle_minutes,
@@ -527,7 +532,7 @@ def _latest_feature_snapshot(config: TournamentConfig) -> Optional[Dict[str, Any
         df,
         config.candle_minutes,
         nse_mode=_is_indian_equity(),
-        holidays=_NSE_HOLIDAYS if _is_indian_equity() else set(),
+        holidays=_nse_holidays() if _is_indian_equity() else set(),
         now_utc=datetime.now(timezone.utc),
     )
     feature_df = make_inference_frame(
@@ -609,11 +614,12 @@ def _expected_points_in_window(start_utc: datetime, end_utc: datetime, tf_minute
     cur = start_utc.astimezone(IST)
     end_local = end_utc.astimezone(IST)
     count = 0
+    holidays = _nse_holidays()
     while cur.date() <= end_local.date():
         day = cur.date()
         day_start = datetime(day.year, day.month, day.day, 9, 15, tzinfo=cur.tzinfo)
         day_end = datetime(day.year, day.month, day.day, 15, 30, tzinfo=cur.tzinfo)
-        if day_start.weekday() < 5 and day not in _NSE_HOLIDAYS:
+        if day_start.weekday() < 5 and day not in holidays:
             minute = 9 * 60 + 15
             while minute <= (15 * 60 + 30):
                 hh, mm = divmod(minute, 60)
@@ -887,7 +893,7 @@ def get_price_at_timestamp(config: TournamentConfig, value: str) -> Dict[str, An
     tf_cfg = _config_for_timeframe(config, primary_tf)
     tf_minutes = max(1, int(tf_cfg.candle_minutes))
     if _is_indian_equity():
-        anchor = next_nse_slot_at_or_after(ts_utc, tf_minutes, _NSE_HOLIDAYS)
+        anchor = next_nse_slot_at_or_after(ts_utc, tf_minutes, _nse_holidays())
     else:
         anchor = _align_to_interval(ts_utc, tf_minutes)
     target_iso = anchor.isoformat()

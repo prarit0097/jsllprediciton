@@ -16,6 +16,7 @@ from .forecast_metrics import summarize_price_forecast
 from .multi_timeframe import config_for_timeframe
 from .diagnostics import inspect_runtime_capabilities
 from .registry import get_promotion_state, load_registry
+from .market_calendar import load_nse_holidays
 from .storage import Storage
 from .validator import assess_freshness
 
@@ -50,7 +51,7 @@ def _source_lineage_summary(config: TournamentConfig) -> Dict[str, Any]:
         df,
         config.candle_minutes,
         nse_mode=(config.yfinance_symbol or "").upper().endswith((".NS", ".BO")),
-        holidays=set(),
+        holidays=load_nse_holidays(config.data_dir) if (config.yfinance_symbol or "").upper().endswith((".NS", ".BO")) else set(),
         now_utc=datetime.now(timezone.utc),
     )
     return {
