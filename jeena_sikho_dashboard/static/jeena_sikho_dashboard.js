@@ -250,6 +250,49 @@ function labelForPrediction(pred) {
   return mins < 60 ? `${mins}m` : `${mins / 60}h`;
 }
 
+function hasDisplayablePredictionPrice(pred) {
+  if (!pred) return false;
+  const direct = pred.predicted_price;
+  const fallback = pred.last_ready?.predicted_price;
+  return [direct, fallback].some((value) => value !== null && value !== undefined && !Number.isNaN(Number(value)));
+}
+
+function displayPredictionPrice(pred) {
+  if (!pred) return null;
+  if (pred.predicted_price !== null && pred.predicted_price !== undefined && !Number.isNaN(Number(pred.predicted_price))) {
+    return Number(pred.predicted_price);
+  }
+  const fallback = pred.last_ready?.predicted_price;
+  if (fallback !== null && fallback !== undefined && !Number.isNaN(Number(fallback))) {
+    return Number(fallback);
+  }
+  return null;
+}
+
+function displayPredictionBand(pred, key) {
+  if (!pred) return null;
+  const direct = pred[key];
+  if (direct !== null && direct !== undefined && !Number.isNaN(Number(direct))) {
+    return Number(direct);
+  }
+  const fallback = pred.last_ready?.[key];
+  if (fallback !== null && fallback !== undefined && !Number.isNaN(Number(fallback))) {
+    return Number(fallback);
+  }
+  return null;
+}
+
+function predictionValueSourceLabel(pred) {
+  if (!pred) return '';
+  if (pred.predicted_price !== null && pred.predicted_price !== undefined && !Number.isNaN(Number(pred.predicted_price))) {
+    return '';
+  }
+  if (pred.last_ready?.predicted_price !== null && pred.last_ready?.predicted_price !== undefined && !Number.isNaN(Number(pred.last_ready.predicted_price))) {
+    return ' | fallback: last matched value';
+  }
+  return '';
+}
+
 function horizonRank(pred) {
   const tf = predictionTimeframe(pred);
   const primaryTf = primaryBusinessTimeframe();
@@ -265,9 +308,9 @@ function selectPrimaryPrediction(preds) {
   if (!preds.length) return null;
   const primaryTf = primaryBusinessTimeframe();
   const byMinutes = sortPredictions(preds);
-  const primary = byMinutes.find(p => predictionTimeframe(p) === primaryTf && p.predicted_price);
+  const primary = byMinutes.find(p => predictionTimeframe(p) === primaryTf && hasDisplayablePredictionPrice(p));
   if (primary) return primary;
-  return byMinutes.find(p => p.predicted_price) || byMinutes[0];
+  return byMinutes.find(p => hasDisplayablePredictionPrice(p)) || byMinutes[0];
 }
 
 function formatCountdown(predictedAt, horizonMin, targetIso = null) {
@@ -489,11 +532,14 @@ function renderPriceRow(primary, nowPriceUsd, nowPriceInr) {
 
   const horizonMin = predictionMinutes(primary) || 10;
   const label = labelForPrediction(primary);
-  const predDisplay = primary.predicted_price
-    ? formatDualPrice(primary.predicted_price, lastFxRate)
+  const priceValue = displayPredictionPrice(primary);
+  const lowBand = displayPredictionBand(primary, 'predicted_price_low');
+  const highBand = displayPredictionBand(primary, 'predicted_price_high');
+  const predDisplay = priceValue !== null
+    ? formatDualPrice(priceValue, lastFxRate)
     : '--';
-  const band = (primary.predicted_price_low && primary.predicted_price_high)
-    ? ` [${formatDualPrice(primary.predicted_price_low, lastFxRate)} - ${formatDualPrice(primary.predicted_price_high, lastFxRate)}]`
+  const band = (lowBand !== null && highBand !== null)
+    ? ` [${formatDualPrice(lowBand, lastFxRate)} - ${formatDualPrice(highBand, lastFxRate)}]`
     : '';
   const conf = formatConfidenceProxy(primary);
   const match = statusText(primary);
@@ -502,6 +548,7 @@ function renderPriceRow(primary, nowPriceUsd, nowPriceInr) {
   const quality = qualityBadgeHtml(primary.quality_badge, primary.is_primary_business_horizon ? 'trust-primary' : '');
   const trustMetrics = formatTrustMetrics(primary);
   const trustState = formatTrustState(primary);
+  const sourceLabel = predictionValueSourceLabel(primary);
 
   const lastReady = primary.last_ready;
 
@@ -510,7 +557,7 @@ function renderPriceRow(primary, nowPriceUsd, nowPriceInr) {
     if (priceRow) {
       priceRow.style.display = '';
       priceRow.innerHTML = `
-        <span class="price-left">${quality} Predicted (${label || `${horizonMin}m`}): ${predDisplay}${band} | ${conf}${primary.low_confidence ? ' low' : ''} | Match: ${match}<br><span class="muted">${trustMetrics}</span><br><span class="muted">${provenance}</span><br><span class="muted">${trustState}</span></span>
+        <span class="price-left">${quality} Predicted (${label || `${horizonMin}m`}): ${predDisplay}${band} | ${conf}${primary.low_confidence ? ' low' : ''} | Match: ${match}${sourceLabel}<br><span class="muted">${trustMetrics}</span><br><span class="muted">${provenance}</span><br><span class="muted">${trustState}</span></span>
         <span class="price-right"></span>
       `;
     }
@@ -568,18 +615,21 @@ function renderPredList(predictions) {
   list.innerHTML = '';
   ordered.forEach((pred, idx) => {
     const label = labelForPrediction(pred);
-    const horizonMin = predictionMinutes(pred) || 0;
-    const predPrice = pred.predicted_price
-      ? formatDualPrice(pred.predicted_price, lastFxRate)
+    const priceValue = displayPredictionPrice(pred);
+    const lowBand = displayPredictionBand(pred, 'predicted_price_low');
+    const highBand = displayPredictionBand(pred, 'predicted_price_high');
+    const predPrice = priceValue !== null
+      ? formatDualPrice(priceValue, lastFxRate)
       : '--';
-    const band = (pred.predicted_price_low && pred.predicted_price_high)
-      ? ` [${formatDualPrice(pred.predicted_price_low, lastFxRate)} - ${formatDualPrice(pred.predicted_price_high, lastFxRate)}]`
+    const band = (lowBand !== null && highBand !== null)
+      ? ` [${formatDualPrice(lowBand, lastFxRate)} - ${formatDualPrice(highBand, lastFxRate)}]`
       : '';
     const match = statusText(pred);
     const provenance = formatPredictionProvenance(pred);
     const trustMetrics = formatTrustMetrics(pred);
     const trustState = formatTrustState(pred);
     const quality = qualityBadgeHtml(pred.quality_badge, pred.is_primary_business_horizon ? 'trust-primary' : '');
+    const sourceLabel = predictionValueSourceLabel(pred);
 
     let lastMatchedLine = 'Last matched on last predicted price: --';
     let diffActualLine = 'Difference: -- | Actual: --';
@@ -597,7 +647,7 @@ function renderPredList(predictions) {
       diffActualLine = `${diffOnly} | ${actualLine}${actualTime ? ' ' + actualTime : ''}`;
     }
 
-    const line = `${quality} Predicted (${label}): ${predPrice}${band} | ${formatConfidenceProxy(pred)}${pred.low_confidence ? ' low' : ''} | Match: ${match}<br>${trustMetrics}<br>${provenance}<br>${trustState}<br>${lastMatchedLine}<br>${diffActualLine}`;
+    const line = `${quality} Predicted (${label}): ${predPrice}${band} | ${formatConfidenceProxy(pred)}${pred.low_confidence ? ' low' : ''} | Match: ${match}${sourceLabel}<br>${trustMetrics}<br>${provenance}<br>${trustState}<br>${lastMatchedLine}<br>${diffActualLine}`;
 
     const item = document.createElement('div');
     item.className = `pred-item${pred.is_primary_business_horizon ? ' pred-item-primary' : ''}`;
@@ -659,7 +709,7 @@ function updateTimeframePill(predictions) {
 function renderPredictionUI() {
   const predictions = normalizePredictions(lastPrediction);
   updateTimeframePill(predictions);
-  const primary = selectPrimaryPrediction(predictions.filter(p => p.predicted_price));
+  const primary = selectPrimaryPrediction(predictions);
   renderPriceRow(primary, lastNowPrice, lastNowPriceInr);
   renderPredList(predictions);
   renderHorizonMetrics(lastPrediction);
