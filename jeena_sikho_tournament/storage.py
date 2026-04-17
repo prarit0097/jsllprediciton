@@ -160,3 +160,21 @@ class Storage:
                 """
             )
             return cur.rowcount
+
+    def purge_invalid_session_rows(self) -> int:
+        if not self.db_path.exists() or not self._is_nse_symbol():
+            return 0
+        df = self.load()
+        if df.empty:
+            return 0
+        filtered = self._filter_off_slot_rows(df)
+        invalid_index = df.index.difference(filtered.index)
+        if len(invalid_index) == 0:
+            return 0
+        values = [(ts.isoformat(),) for ts in invalid_index]
+        with self._connect() as con:
+            cur = con.executemany(
+                f"DELETE FROM {self.table} WHERE timestamp_utc = ?",
+                values,
+            )
+            return int(cur.rowcount or 0)

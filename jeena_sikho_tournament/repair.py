@@ -91,6 +91,7 @@ def _missing_slots(storage: Storage, lookback_days: int, config: TournamentConfi
 def repair_timeframe_data(config: TournamentConfig, lookback_days: int = 120) -> Dict[str, Any]:
     storage = Storage(config.db_path, config.ohlcv_table)
     storage.init_db()
+    purged_invalid = storage.purge_invalid_session_rows()
     missing, recent = _missing_slots(storage, lookback_days, config)
     before_missing = int(len(missing))
     inserted = 0
@@ -127,6 +128,7 @@ def repair_timeframe_data(config: TournamentConfig, lookback_days: int = 120) ->
         "after_missing": int(len(after_missing)),
         "inserted": inserted,
         "fetched_rows": fetched_rows,
+        "purged_invalid_session_rows": purged_invalid,
         "dq_ok": dq.ok,
         "dq_errors": dq.errors,
         "dq_warnings": dq.warnings,
