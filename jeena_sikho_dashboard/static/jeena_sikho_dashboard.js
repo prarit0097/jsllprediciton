@@ -414,19 +414,6 @@ function formatConfidenceProxy(pred) {
   return `${label}: ${conf}`;
 }
 
-function formatTrustState(pred) {
-  if (!pred) return '--';
-  const parts = [];
-  if (pred.promotion_state) parts.push(`State ${String(pred.promotion_state).replace(/_/g, ' ')}`);
-  if (pred.shadow_status) parts.push(`Shadow ${String(pred.shadow_status).replace(/_/g, ' ')}`);
-  if (pred.freshness_status) parts.push(`Freshness ${pred.freshness_status}`);
-  if (pred.data_source_quality) parts.push(`Data ${pred.data_source_quality}`);
-  if (Array.isArray(pred.fail_fast_reasons) && pred.fail_fast_reasons.length) {
-    parts.push(`Flags ${pred.fail_fast_reasons.join(', ')}`);
-  }
-  return parts.join(' | ') || '--';
-}
-
 function formatPredictionProvenance(pred) {
   if (!pred) return '';
   const anchorAt = pred.forecast_anchor_at || pred.predicted_at;
@@ -524,7 +511,6 @@ function renderPriceRow(primary, nowPriceUsd, nowPriceInr) {
   const isSingle = Array.isArray(lastPrediction?.predictions) && lastPrediction.predictions.length <= 1;
   const provenance = formatPredictionProvenance(primary);
   const quality = qualityBadgeHtml(primary.quality_badge, primary.is_primary_business_horizon ? 'trust-primary' : '');
-  const trustState = formatTrustState(primary);
   const sourceLabel = predictionValueSourceLabel(primary);
   const targetInline = formatPredictionTargetInline(primary);
 
@@ -535,7 +521,7 @@ function renderPriceRow(primary, nowPriceUsd, nowPriceInr) {
     if (priceRow) {
       priceRow.style.display = '';
       priceRow.innerHTML = `
-        <span class="price-left">${quality} Predicted (${label || `${horizonMin}m`}${targetInline}): ${predDisplay}${band} | ${conf}${primary.low_confidence ? ' low' : ''} | Match: ${match}${sourceLabel}<br><span class="muted">${provenance}</span><br><span class="muted">${trustState}</span></span>
+        <span class="price-left">${quality} Predicted (${label || `${horizonMin}m`}${targetInline}): ${predDisplay}${band} | ${conf}${primary.low_confidence ? ' low' : ''} | Match: ${match}${sourceLabel}<br><span class="muted">${provenance}</span></span>
         <span class="price-right"></span>
       `;
     }
@@ -604,7 +590,6 @@ function renderPredList(predictions) {
       : '';
     const match = statusText(pred);
     const provenance = formatPredictionProvenance(pred);
-    const trustState = formatTrustState(pred);
     const quality = qualityBadgeHtml(pred.quality_badge, pred.is_primary_business_horizon ? 'trust-primary' : '');
     const sourceLabel = predictionValueSourceLabel(pred);
     const targetInline = formatPredictionTargetInline(pred);
@@ -625,7 +610,7 @@ function renderPredList(predictions) {
       diffActualLine = `${diffOnly} | ${actualLine}${actualTime ? ' ' + actualTime : ''}`;
     }
 
-    const line = `${quality} Predicted (${label}${targetInline}): ${predPrice}${band} | ${formatConfidenceProxy(pred)}${pred.low_confidence ? ' low' : ''} | Match: ${match}${sourceLabel}<br>${provenance}<br>${trustState}<br>${lastMatchedLine}<br>${diffActualLine}`;
+    const line = `${quality} Predicted (${label}${targetInline}): ${predPrice}${band} | ${formatConfidenceProxy(pred)}${pred.low_confidence ? ' low' : ''} | Match: ${match}${sourceLabel}<br>${provenance}<br>${lastMatchedLine}<br>${diffActualLine}`;
 
     const item = document.createElement('div');
     item.className = `pred-item${pred.is_primary_business_horizon ? ' pred-item-primary' : ''}`;
