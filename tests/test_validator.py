@@ -109,3 +109,62 @@ class RepairSanitizationTests(unittest.TestCase):
                 else:
                     os.environ[key] = value
             shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_repair_removes_existing_holiday_rows(self):
+        tmp = tempfile.mkdtemp()
+        old_env = {
+            "APP_DATA_DIR": os.environ.get("APP_DATA_DIR"),
+            "APP_MARKET_DB_FILE": os.environ.get("APP_MARKET_DB_FILE"),
+            "MARKET_YFINANCE_SYMBOL": os.environ.get("MARKET_YFINANCE_SYMBOL"),
+        }
+        try:
+            os.environ["APP_DATA_DIR"] = tmp
+            os.environ["APP_MARKET_DB_FILE"] = "repair.sqlite3"
+            os.environ["MARKET_YFINANCE_SYMBOL"] = "JSLL.NS"
+
+            cfg = TournamentConfig()
+            storage = Storage(cfg.db_path, cfg.ohlcv_table)
+            storage.init_db()
+
+            valid_ts = pd.Timestamp("2026-04-13T09:45:00+00:00")
+            holiday_ts = pd.Timestamp("2026-04-14T09:45:00+00:00")
+
+            storage.upsert(
+                pd.DataFrame(
+                    {
+                        "open": [100.0],
+                        "high": [101.0],
+                        "low": [99.0],
+                        "close": [100.5],
+                        "volume": [1000.0],
+                        "source": ["seed"],
+                    },
+                    index=pd.DatetimeIndex([valid_ts], tz="UTC"),
+                )
+            )
+
+            with sqlite3.connect(cfg.db_path) as con:
+                con.execute(
+                    f"""
+                    INSERT OR REPLACE INTO {cfg.ohlcv_table}
+                    (timestamp_utc, open, high, low, close, volume, source)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (holiday_ts.isoformat(), 99.0, 100.0, 98.0, 99.5, 900.0, "legacy_holiday"),
+                )
+
+            with patch("jeena_sikho_tournament.repair.fetch_and_stitch", return_value=(pd.DataFrame(), None)):
+                report = repair_timeframe_data(cfg, lookback_days=120)
+
+            repaired = storage.load()
+            self.assertNotIn(holiday_ts, repaired.index)
+            self.assertIn(valid_ts, repaired.index)
+            self.assertEqual(report["purged_invalid_session_rows"], 1)
+            self.assertNotIn("nse_session_boundary_violation", report["dq_errors"])
+        finally:
+            for key, value in old_env.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+            shutil.rmtree(tmp, ignore_errors=True)

@@ -123,15 +123,20 @@ class Storage:
     def _filter_off_slot_rows(self, df: pd.DataFrame) -> pd.DataFrame:
         if df.empty or not self._is_nse_symbol():
             return df
+        from .market_calendar import load_nse_holidays
+
         step = self._interval_minutes()
         idx_local = df.index.tz_convert("Asia/Kolkata")
         mins = idx_local.hour * 60 + idx_local.minute
+        holidays = load_nse_holidays(self.db_path.parent)
+        is_holiday = pd.Series(idx_local.date, index=df.index).isin(holidays).to_numpy()
         if step >= 1440:
             align_ok = mins == (15 * 60 + 30)
         else:
             align_ok = ((mins - (9 * 60 + 15)) % max(1, step)) == 0
         valid = (
             (idx_local.weekday < 5)
+            & (~is_holiday)
             & (mins >= (9 * 60 + 15))
             & (mins <= (15 * 60 + 30))
             & align_ok
