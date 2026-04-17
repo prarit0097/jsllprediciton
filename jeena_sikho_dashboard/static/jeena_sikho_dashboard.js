@@ -414,33 +414,6 @@ function formatConfidenceProxy(pred) {
   return `${label}: ${conf}`;
 }
 
-function formatTrustMetrics(pred) {
-  if (!pred) return '--';
-  const parts = [];
-  if (pred.holdout_price_mae !== null && pred.holdout_price_mae !== undefined) {
-    parts.push(`Holdout MAE ${fmt(pred.holdout_price_mae, 2)}`);
-  }
-  if (pred.live_mae_20 !== null && pred.live_mae_20 !== undefined) {
-    parts.push(`Live20 MAE ${fmt(pred.live_mae_20, 2)}`);
-  }
-  if (pred.median_abs_error !== null && pred.median_abs_error !== undefined) {
-    parts.push(`Median ${fmt(pred.median_abs_error, 2)}`);
-  }
-  if (pred.p90_abs_error !== null && pred.p90_abs_error !== undefined) {
-    parts.push(`P90 ${fmt(pred.p90_abs_error, 2)}`);
-  }
-  if (pred.signed_bias_rs !== null && pred.signed_bias_rs !== undefined) {
-    parts.push(`Bias ${fmt(pred.signed_bias_rs, 2)}`);
-  }
-  if (pred.band_80_coverage !== null && pred.band_80_coverage !== undefined) {
-    parts.push(`Band80 ${fmt(pred.band_80_coverage, 1)}%`);
-  }
-  if (pred.champion_age_hours !== null && pred.champion_age_hours !== undefined) {
-    parts.push(`Champion age ${fmt(pred.champion_age_hours, 1)}h`);
-  }
-  return parts.join(' | ') || '--';
-}
-
 function formatTrustState(pred) {
   if (!pred) return '--';
   const parts = [];
@@ -551,7 +524,6 @@ function renderPriceRow(primary, nowPriceUsd, nowPriceInr) {
   const isSingle = Array.isArray(lastPrediction?.predictions) && lastPrediction.predictions.length <= 1;
   const provenance = formatPredictionProvenance(primary);
   const quality = qualityBadgeHtml(primary.quality_badge, primary.is_primary_business_horizon ? 'trust-primary' : '');
-  const trustMetrics = formatTrustMetrics(primary);
   const trustState = formatTrustState(primary);
   const sourceLabel = predictionValueSourceLabel(primary);
   const targetInline = formatPredictionTargetInline(primary);
@@ -563,7 +535,7 @@ function renderPriceRow(primary, nowPriceUsd, nowPriceInr) {
     if (priceRow) {
       priceRow.style.display = '';
       priceRow.innerHTML = `
-        <span class="price-left">${quality} Predicted (${label || `${horizonMin}m`}${targetInline}): ${predDisplay}${band} | ${conf}${primary.low_confidence ? ' low' : ''} | Match: ${match}${sourceLabel}<br><span class="muted">${trustMetrics}</span><br><span class="muted">${provenance}</span><br><span class="muted">${trustState}</span></span>
+        <span class="price-left">${quality} Predicted (${label || `${horizonMin}m`}${targetInline}): ${predDisplay}${band} | ${conf}${primary.low_confidence ? ' low' : ''} | Match: ${match}${sourceLabel}<br><span class="muted">${provenance}</span><br><span class="muted">${trustState}</span></span>
         <span class="price-right"></span>
       `;
     }
@@ -632,7 +604,6 @@ function renderPredList(predictions) {
       : '';
     const match = statusText(pred);
     const provenance = formatPredictionProvenance(pred);
-    const trustMetrics = formatTrustMetrics(pred);
     const trustState = formatTrustState(pred);
     const quality = qualityBadgeHtml(pred.quality_badge, pred.is_primary_business_horizon ? 'trust-primary' : '');
     const sourceLabel = predictionValueSourceLabel(pred);
@@ -654,7 +625,7 @@ function renderPredList(predictions) {
       diffActualLine = `${diffOnly} | ${actualLine}${actualTime ? ' ' + actualTime : ''}`;
     }
 
-    const line = `${quality} Predicted (${label}${targetInline}): ${predPrice}${band} | ${formatConfidenceProxy(pred)}${pred.low_confidence ? ' low' : ''} | Match: ${match}${sourceLabel}<br>${trustMetrics}<br>${provenance}<br>${trustState}<br>${lastMatchedLine}<br>${diffActualLine}`;
+    const line = `${quality} Predicted (${label}${targetInline}): ${predPrice}${band} | ${formatConfidenceProxy(pred)}${pred.low_confidence ? ' low' : ''} | Match: ${match}${sourceLabel}<br>${provenance}<br>${trustState}<br>${lastMatchedLine}<br>${diffActualLine}`;
 
     const item = document.createElement('div');
     item.className = `pred-item${pred.is_primary_business_horizon ? ' pred-item-primary' : ''}`;
