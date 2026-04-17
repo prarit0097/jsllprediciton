@@ -36,6 +36,7 @@ from .db import (
     get_latest_run,
     get_latest_runs_for_timeframes,
     get_ohlcv_close_at,
+    get_ohlcv_open_at,
     get_recent_ready_predictions,
     get_recent_runs,
     get_scores,
@@ -376,7 +377,7 @@ def _prediction_target_timestamp(pred_at: datetime, horizon_min: int, tf_minutes
     if step >= 1440 or horizon >= 1440:
         trading_days = max(1, int(np.ceil(horizon / 1440.0)))
         holidays = _nse_holidays()
-        cur = pred_at.astimezone(IST).replace(hour=15, minute=30, second=0, microsecond=0)
+        cur = pred_at.astimezone(IST).replace(hour=9, minute=15, second=0, microsecond=0)
         for _ in range(trading_days):
             cur = cur + timedelta(days=1)
             while not is_nse_trading_day(cur, holidays):
@@ -1073,8 +1074,11 @@ def update_pending_predictions(config: TournamentConfig) -> None:
             continue
         target_iso = target_ts.isoformat()
 
-        table = "ohlcv" if int(tf_minutes) == 60 else f"ohlcv_{int(tf_minutes)}m"
-        actual = get_ohlcv_close_at(target_iso, table=table)
+        if int(tf_minutes) >= 1440 or int(horizon_min) >= 1440:
+            actual = get_ohlcv_open_at(target_iso, table="ohlcv")
+        else:
+            table = "ohlcv" if int(tf_minutes) == 60 else f"ohlcv_{int(tf_minutes)}m"
+            actual = get_ohlcv_close_at(target_iso, table=table)
         if actual is None:
             continue
         metrics = _compute_match_metrics(p.get("predicted_price"), actual)

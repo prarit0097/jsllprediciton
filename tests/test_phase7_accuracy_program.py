@@ -59,16 +59,16 @@ class AccuracyProgramSettlementTests(unittest.TestCase):
         update_mock.assert_called_once_with(config)
         refresh_mock.assert_called_once_with(config)
 
-    def test_daily_horizon_targets_next_nse_close_not_next_open(self):
+    def test_daily_horizon_targets_next_nse_open(self):
         pred_at = datetime(2026, 2, 10, 4, 25, tzinfo=timezone.utc)  # 09:55 IST
-        expected = datetime(2026, 2, 11, 10, 0, tzinfo=timezone.utc)  # 15:30 IST next trading day
+        expected = datetime(2026, 2, 11, 3, 45, tzinfo=timezone.utc)  # 09:15 IST next trading day
 
         with patch("jeena_sikho_dashboard.services._is_indian_equity", return_value=True):
             target = _prediction_target_timestamp(pred_at, 1440, 1440)
 
         self.assertEqual(target, expected)
 
-    def test_pending_daily_prediction_settles_only_from_exact_target_close_bar(self):
+    def test_pending_daily_prediction_settles_only_from_exact_target_open_bar(self):
         with tempfile.TemporaryDirectory() as tmp:
             with patch.dict(
                 os.environ,
@@ -102,16 +102,16 @@ class AccuracyProgramSettlementTests(unittest.TestCase):
                     }
                 )
 
-                expected_target_iso = "2026-02-10T10:00:00+00:00"
+                expected_target_iso = "2026-02-10T03:45:00+00:00"
 
-                def fake_get_close(target_iso: str, table: str = "ohlcv"):
-                    self.assertEqual(table, "ohlcv_1440m")
+                def fake_get_open(target_iso: str, table: str = "ohlcv"):
+                    self.assertEqual(table, "ohlcv")
                     self.assertEqual(target_iso, expected_target_iso)
                     return 666.0
 
                 with ExitStack() as stack:
                     stack.enter_context(patch("jeena_sikho_dashboard.services._is_indian_equity", return_value=True))
-                    stack.enter_context(patch("jeena_sikho_dashboard.services.get_ohlcv_close_at", side_effect=fake_get_close))
+                    stack.enter_context(patch("jeena_sikho_dashboard.services.get_ohlcv_open_at", side_effect=fake_get_open))
                     update_pending_predictions(TournamentConfig())
 
                 row = get_latest_prediction_for_timeframe("1d")
