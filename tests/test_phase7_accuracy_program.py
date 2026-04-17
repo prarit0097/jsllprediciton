@@ -17,6 +17,7 @@ from jeena_sikho_dashboard.services import (
 )
 from jeena_sikho_tournament.config import TournamentConfig
 from jeena_sikho_tournament.features import make_inference_frame
+from jeena_sikho_tournament.tournament import _update_predictions_safe
 
 
 def _base_ohlcv_with_exogenous(periods: int = 24 * 25) -> pd.DataFrame:
@@ -42,6 +43,22 @@ def _base_ohlcv_with_exogenous(periods: int = 24 * 25) -> pd.DataFrame:
 
 
 class AccuracyProgramSettlementTests(unittest.TestCase):
+    def test_tournament_prediction_sync_refreshes_fresh_forecasts_after_settlement(self):
+        config = TournamentConfig()
+
+        with ExitStack() as stack:
+            update_mock = stack.enter_context(
+                patch("jeena_sikho_dashboard.services.update_pending_predictions")
+            )
+            refresh_mock = stack.enter_context(
+                patch("jeena_sikho_dashboard.services.refresh_prediction")
+            )
+
+            _update_predictions_safe(config)
+
+        update_mock.assert_called_once_with(config)
+        refresh_mock.assert_called_once_with(config)
+
     def test_daily_horizon_targets_next_nse_close_not_next_open(self):
         pred_at = datetime(2026, 2, 10, 4, 25, tzinfo=timezone.utc)  # 09:55 IST
         expected = datetime(2026, 2, 11, 10, 0, tzinfo=timezone.utc)  # 15:30 IST next trading day

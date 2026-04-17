@@ -36,8 +36,9 @@ from jeena_sikho_dashboard.db import get_recent_ready_predictions, insert_run, i
 
 def _update_predictions_safe(config) -> None:
     try:
-        from jeena_sikho_dashboard.services import update_pending_predictions
+        from jeena_sikho_dashboard.services import refresh_prediction, update_pending_predictions
         update_pending_predictions(config)
+        refresh_prediction(config)
     except Exception as exc:
         LOGGER.info("Prediction match update skipped: %s", exc)
 
